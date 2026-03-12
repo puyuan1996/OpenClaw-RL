@@ -20,7 +20,8 @@ export PYTHONFAULTHANDLER=1
 # ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
 # PRM_GPUS=${PRM_GPUS:-2}
 
-NUM_GPUS=${NUM_GPUS:-4}
+# NUM_GPUS=${NUM_GPUS:-4}
+NUM_GPUS=4
 ACTOR_GPUS=${ACTOR_GPUS:-2}
 ROLLOUT_GPUS=${ROLLOUT_GPUS:-1}
 PRM_GPUS=${PRM_GPUS:-1}
@@ -51,7 +52,7 @@ source "/mnt/shared-storage-user/puyuan/code/slime/scripts/models/qwen3-4B.sh"
 
 
 HF_CKPT=${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-4B/}
-REF_LOAD=${REF_LOAD:-${HF_CKPT}}
+REF_LOAD=${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-4B_torch_dist/}
 SAVE_CKPT=${SAVE_CKPT:-/mnt/shared-storage-user/puyuan/code/OpenClaw-RL/openclaw-combine}
 PRM_MODEL_PATH=${PRM_MODEL_PATH:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-4B/}
 
@@ -72,7 +73,7 @@ export OPENCLAW_COMBINE_W_RL="${OPENCLAW_COMBINE_W_RL:-1.0}"
 export OPENCLAW_COMBINE_W_OPD="${OPENCLAW_COMBINE_W_OPD:-1.0}"
 
 CKPT_ARGS=(
-   --megatron-to-hf-mode bridge
+   # --megatron-to-hf-mode bridge  # 注释掉：使用默认 raw 模式，无需 megatron-bridge 依赖
    --hf-checkpoint "${HF_CKPT}"
    --ref-load "${REF_LOAD}"
    --save "${SAVE_CKPT}"
@@ -96,9 +97,10 @@ ROLLOUT_ARGS=(
 
    --num-steps-per-rollout 1
 )
+   # --tensor-model-parallel-size 4
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -141,19 +143,23 @@ OPTIMIZER_ARGS=(
 
 EVAL_ARGS=()
 
+   # --rollout-num-gpus-per-engine 2
+
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-tool-call-parser "${TOOL_CALL_PARSER}"
    --sglang-mem-fraction-static 0.8
    --sglang-context-length 32768
    --sglang-reasoning-parser qwen3
 )
 
+   # --prm-num-gpus-per-engine 2
+
 PRM_ARGS=(
    --prm-enable
    --prm-num-gpus "${PRM_GPUS}"
-   --prm-num-gpus-per-engine 2
-   --prm-model-path "${PRM_MODEL_PATH}"
+   --prm-num-gpus-per-engine 1
+   --prm-model-path "${PRM_MODEL_PATH}"git
    --prm-m "${PRM_M}"
    --prm-temperature "${PRM_TEMPERATURE:-0.6}"
    --prm-max-new-tokens "${PRM_MAX_NEW_TOKENS:-8192}"
@@ -204,7 +210,7 @@ ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --d
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
+    \"PYTHONPATH\": \"/mnt/shared-storage-user/puyuan/code/OpenClaw-RL/Megatron-LM:${SCRIPT_DIR}:${SCRIPT_DIR}/../openclaw-opd:${SLIME_ROOT}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"OPENCLAW_EVAL_MODE\": \"${OPENCLAW_EVAL_MODE}\",
     \"OPENCLAW_COMBINE_W_RL\": \"${OPENCLAW_COMBINE_W_RL}\",
