@@ -49,8 +49,6 @@ SLIME_ROOT="$(cd -- "${SCRIPT_DIR}/../slime" &>/dev/null && pwd)"
 # PRM_MODEL_PATH=${PRM_MODEL_PATH:-/data_storage/wyj/systems/huggingface/hub/Qwen3-4B-Thinking-2507}
 
 source "/mnt/shared-storage-user/puyuan/code/slime/scripts/models/qwen3-4B.sh"
-
-
 HF_CKPT=${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-4B/}
 REF_LOAD=${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-4B_torch_dist/}
 SAVE_CKPT=${SAVE_CKPT:-/mnt/shared-storage-user/puyuan/code/OpenClaw-RL/openclaw-combine}

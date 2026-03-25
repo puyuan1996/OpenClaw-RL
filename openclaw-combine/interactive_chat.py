@@ -144,6 +144,7 @@ class ChatClient:
                 headers={
                     "Authorization": f"Bearer {API_KEY}",
                     "X-Session-ID": self.session.session_id,
+                    "X-Turn-Type": "main",
                 },
             )
 
@@ -200,6 +201,7 @@ class ChatClient:
                 headers={
                     "Authorization": f"Bearer {API_KEY}",
                     "X-Session-ID": self.session.session_id,
+                    "X-Turn-Type": "main",
                 },
             )
 

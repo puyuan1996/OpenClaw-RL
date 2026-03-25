@@ -45,6 +45,7 @@ class SimpleChat:
                 headers={
                     "Authorization": f"Bearer {API_KEY}",
                     "X-Session-ID": self.session_id,
+                    "X-Turn-Type": "main",
                 },
             )
 
@@ -80,6 +81,7 @@ class SimpleChat:
                 headers={
                     "Authorization": f"Bearer {API_KEY}",
                     "X-Session-ID": self.session_id,
+                    "X-Turn-Type": "main",
                 },
             )
             print("✓ Feedback sent\n")
