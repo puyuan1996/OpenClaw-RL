@@ -870,9 +870,11 @@ def _run_one_session(worker_id: int, session_index: int, seeds: list[SeedTask]) 
             )
             result = _send_with_timeout(session, user_prompt)
             latest_response = result.text
+            # Count tool calls by parsing response text
+            tool_calls_count = latest_response.count("<tool_call>")
             print(
                 f"[a3s-code-driver] worker={worker_id} session_id={session_id} "
-                f"turn={main_turn_number} tool_calls={result.tool_calls_count} "
+                f"turn={main_turn_number} tool_calls={tool_calls_count} "
                 f"response_chars={len(result.text)}",
                 flush=True,
             )
@@ -881,7 +883,7 @@ def _run_one_session(worker_id: int, session_index: int, seeds: list[SeedTask]) 
                     "turn": main_turn_number,
                     "user": user_prompt,
                     "assistant": result.text,
-                    "tool_calls_count": result.tool_calls_count,
+                    "tool_calls_count": tool_calls_count,
                     "done_after_response": done_after_response,
                 }
             )
