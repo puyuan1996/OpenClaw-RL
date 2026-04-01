@@ -1,0 +1,11 @@
+{
+  "template": "mini_taskboard",
+  "repo_summary": "A minimal CLI task board application written in Python. Supports adding, listing, and marking tasks as done.",
+  "key_files": ["taskboard.py", "tasks.json", "tests/test_taskboard.py"],
+  "test_command": "python -m pytest tests/ -v",
+  "realism_notes": [
+    "Simple single-file CLI tool",
+    "JSON-based storage",
+    "Basic pytest test coverage"
+  ]
+}
