@@ -1,22 +1,25 @@
 # Mini Taskboard
 
-A simple CLI task manager.
+`mini-taskboard` is a tiny Python CLI for tracking tasks in a local JSON file.
 
-## Usage
+## Current Commands
+
+- `add <title>` creates a new open task and rejects blank titles
+- `list` prints all tasks
+- `done <task_id>` marks a task as done
+
+## Quick Start
 
 ```bash
-# Add a task
-python taskboard.py add "Buy groceries"
-
-# List tasks
-python taskboard.py list
-
-# Mark task as done
-python taskboard.py done 1
+python -m taskboard.cli add "ship release notes"
+python -m taskboard.cli add "clean up stale feature flags"
+python -m taskboard.cli list
+python -m taskboard.cli done 1
+python -m taskboard.cli list
 ```
 
-## Testing
+## Development
 
 ```bash
-python -m pytest tests/ -v
+pytest -q
 ```

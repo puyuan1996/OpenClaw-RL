@@ -117,8 +117,10 @@ def distributed_masked_whiten(
         torch.Tensor: The locally whitened tensor using global statistics.
     """
     # Calculate local intermediate statistics
-    # Ensure mask is on the same device as values
-    mask = mask.to(values.device)
+    # Ensure mask is on the same device as values (defensive check for data source compatibility)
+    if mask.device != values.device:
+        mask = mask.to(values.device)
+
     local_sum = (values * mask).sum()
     local_sum_sq = ((values**2) * mask).sum()
     local_mask_sum = mask.sum()

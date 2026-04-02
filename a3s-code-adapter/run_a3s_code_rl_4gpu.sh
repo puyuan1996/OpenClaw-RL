@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# a3s-code-rl training adapted for OpenClaw-RL.
-# Derived from a3s-code-rl/run_a3s_code_rl_4gpu.sh with paths adjusted for OpenClaw-RL layout.
+################################################################################
+# a3s-code-rl training — OpenClaw-RL
 #
 # Usage:
-#   cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/slime
-#   bash ../a3s-code-adapter/run_a3s_code_rl_4gpu.sh
-#
-# Or standalone:
 #   bash /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/a3s-code-adapter/run_a3s_code_rl_4gpu.sh
+#
+# Key env overrides:
+#   NUM_GPUS  ACTOR_GPUS  ROLLOUT_GPUS  ROLLOUT_BATCH_SIZE
+#   POLICY_LR  USE_WANDB  WANDB_API_KEY
+################################################################################
 
 set -euo pipefail
-set -x
 
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
@@ -72,20 +72,51 @@ fi
 # ── Model paths (aligned with OpenClaw-RL defaults) ──────────────
 HF_CKPT="${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-4B/}"
 REF_LOAD="${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-4B_torch_dist/}"
-SAVE_CKPT="${SAVE_CKPT:-${PROJECT_ROOT}/ckpt/qwen3-4b-a3s-code-rl}"
 PRM_MODEL_PATH="${PRM_MODEL_PATH:-${HF_CKPT}}"
 KIMI_BASE_URL="${KIMI_BASE_URL:-http://s-20260204175507-cqflp.ailab-pj.pjh-service.org.cn}"
-mkdir -p "${SAVE_CKPT}"
 
 # ── Model arch args (Qwen3-4B, rotary_base=1M) ──────────────────
 source "${SLIME_ROOT}/scripts/models/qwen3-4B.sh"
 
-# ── Artifact root ────────────────────────────────────────────────
+# ── Run ID & structured output directory ────────────────────────
+# Format: a3s_code_rl_<model>_<gpus>gpu_<YYYYMMDD_HHMMSS>
+MODEL_SHORT_NAME="qwen3_4b"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-${PROJECT_ROOT}}"
-RUN_ID="a3s_code_rl_qwen3_4b_$(date +%Y%m%d_%H%M%S)"
+RUN_ID="a3s_code_rl_${MODEL_SHORT_NAME}_${NUM_GPUS}gpu_${TIMESTAMP}"
 RUN_ROOT="${ARTIFACT_ROOT}/runs/${RUN_ID}"
 LOG_DIR="${RUN_ROOT}/logs"
-mkdir -p "${LOG_DIR}" "${RUN_ROOT}" "${CODE_RL_DIR}/results"
+CKPT_DIR="${RUN_ROOT}/ckpt"
+mkdir -p "${LOG_DIR}" "${RUN_ROOT}" "${CKPT_DIR}" "${CODE_RL_DIR}/results"
+
+# Override SAVE_CKPT to point into this run's directory
+SAVE_CKPT="${SAVE_CKPT:-${CKPT_DIR}}"
+mkdir -p "${SAVE_CKPT}"
+
+# ── Log files ───────────────────────────────────────────────────
+MAIN_LOG="${LOG_DIR}/main.log"
+XTRACE_LOG="${LOG_DIR}/xtrace.log"
+
+# Redirect bash xtrace (-x) to a separate file so it doesn't pollute main log.
+# FD 3 → xtrace file; BASH_XTRACEFD tells bash to write trace there.
+exec 3>>"${XTRACE_LOG}"
+export BASH_XTRACEFD=3
+set -x
+
+# Tee stdout+stderr to main.log while keeping terminal output.
+exec > >(tee -a "${MAIN_LOG}") 2>&1
+
+echo "================================================================"
+echo "  a3s-code-rl training — ${RUN_ID}"
+echo "================================================================"
+echo ""
+echo "  Run root  : ${RUN_ROOT}"
+echo "  Main log  : ${MAIN_LOG}"
+echo "  Xtrace log: ${XTRACE_LOG}"
+echo "  Checkpoint: ${SAVE_CKPT}"
+echo ""
+
+_START_EPOCH=$(date +%s)
 
 # ── Serving / API config ─────────────────────────────────────────
 export SGLANG_API_KEY="${SGLANG_API_KEY:-apiKey}"
@@ -131,6 +162,8 @@ export POLICY_EPS_CLIP_C="${POLICY_EPS_CLIP_C:-3.0}"
 export POLICY_NORMALIZE_ADVANTAGES="${POLICY_NORMALIZE_ADVANTAGES:-1}"
 export POLICY_USE_ROLLOUT_LOGPROBS="${POLICY_USE_ROLLOUT_LOGPROBS:-1}"
 export DISABLE_BF16_REDUCED_PRECISION_MATMUL="${DISABLE_BF16_REDUCED_PRECISION_MATMUL:-1}"
+# Number of samples collected before triggering a training step (the "16" threshold).
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 
 # ── External PRM ─────────────────────────────────────────────────
 if [[ "${ENABLE_PRM}" == "1" && "${PRM_BACKEND}" == "external_openai" ]]; then
@@ -175,7 +208,7 @@ ROLLOUT_ARGS=(
   --disable-rollout-global-dataset
   --rollout-function-path code_rl_rollout.generate_rollout_code_rl
   --num-rollout 100000000
-  --rollout-batch-size 16
+  --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
   --n-samples-per-prompt 1
   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
@@ -281,19 +314,37 @@ if [[ "${DISABLE_BF16_REDUCED_PRECISION_MATMUL}" == "1" ]]; then
   MISC_ARGS+=(--disable-bf16-reduced-precision-matmul)
 fi
 
-# ── Wandb ────────────────────────────────────────────────────────
-USE_WANDB="${USE_WANDB:-0}"
+# ── WandB ────────────────────────────────────────────────────────
+# Default: offline mode (always records locally, no network needed).
+# Set USE_WANDB=1 + WANDB_API_KEY to enable online sync.
+# Set USE_WANDB=0 to disable entirely.
+USE_WANDB="${USE_WANDB:-offline}"
 WANDB_PROJECT="${WANDB_PROJECT:-a3s_code_rl}"
+WANDB_GROUP="${WANDB_GROUP:-${MODEL_SHORT_NAME}-a3s-code-rl}"
 WANDB_KEY_VALUE="${WANDB_KEY:-${WANDB_API_KEY:-}}"
-if [[ "${USE_WANDB}" == "1" && -n "${WANDB_KEY_VALUE}" ]]; then
+
+if [[ "${USE_WANDB}" == "0" ]]; then
+  # Fully disabled
+  WANDB_ARGS=()
+  export WANDB_MODE="disabled"
+elif [[ "${USE_WANDB}" == "1" && -n "${WANDB_KEY_VALUE}" ]]; then
+  # Online mode
   WANDB_ARGS=(
     --use-wandb
     --wandb-project "${WANDB_PROJECT}"
-    --wandb-group qwen3-4b-a3s-code-rl
+    --wandb-group "${WANDB_GROUP}"
     --wandb-key "${WANDB_KEY_VALUE}"
   )
+  export WANDB_MODE="online"
 else
-  WANDB_ARGS=()
+  # Offline mode (default) — logs saved under RUN_ROOT/wandb/
+  WANDB_ARGS=(
+    --use-wandb
+    --wandb-project "${WANDB_PROJECT}"
+    --wandb-group "${WANDB_GROUP}"
+  )
+  export WANDB_MODE="offline"
+  export WANDB_DIR="${RUN_ROOT}"
 fi
 
 # ── Runtime env ──────────────────────────────────────────────────
@@ -311,7 +362,9 @@ RUNTIME_ENV_JSON="{
     \"CODE_RL_CONTEXT_SAFETY_MARGIN\": \"${CODE_RL_CONTEXT_SAFETY_MARGIN}\",
     \"CODE_RL_MAX_RESPONSE_TOKENS\": \"${CODE_RL_MAX_RESPONSE_TOKENS}\",
     \"CODE_RL_DROP_REPETITIVE_SAMPLES\": \"${CODE_RL_DROP_REPETITIVE_SAMPLES}\",
-    \"SLIME_PPO_RATIO_SAFE_BOUND\": \"${SLIME_PPO_RATIO_SAFE_BOUND}\"
+    \"SLIME_PPO_RATIO_SAFE_BOUND\": \"${SLIME_PPO_RATIO_SAFE_BOUND}\",
+    \"WANDB_MODE\": \"${WANDB_MODE}\",
+    \"WANDB_DIR\": \"${WANDB_DIR:-${RUN_ROOT}}\"
   }
 }"
 
@@ -328,15 +381,45 @@ cat > "${RUN_ROOT}/launch_info.json" <<EOF
   "prm_gpus": ${EFFECTIVE_PRM_GPUS},
   "tp_train": ${TP_TRAIN},
   "tp_sglang": ${TP_SGLANG},
+  "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
   "enable_prm": $([[ "${ENABLE_PRM}" == "1" ]] && echo true || echo false),
   "prm_backend": "${EFFECTIVE_PRM_BACKEND}",
   "prm_model": "$([[ "${EFFECTIVE_PRM_BACKEND}" == "external_openai" ]] && printf '%s' "${CODE_RL_PRM_OPENAI_MODEL_NAME}" || printf '%s' "${PRM_MODEL_PATH}")",
+  "wandb_mode": "${WANDB_MODE}",
+  "wandb_project": "${WANDB_PROJECT}",
+  "policy_lr": "${POLICY_LR}",
+  "kl_loss_coef": "${POLICY_KL_LOSS_COEF}",
   "adapter_source": "a3s-code-adapter",
   "timestamp": "$(date -Iseconds)"
 }
 EOF
 
-echo "=== RUN_ROOT: ${RUN_ROOT} ==="
+# ── Print config summary ────────────────────────────────────────
+echo "── GPU Allocation ──────────────────────────────────────────"
+echo "  Total GPUs     : ${NUM_GPUS}"
+echo "  Actor GPUs     : ${ACTOR_GPUS} (TP=${TP_TRAIN})"
+echo "  Rollout GPUs   : ${ROLLOUT_GPUS} (TP=${TP_SGLANG})"
+echo "  PRM            : ${EFFECTIVE_PRM_BACKEND} (GPUs=${EFFECTIVE_PRM_GPUS})"
+echo ""
+echo "── Training ────────────────────────────────────────────────"
+echo "  Model          : ${MODEL_SHORT_NAME} (${HF_CKPT})"
+echo "  Batch size     : ${ROLLOUT_BATCH_SIZE} samples/step"
+echo "  LR             : ${POLICY_LR}"
+echo "  KL coef        : ${POLICY_KL_LOSS_COEF}"
+echo "  Context tokens : ${CONTEXT_LENGTH}"
+echo "  Max resp tokens: ${ROLLOUT_MAX_RESPONSE_LEN}"
+echo ""
+echo "── WandB ─────────────────────────────────────────────────"
+echo "  Mode           : ${WANDB_MODE}"
+echo "  Project        : ${WANDB_PROJECT}"
+echo "  Group          : ${WANDB_GROUP}"
+echo ""
+echo "── Recording ───────────────────────────────────────────────"
+echo "  Samples        : ${CODE_RL_RECORD_FILE}"
+echo "  PRM scores     : ${CODE_RL_PRM_RECORD_FILE}"
+echo "  Trace          : ${CODE_RL_TRACE_RECORD_FILE}"
+echo "================================================================"
+echo ""
 
 # ── Launch via ray job submit (consistent with OpenClaw-RL pattern) ──
 export PYTHONPATH="${MEGATRON_ROOT}:${CODE_RL_DIR}:${SLIME_ROOT}:${PYTHONPATH:-}"
@@ -344,6 +427,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 cd "${SLIME_ROOT}"
 
+set +e
 ray job submit --address="http://127.0.0.1:8265" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 train_async.py \
@@ -362,3 +446,31 @@ ray job submit --address="http://127.0.0.1:8265" \
   ${WANDB_ARGS[@]} \
   ${CUSTOM_ARGS[@]} \
   ${PRM_ARGS[@]}
+
+TRAIN_EXIT_CODE=$?
+set -e
+
+# ── Post-training summary ───────────────────────────────────────
+echo ""
+echo "================================================================"
+if [[ ${TRAIN_EXIT_CODE} -eq 0 ]]; then
+  echo "  Training completed successfully."
+else
+  echo "  Training FAILED (exit code: ${TRAIN_EXIT_CODE})"
+  # Quick diagnostics from log
+  if grep -q "CUDA out of memory\|OutOfMemoryError\|OOM" "${MAIN_LOG}" 2>/dev/null; then
+    echo "  -> OOM detected. Try reducing ROLLOUT_BATCH_SIZE or MAX_TOKENS_PER_GPU."
+  fi
+  if grep -q "No backend type associated with device type cpu" "${MAIN_LOG}" 2>/dev/null; then
+    echo "  -> CPU/GPU device mismatch in distributed op. Check tensor placement in loss.py."
+  fi
+fi
+echo ""
+echo "  Run root : ${RUN_ROOT}"
+echo "  Main log : ${MAIN_LOG}"
+echo "  Xtrace   : ${XTRACE_LOG}"
+_ELAPSED=$(( $(date +%s) - _START_EPOCH ))
+echo "  Duration : $(( _ELAPSED / 60 ))m $(( _ELAPSED % 60 ))s"
+echo "================================================================"
+
+exit ${TRAIN_EXIT_CODE}

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -820,6 +821,13 @@ def _run_one_session(worker_id: int, session_index: int, seeds: list[SeedTask]) 
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "main_turns": [],
         "status": "started",
+        "metadata": {
+            "model": A3S_MODEL_NAME,
+            "max_main_turns": MAX_MAIN_TURNS,
+            "max_tool_rounds": MAX_TOOL_ROUNDS,
+            "context_tokens": MODEL_CONTEXT_TOKENS,
+            "output_tokens": MODEL_OUTPUT_TOKENS,
+        },
     }
 
     simulated_user_client = httpx.Client(timeout=None, trust_env=False)
@@ -870,21 +878,29 @@ def _run_one_session(worker_id: int, session_index: int, seeds: list[SeedTask]) 
             )
             result = _send_with_timeout(session, user_prompt)
             latest_response = result.text
-            # Count tool calls by parsing response text
-            tool_calls_count = latest_response.count("<tool_call>")
+            # Use SDK's native tool_calls_count instead of parsing text
+            tool_calls_count = getattr(result, "tool_calls_count", 0)
+            prompt_tokens = getattr(result, "prompt_tokens", 0)
+            completion_tokens = getattr(result, "completion_tokens", 0)
+            total_tokens = getattr(result, "total_tokens", 0)
             print(
                 f"[a3s-code-driver] worker={worker_id} session_id={session_id} "
                 f"turn={main_turn_number} tool_calls={tool_calls_count} "
-                f"response_chars={len(result.text)}",
+                f"response_chars={len(latest_response)} "
+                f"tokens=({prompt_tokens}/{completion_tokens}/{total_tokens})",
                 flush=True,
             )
             record["main_turns"].append(
                 {
                     "turn": main_turn_number,
                     "user": user_prompt,
-                    "assistant": result.text,
+                    "assistant": latest_response,
                     "tool_calls_count": tool_calls_count,
                     "done_after_response": done_after_response,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "execution_feedback": None,
                 }
             )
             if done_after_response:
@@ -892,9 +908,11 @@ def _run_one_session(worker_id: int, session_index: int, seeds: list[SeedTask]) 
 
         _mark_session_done(simulated_user_client, session_id)
         record["status"] = "completed"
+        record["total_turns"] = len(record["main_turns"])
+        record["total_tool_calls"] = sum(t.get("tool_calls_count", 0) for t in record["main_turns"])
         print(
             f"[a3s-code-driver] worker={worker_id} session_id={session_id} status=completed "
-            f"main_turns={len(record['main_turns'])}",
+            f"main_turns={len(record['main_turns'])} total_tool_calls={record['total_tool_calls']}",
             flush=True,
         )
     except Exception as exc:
@@ -904,6 +922,7 @@ def _run_one_session(worker_id: int, session_index: int, seeds: list[SeedTask]) 
             pass
         record["status"] = "error"
         record["error"] = f"{type(exc).__name__}: {exc}"
+        record["error_traceback"] = traceback.format_exc()
         print(
             f"[a3s-code-driver] worker={worker_id} session_id={session_id} status=error "
             f"error={type(exc).__name__}: {exc}",
