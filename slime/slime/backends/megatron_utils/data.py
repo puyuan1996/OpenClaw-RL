@@ -124,6 +124,7 @@ def get_batch(
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
+        packed_seq_params = None  # bshd format doesn't use packed_seq_params
     elif qkv_format == "thd":
         tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
 

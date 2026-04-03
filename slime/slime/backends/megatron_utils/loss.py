@@ -283,12 +283,25 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     if not mpu.is_pipeline_last_stage():
         return
 
-    # loss_masks live on CPU (lazy-loading optimisation).  We need GPU copies
-    # for the advantage / KL / normalisation math below.  The original CPU
-    # tensors in rollout_data["loss_masks"] are NOT modified.
-    if loss_masks and isinstance(loss_masks[0], torch.Tensor) and not loss_masks[0].is_cuda:
-        _gpu = torch.cuda.current_device()
-        loss_masks = [m.to(device=_gpu) for m in loss_masks]
+    # Several per-sample tensor lists (loss_masks, log_probs, ref_log_probs)
+    # live on CPU after _get_rollout_data / _offload_rollout_data_to_cpu.
+    # We need GPU copies for the advantage / KL / normalisation math below
+    # (in particular dist.all_reduce requires CUDA tensors on NCCL backend).
+    # The original CPU tensors in rollout_data are NOT modified.
+    _gpu = torch.cuda.current_device()
+
+    def _ensure_gpu(tensors):
+        if tensors and isinstance(tensors[0], torch.Tensor) and not tensors[0].is_cuda:
+            return [t.to(device=_gpu) for t in tensors]
+        return tensors
+
+    loss_masks = _ensure_gpu(loss_masks)
+    if log_probs is not None:
+        log_probs = _ensure_gpu(log_probs)
+    if ref_log_probs is not None:
+        ref_log_probs = _ensure_gpu(ref_log_probs)
+    if values is not None:
+        values = _ensure_gpu(values)
 
     if args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
@@ -484,7 +497,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 local_mask_chunk = (
                     torch.cat(local_mask_parts)
                     if local_mask_parts
-                    else torch.tensor([], device=all_advs.device, dtype=full_mask.dtype)
+                    else torch.tensor([], device=full_mask.device, dtype=full_mask.dtype)
                 )
                 mask_chunks.append(local_mask_chunk)
 
