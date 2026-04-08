@@ -9,8 +9,10 @@
 #   3. Set SWE_EXEC_SERVER_URLS in .env.swe or environment
 #
 # Usage:
-#   bash swe-rl/scripts/run_swe_rl_4b_remote_1node.sh
-#   DEBUG_MODE=1 bash swe-rl/scripts/run_swe_rl_4b_remote_1node.sh
+#   bash swe-rl/scripts/run_swe_rl_4b_remote_1node.sh                    # full training
+#   DEBUG_MODE=1 bash swe-rl/scripts/run_swe_rl_4b_remote_1node.sh       # minimal debug (4 samples, 1 step)
+#   SUBSET_K=20 bash swe-rl/scripts/run_swe_rl_4b_remote_1node.sh        # first 20 samples, full config to converge
+#   MAX_CKPT_KEEP=3 bash swe-rl/scripts/run_swe_rl_4b_remote_1node.sh    # keep 3 checkpoints (default: 2)
 
 pkill -9 sglang || true
 sleep 3
@@ -38,12 +40,37 @@ SLIME_DIR="$(cd -- "${SWE_RL_DIR}/../slime" &>/dev/null && pwd)"
 EXPORT_ROOT=${EXPORT_ROOT:-"${SWE_RL_DIR}/../export"}
 mkdir -p "${EXPORT_ROOT}/ckpt" "${EXPORT_ROOT}/swe_rollouts"
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%F_%H%M%S)}
-LOG_DIR=${LOG_DIR:-"${SCRIPT_DIR}/logs"}
-mkdir -p "${LOG_DIR}"
-RUN_LOG=${RUN_LOG:-"${LOG_DIR}/run_swe_rl_4b_remote_1node_${RUN_TIMESTAMP}.log"}
+DEBUG_MODE=${DEBUG_MODE:-0}
+SUBSET_K=${SUBSET_K:-0}          # 0=disabled; >0 = train on first K samples with full config
+MAX_CKPT_KEEP=${MAX_CKPT_KEEP:-2}
+
+# ── Structured log directory ─────────────────────────────────────────
+# Layout: logs/<run_name>/train.log, pool_server.log, run_config.json
+DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [[ "${DEBUG_MODE}" == "1" ]]; then
+  RUN_NAME="qwen3-4b_${DETECTED_GPUS}gpu_debug_${RUN_TIMESTAMP}"
+elif (( SUBSET_K > 0 )); then
+  RUN_NAME="qwen3-4b_${DETECTED_GPUS}gpu_subset${SUBSET_K}_${RUN_TIMESTAMP}"
+else
+  RUN_NAME="qwen3-4b_${DETECTED_GPUS}gpu_full_${RUN_TIMESTAMP}"
+fi
+RUN_NAME=${RUN_NAME:-"swe-rl_${RUN_TIMESTAMP}"}
+LOG_BASE="${SCRIPT_DIR}/logs"
+RUN_LOG_DIR="${LOG_BASE}/${RUN_NAME}"
+mkdir -p "${RUN_LOG_DIR}"
+CKPT_SAVE_DIR="${EXPORT_ROOT}/ckpt/${RUN_NAME}"
+
+RUN_LOG="${RUN_LOG_DIR}/train.log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
-echo "Run log: ${RUN_LOG}"
-echo "Run timestamp: ${RUN_TIMESTAMP}"
+echo "========================================"
+echo "  SWE-RL Run: ${RUN_NAME}"
+echo "  Log dir:    ${RUN_LOG_DIR}"
+echo "  Ckpt dir:   ${CKPT_SAVE_DIR}"
+echo "  Timestamp:  ${RUN_TIMESTAMP}"
+echo "  Debug mode: ${DEBUG_MODE}"
+echo "  Subset K:   ${SUBSET_K}"
+echo "  Max ckpt:   ${MAX_CKPT_KEEP}"
+echo "========================================"
 
 # ── Model ────────────────────────────────────────────────────────────
 source "${SLIME_DIR}/scripts/models/qwen3-4B.sh"
@@ -69,10 +96,8 @@ export RAY_health_check_timeout_ms=${RAY_health_check_timeout_ms:-30000}
 export RAY_num_heartbeats_timeout=${RAY_num_heartbeats_timeout:-60}
 
 # ── GPU allocation (single node) ─────────────────────────────────────
-DEBUG_MODE=${DEBUG_MODE:-0}
 if [[ "${DEBUG_MODE}" == "1" ]]; then
   # Debug: auto-detect GPU count, split evenly between actor and rollout
-  DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
   NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE:-${DETECTED_GPUS:-4}}
   HALF_GPUS=$(( NUM_GPUS_PER_NODE / 2 ))
   ACTOR_GPUS_PER_NODE=${ACTOR_GPUS_PER_NODE:-${HALF_GPUS}}
@@ -125,7 +150,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-SWE_POOL_LOG=${SWE_POOL_LOG:-"${LOG_DIR}/swe_env_pool_server_1node.log"}
+SWE_POOL_LOG="${RUN_LOG_DIR}/pool_server.log"
 PYTHONPATH="${SLIME_DIR}:${SWE_RL_DIR}:${SWE_RL_DIR}/server:${PYTHONPATH}" \
 python3 -m swe_env_pool_server \
   --host "${SWE_ENV_SERVER_BIND_HOST}" \
@@ -158,24 +183,36 @@ REF_LOAD=${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-4B_torch_d
 CKPT_ARGS=(
   --hf-checkpoint "${HF_CKPT}"
   --ref-load "${REF_LOAD}"
-  --save "${SAVE_CKPT:-${EXPORT_ROOT}/ckpt/swe-rl-4b-remote-1node_${RUN_TIMESTAMP}}"
+  --save "${SAVE_CKPT:-${CKPT_SAVE_DIR}}"
   --save-interval 5
 )
 
 # ── Rollout data ─────────────────────────────────────────────────────
+TRAIN_JSONL="${SWE_RL_DIR}/swe_data/swe_gym_subset/train.jsonl"
 if [[ "${DEBUG_MODE}" == "1" ]]; then
   # Debug: use train_debug4.jsonl (4 samples), minimal rollout
   DEBUG_DATA="${SWE_RL_DIR}/swe_data/swe_gym_subset/train_debug4.jsonl"
   if [[ ! -f "${DEBUG_DATA}" ]]; then
     echo "Creating debug dataset (first 4 samples)..."
-    head -4 "${SWE_RL_DIR}/swe_data/swe_gym_subset/train.jsonl" > "${DEBUG_DATA}"
+    head -4 "${TRAIN_JSONL}" > "${DEBUG_DATA}"
   fi
   PROMPT_DATA=${PROMPT_DATA:-${DEBUG_DATA}}
   NUM_ROLLOUT=4
   N_SAMPLES=1
   ROLLOUT_BATCH_SIZE=4
+elif (( SUBSET_K > 0 )); then
+  # Subset: first K samples, full training config (converge on small data)
+  SUBSET_DATA="${SWE_RL_DIR}/swe_data/swe_gym_subset/train_subset${SUBSET_K}.jsonl"
+  if [[ ! -f "${SUBSET_DATA}" ]]; then
+    echo "Creating subset dataset (first ${SUBSET_K} samples)..."
+    head -"${SUBSET_K}" "${TRAIN_JSONL}" > "${SUBSET_DATA}"
+  fi
+  PROMPT_DATA=${PROMPT_DATA:-${SUBSET_DATA}}
+  NUM_ROLLOUT=${NUM_ROLLOUT:-500}
+  N_SAMPLES=${N_SAMPLES:-4}
+  ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8}
 else
-  PROMPT_DATA=${PROMPT_DATA:-${SWE_RL_DIR}/swe_data/swe_gym_subset/train.jsonl}
+  PROMPT_DATA=${PROMPT_DATA:-${TRAIN_JSONL}}
   NUM_ROLLOUT=500
   N_SAMPLES=4
   ROLLOUT_BATCH_SIZE=8
@@ -295,10 +332,41 @@ OPENAI_BASE_URL=${OPENAI_BASE_URL:-auto}
 OPENAI_API_KEY=${OPENAI_API_KEY:-dummy}
 LITELLM_MODEL_REGISTRY_PATH=${LITELLM_MODEL_REGISTRY_PATH:-"${SWE_RL_DIR}/litellm.json"}
 SWE_LITELLM_MODEL_NAME=${SWE_LITELLM_MODEL_NAME:-openai/Qwen/Qwen3-4B}
-SWE_SAVE_TRAJ_DIR=${SWE_SAVE_TRAJ_DIR:-${EXPORT_ROOT}/swe_rollouts/swe-rl-4b-remote-1node_${RUN_TIMESTAMP}}
+SWE_SAVE_TRAJ_DIR=${SWE_SAVE_TRAJ_DIR:-${EXPORT_ROOT}/swe_rollouts/${RUN_NAME}}
 mkdir -p "${SWE_SAVE_TRAJ_DIR}"
 echo "SWE rollout artifacts dir: ${SWE_SAVE_TRAJ_DIR}"
 echo "SWE_ENV_SERVER_URL=${SWE_ENV_SERVER_URL}, SWE_EXEC_SERVER_URLS=${SWE_EXEC_SERVER_URLS}"
+
+# ── Dump run config ──────────────────────────────────────────────────
+cat > "${RUN_LOG_DIR}/run_config.json" <<CFGEOF
+{
+  "run_name": "${RUN_NAME}",
+  "timestamp": "${RUN_TIMESTAMP}",
+  "debug_mode": ${DEBUG_MODE},
+  "subset_k": ${SUBSET_K},
+  "model": "Qwen3-4B",
+  "hf_ckpt": "${HF_CKPT}",
+  "ref_load": "${REF_LOAD}",
+  "ckpt_save_dir": "${CKPT_SAVE_DIR}",
+  "max_ckpt_keep": ${MAX_CKPT_KEEP},
+  "gpus": ${NUM_GPUS_PER_NODE},
+  "actor_gpus": ${ACTOR_GPUS_PER_NODE},
+  "rollout_gpus": ${ROLLOUT_GPUS_PER_NODE},
+  "tp_size": ${TP_SIZE},
+  "rollout_engine_gpus": ${ROLLOUT_NUM_GPUS_PER_ENGINE},
+  "prompt_data": "${PROMPT_DATA}",
+  "num_rollout": ${NUM_ROLLOUT},
+  "n_samples": ${N_SAMPLES},
+  "batch_size": ${ROLLOUT_BATCH_SIZE},
+  "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
+  "swe_exec_urls": "${SWE_EXEC_SERVER_URLS}",
+  "swe_max_concurrent": "${SWE_MAX_CONCURRENT}",
+  "swe_max_containers": "${SWE_MAX_CONTAINERS_PER_NODE}",
+  "traj_dir": "${SWE_SAVE_TRAJ_DIR}",
+  "log_dir": "${RUN_LOG_DIR}"
+}
+CFGEOF
+echo "Run config saved: ${RUN_LOG_DIR}/run_config.json"
 
 # ── NVLink detection ─────────────────────────────────────────────────
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
@@ -364,7 +432,28 @@ RAY_LOG_EXIT=$?
 RAY_STATUS_OUTPUT=$(ray job status --address="http://${MASTER_ADDR}:8265" "${RAY_JOB_SUBMISSION_ID}" --log-style=record 2>&1)
 echo "${RAY_STATUS_OUTPUT}"
 set -e
-if [[ "${RAY_STATUS_OUTPUT}" == *"SUCCEEDED"* ]]; then
+
+# ── Checkpoint cleanup: keep only the latest MAX_CKPT_KEEP ───────────
+CKPT_DIR="${SAVE_CKPT:-${CKPT_SAVE_DIR}}"
+if [[ -d "${CKPT_DIR}" ]] && (( MAX_CKPT_KEEP > 0 )); then
+  # Slime saves checkpoints as global_step_<N> directories
+  CKPT_DIRS=($(ls -1d "${CKPT_DIR}"/global_step_* 2>/dev/null | sort -t_ -k3 -n))
+  TOTAL_CKPTS=${#CKPT_DIRS[@]}
+  if (( TOTAL_CKPTS > MAX_CKPT_KEEP )); then
+    NUM_TO_DELETE=$(( TOTAL_CKPTS - MAX_CKPT_KEEP ))
+    echo "Checkpoint cleanup: found ${TOTAL_CKPTS}, keeping ${MAX_CKPT_KEEP}, deleting ${NUM_TO_DELETE}"
+    for (( i=0; i<NUM_TO_DELETE; i++ )); do
+      echo "  Removing old checkpoint: ${CKPT_DIRS[$i]}"
+      rm -rf "${CKPT_DIRS[$i]}"
+    done
+  else
+    echo "Checkpoint cleanup: ${TOTAL_CKPTS} checkpoints found, within limit (max=${MAX_CKPT_KEEP})"
+  fi
+fi
+
+RAY_STATUS_LOWER=$(echo "${RAY_STATUS_OUTPUT}" | tr '[:upper:]' '[:lower:]')
+if [[ "${RAY_STATUS_LOWER}" == *"succeeded"* ]]; then
+  echo "Ray job succeeded!"
   exit 0
 fi
 echo "Ray job failed (submission id: ${RAY_JOB_SUBMISSION_ID}, logs exit: ${RAY_LOG_EXIT})"

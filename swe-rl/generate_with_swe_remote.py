@@ -375,6 +375,22 @@ def _ensure_openai_base_url(args):
         logger.info(f"[SWE-R] OPENAI_BASE_URL resolved to {url}")
 
 
+def _fill_placeholder_tokens(sample: Sample, tokenizer) -> None:
+    """Fill an aborted sample with minimal valid tokens to prevent training crash.
+
+    Without valid tokens, prompt_length = total_length - response_length = 0,
+    causing F.pad(loss_mask, (prompt_length - 1, 1)) to crash with negative pad.
+    """
+    prompt_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "aborted"}],
+        add_generation_prompt=True, tokenize=True,
+    )
+    eos_id = tokenizer.eos_token_id or 0
+    sample.tokens = prompt_ids + [eos_id]
+    sample.response_length = 1
+    sample.loss_mask = [0]
+
+
 async def generate(args, sample: Sample, sampling_params: dict) -> Sample | list[Sample]:
     """Called by slime via ``--custom-generate-function-path``.
 
@@ -396,6 +412,8 @@ async def generate(args, sample: Sample, sampling_params: dict) -> Sample | list
         logger.error(
             f"[SWE-R] [{iid}] TOTAL ROLLOUT TIMEOUT ({rollout_timeout}s) exceeded, aborting sample"
         )
+        state = GenerateState(args)
+        _fill_placeholder_tokens(sample, state.tokenizer)
         sample.status = Sample.Status.ABORTED
         sample.reward = {"score": 0.0, "acc": 0.0}
         sample.remove_sample = True
@@ -538,6 +556,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict) -> Sample 
 
     if not messages:
         logger.warning(f"[SWE-R] [{iid}] Step 5/5: ABORTED — no messages (error={error})")
+        _fill_placeholder_tokens(sample, state.tokenizer)
         sample.status = Sample.Status.ABORTED
         sample.reward = {"score": 0.0, "acc": 0.0}
         sample.remove_sample = True
