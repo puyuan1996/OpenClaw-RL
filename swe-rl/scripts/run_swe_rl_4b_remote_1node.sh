@@ -42,7 +42,7 @@ mkdir -p "${EXPORT_ROOT}/ckpt" "${EXPORT_ROOT}/swe_rollouts"
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%F_%H%M%S)}
 DEBUG_MODE=${DEBUG_MODE:-0}
 SUBSET_K=${SUBSET_K:-0}          # 0=disabled; >0 = train on first K samples with full config
-MAX_CKPT_KEEP=${MAX_CKPT_KEEP:-2}
+MAX_CKPT_KEEP=${MAX_CKPT_KEEP:-1}
 
 # ── Structured log directory ─────────────────────────────────────────
 # Layout: logs/<run_name>/train.log, pool_server.log, run_config.json
@@ -105,12 +105,22 @@ if [[ "${DEBUG_MODE}" == "1" ]]; then
   ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-${HALF_GPUS}}
   echo "DEBUG_MODE: detected ${DETECTED_GPUS} GPUs, actor=${ACTOR_GPUS_PER_NODE}, rollout=${ROLLOUT_GPUS_PER_NODE}"
 else
-  NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE:-8}
-  ACTOR_GPUS_PER_NODE=${ACTOR_GPUS_PER_NODE:-4}
-  ROLLOUT_GPUS_PER_NODE=${ROLLOUT_GPUS_PER_NODE:-4}
-  ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}
+  NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE:-${DETECTED_GPUS:-8}}
+  HALF_GPUS=$(( NUM_GPUS_PER_NODE / 2 ))
+  ACTOR_GPUS_PER_NODE=${ACTOR_GPUS_PER_NODE:-${HALF_GPUS}}
+  ROLLOUT_GPUS_PER_NODE=${ROLLOUT_GPUS_PER_NODE:-${HALF_GPUS}}
+  # engine TP: half of rollout GPUs, minimum 1
+  ENGINE_TP=$(( HALF_GPUS > 1 ? HALF_GPUS / 2 : 1 ))
+  ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-${ENGINE_TP}}
 fi
 ROLLOUT_GPUS_TOTAL=${ROLLOUT_GPUS_TOTAL:-${ROLLOUT_GPUS_PER_NODE}}
+
+# Sanity check: clamp to actual GPU count
+if (( DETECTED_GPUS > 0 && NUM_GPUS_PER_NODE > DETECTED_GPUS )); then
+  echo "WARNING: NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE} > detected GPUs=${DETECTED_GPUS}, clamping to ${DETECTED_GPUS}"
+  NUM_GPUS_PER_NODE=${DETECTED_GPUS}
+fi
+echo "GPU config: total=${NUM_GPUS_PER_NODE}, actor=${ACTOR_GPUS_PER_NODE}, rollout=${ROLLOUT_GPUS_PER_NODE}, engine_tp=${ROLLOUT_NUM_GPUS_PER_ENGINE}"
 
 if (( ACTOR_GPUS_PER_NODE + ROLLOUT_GPUS_PER_NODE > NUM_GPUS_PER_NODE )); then
   echo "ACTOR_GPUS_PER_NODE + ROLLOUT_GPUS_PER_NODE must be <= NUM_GPUS_PER_NODE"
@@ -242,7 +252,7 @@ if [[ "${DEBUG_MODE}" == "1" ]]; then
   TP_SIZE=${ACTOR_GPUS_PER_NODE}
   MAX_TOKENS_PER_GPU=8192
 else
-  TP_SIZE=4
+  TP_SIZE=${TP_SIZE:-${ACTOR_GPUS_PER_NODE}}
   MAX_TOKENS_PER_GPU=16384
 fi
 PERF_ARGS=(
@@ -297,6 +307,8 @@ CUSTOM_ARGS=(
   --custom-generate-function-path generate_with_swe_remote.generate
   --custom-rm-path generate_with_swe_remote.reward_func
 )
+
+export WANDB_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
 
 # ── Weights & Biases ─────────────────────────────────────────────────
 if [[ "${DEBUG_MODE}" == "1" ]]; then
@@ -400,9 +412,11 @@ RUNTIME_ENV_JSON="{
     \"SWE_MAX_CONCURRENT\": \"${SWE_MAX_CONCURRENT}\",
     \"MSWEA_DOCKER_EXEC_MODE\": \"${MSWEA_DOCKER_EXEC_MODE:-api}\",
     \"NO_PROXY\": \"${NO_PROXY}\",
-    \"no_proxy\": \"${no_proxy}\"
+    \"no_proxy\": \"${no_proxy}\",
+    \"WANDB_MODE\": \"offline\"
   }
 }"
+
 
 # ── Submit Ray job ───────────────────────────────────────────────────
 RAY_JOB_SUBMISSION_ID=${RAY_JOB_SUBMISSION_ID:-"swe_rl_4b_remote_1node_$(date +%Y%m%d_%H%M%S)"}
@@ -452,6 +466,16 @@ if [[ -d "${CKPT_DIR}" ]] && (( MAX_CKPT_KEEP > 0 )); then
 fi
 
 RAY_STATUS_LOWER=$(echo "${RAY_STATUS_OUTPUT}" | tr '[:upper:]' '[:lower:]')
+
+# Extract real errors when job failed (socket.send spam hides the actual cause)
+if [[ "${RAY_STATUS_LOWER}" != *"succeeded"* ]]; then
+  echo ""
+  echo "========== REAL ERROR (filtered from ${RUN_LOG}) =========="
+  grep -E "CUDA error|invalid device|OOM|Exception:|Error:" "${RUN_LOG}" \
+    | grep -v "selector_events" | grep -v "FutureWarning" | tail -20 || true
+  echo "============================================================"
+fi
+
 if [[ "${RAY_STATUS_LOWER}" == *"succeeded"* ]]; then
   echo "Ray job succeeded!"
   exit 0
