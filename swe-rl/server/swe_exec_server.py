@@ -254,11 +254,24 @@ def container_evaluate():
         f"git reset --hard HEAD && git clean -fd && "
         f"git apply <<'{delimiter}'\n{patch}\n{delimiter}"
     )
-    r_apply = _docker(
-        "exec", "-w", cwd, container_id,
-        "bash", "-lc", apply_cmd,
-        timeout=60,
-    )
+    try:
+        r_apply = _docker(
+            "exec", "-w", cwd, container_id,
+            "bash", "-lc", apply_cmd,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "ok": True,
+            "resolved": False,
+            "error": "git apply timed out after 60s (patch may be too large)",
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": True,
+            "resolved": False,
+            "error": f"git apply unexpected error: {e}",
+        })
     if r_apply.returncode != 0:
         return jsonify({
             "ok": True,
