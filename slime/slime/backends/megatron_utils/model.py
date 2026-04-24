@@ -23,6 +23,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from slime.utils import logging_utils
+from slime.utils.checkpoint_utils import check_disk_space_and_cleanup, cleanup_old_checkpoints
 from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -700,6 +701,13 @@ def save(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
     args = get_args()
+
+    # Pre-save: ensure enough disk space (rank 0 only).
+    save_dir = getattr(args, "save", None)
+    is_rank0 = torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+    if save_dir and is_rank0:
+        check_disk_space_and_cleanup(save_dir)
+
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
     save_checkpoint(
@@ -714,6 +722,11 @@ def save(
     )
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
+
+    # Post-save: prune old checkpoints (rank 0 only).
+    max_keep = getattr(args, "max_ckpt_keep", 1)
+    if save_dir and is_rank0:
+        cleanup_old_checkpoints(save_dir, max_keep=max_keep)
 
 
 def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:

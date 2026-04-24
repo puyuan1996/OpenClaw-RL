@@ -6,6 +6,7 @@ from . import wandb_utils
 from .tensorboard_utils import _TensorboardAdapter
 
 _LOGGER_CONFIGURED = False
+_PENDING_METRICS: list[dict] = []
 
 
 # ref: SGLang
@@ -34,8 +35,18 @@ def init_tracking(args, primary: bool = True, **kwargs):
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     if args.use_wandb:
-        wandb.log(metrics)
+        if getattr(args, "_wandb_offline_secondary", False):
+            _PENDING_METRICS.append(metrics.copy())
+        else:
+            wandb.log(metrics)
 
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
         _TensorboardAdapter(args).log(data=metrics_except_step, step=metrics[step_key])
+
+
+def flush_pending_metrics():
+    global _PENDING_METRICS
+    result = _PENDING_METRICS
+    _PENDING_METRICS = []
+    return result

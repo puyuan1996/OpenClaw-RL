@@ -103,6 +103,11 @@ def init_wandb_secondary(args, router_addr=None):
 
     offline = _is_offline_mode(args)
 
+    if offline:
+        args._wandb_offline_secondary = True
+        logger.info("W&B offline mode: skipping secondary init, metrics will be relayed to primary.")
+        return
+
     if (not offline) and args.wandb_key is not None:
         wandb.login(key=args.wandb_key, host=args.wandb_host)
 

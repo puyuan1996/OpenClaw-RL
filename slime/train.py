@@ -1,9 +1,26 @@
 import ray
+import wandb
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
+
+
+def _relay_pending_metrics(result):
+    """Log pending wandb metrics relayed from secondary processes."""
+    if not result:
+        return
+    if wandb.run is None:
+        return
+    metrics_list = result if isinstance(result, list) else [result]
+    for item in metrics_list:
+        if isinstance(item, list):
+            for m in item:
+                if isinstance(m, dict):
+                    wandb.log(m)
+        elif isinstance(item, dict):
+            wandb.log(item)
 
 
 def train(args):
@@ -33,7 +50,7 @@ def train(args):
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
-        ray.get(rollout_manager.eval.remote(rollout_id=0))
+        _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id=0)))
 
     def offload_train():
         if args.offload_train:
@@ -64,9 +81,14 @@ def train(args):
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id)))
 
-        rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        gen_result = ray.get(rollout_manager.generate.remote(rollout_id))
+        if isinstance(gen_result, tuple):
+            rollout_data_ref, pending = gen_result
+            _relay_pending_metrics(pending)
+        else:
+            rollout_data_ref = gen_result
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
@@ -74,10 +96,10 @@ def train(args):
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_ref)
             if rollout_id >= args.num_critic_only_steps:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
-            ray.get(critic_train_handle)
+                _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, rollout_data_ref)))
+            _relay_pending_metrics(ray.get(critic_train_handle))
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+            _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, rollout_data_ref)))
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             save(rollout_id)
@@ -90,7 +112,7 @@ def train(args):
             ray.get(rollout_manager.onload_kv.remote())
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id)))
 
     ray.get(rollout_manager.dispose.remote())
 

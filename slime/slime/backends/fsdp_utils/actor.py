@@ -14,7 +14,7 @@ from slime.ray.train_actor import TrainRayActor
 from slime.utils import logging_utils, train_dump_utils, train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size, process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
-from slime.utils.logging_utils import init_tracking
+from slime.utils.logging_utils import flush_pending_metrics, init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.metric_utils import compute_rollout_step
 from slime.utils.misc import Box
@@ -429,7 +429,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         return packed_batches, grad_accum
 
-    def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
+    def train(self, rollout_id: int, rollout_data_ref: Box):
         """Run one training update over a rollout batch.
 
         Parameters:
@@ -446,7 +446,7 @@ class FSDPTrainRayActor(TrainRayActor):
         with inverse_timer("train_wait"), timer("train"):
             rollout_data = process_rollout_data(self.args, rollout_data_ref, self.dp_rank, self.dp_size)
             if self.args.debug_rollout_only:
-                return
+                return flush_pending_metrics() or None
             self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
 
         train_metric_utils.log_perf_data_raw(
@@ -455,6 +455,8 @@ class FSDPTrainRayActor(TrainRayActor):
             is_primary_rank=dist.get_rank() == 0,
             compute_total_fwd_flops=None,
         )
+
+        return flush_pending_metrics() or None
 
     def _log_rollout_data(self, rollout_id: int, rollout_data, packed_batches):
         log_dict = {}

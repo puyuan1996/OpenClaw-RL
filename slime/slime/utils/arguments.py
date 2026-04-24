@@ -767,6 +767,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
             reset_arg(parser, "--save-interval", type=int, default=None)
+            parser.add_argument(
+                "--max-ckpt-keep",
+                type=int,
+                default=1,
+                help="Maximum number of checkpoints to keep. Older checkpoints are auto-deleted. Default: 1.",
+            )
             reset_arg(parser, "--async-save", action="store_true")
             reset_arg(
                 parser,
