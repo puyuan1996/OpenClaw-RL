@@ -168,6 +168,13 @@ def get_batch(
         strict=True,
     ):
         prompt_length = total_length - response_length
+        if prompt_length < 1:
+            logger.warning(
+                "Degenerate sample in get_batch: total_length=%d, response_length=%d; "
+                "clamping prompt_length to 1",
+                total_length, response_length,
+            )
+            prompt_length = 1
         # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
         loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
         loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)

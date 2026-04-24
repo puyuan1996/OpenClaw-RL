@@ -1,9 +1,26 @@
 import ray
+import wandb
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
+
+
+def _relay_pending_metrics(result):
+    """Log pending wandb metrics relayed from secondary processes."""
+    if not result:
+        return
+    if wandb.run is None:
+        return
+    metrics_list = result if isinstance(result, list) else [result]
+    for item in metrics_list:
+        if isinstance(item, list):
+            for m in item:
+                if isinstance(m, dict):
+                    wandb.log(m)
+        elif isinstance(item, dict):
+            wandb.log(item)
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
@@ -32,7 +49,12 @@ def train(args):
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
         if rollout_data_next_future is not None:
-            rollout_data_curr_ref = ray.get(rollout_data_next_future)
+            gen_result = ray.get(rollout_data_next_future)
+            if isinstance(gen_result, tuple):
+                rollout_data_curr_ref, pending = gen_result
+                _relay_pending_metrics(pending)
+            else:
+                rollout_data_curr_ref = gen_result
 
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
@@ -41,10 +63,10 @@ def train(args):
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if rollout_id >= args.num_critic_only_steps:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
-            ray.get(critic_train_handle)
+                _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref)))
+            _relay_pending_metrics(ray.get(critic_train_handle))
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref)))
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             actor_model.save_model(
@@ -61,12 +83,20 @@ def train(args):
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
             # sync generate before update weights to prevent update weight in the middle of generation
-            rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+            if (x := rollout_data_next_future) is not None:
+                gen_result = ray.get(x)
+                if isinstance(gen_result, tuple):
+                    rollout_data_curr_ref, pending = gen_result
+                    _relay_pending_metrics(pending)
+                else:
+                    rollout_data_curr_ref = gen_result
+            else:
+                rollout_data_curr_ref = None
             rollout_data_next_future = None
             actor_model.update_weights()
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id)))
 
     ray.get(rollout_manager.dispose.remote())
 

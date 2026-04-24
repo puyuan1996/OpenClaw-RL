@@ -155,7 +155,11 @@ class RolloutManager:
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = self._convert_samples_to_train_data(data)
-        return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+        rollout_data_refs = self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+        pending = logging_utils.flush_pending_metrics()
+        if pending:
+            return rollout_data_refs, pending
+        return rollout_data_refs
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -169,6 +173,9 @@ class RolloutManager:
         metrics = _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
+        pending = logging_utils.flush_pending_metrics()
+        if pending:
+            return pending
 
     def save(self, rollout_id):
         self.data_source.save(rollout_id)

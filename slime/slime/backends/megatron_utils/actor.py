@@ -17,7 +17,7 @@ from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
-from slime.utils.logging_utils import init_tracking
+from slime.utils.logging_utils import flush_pending_metrics, init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
@@ -399,7 +399,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
-    def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
+    def train(self, rollout_id: int, rollout_data_ref: Box):
         if self.args.offload_train:
             self.wake_up()
 
@@ -407,12 +407,14 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data = self._get_rollout_data(rollout_data_ref)
             if self.args.debug_rollout_only:
                 log_rollout_data(rollout_id, self.args, rollout_data)
-                return
+                return flush_pending_metrics() or None
 
         if self.role == "critic":
-            return self.train_critic(rollout_id, rollout_data)
+            self.train_critic(rollout_id, rollout_data)
         else:
-            return self.train_actor(rollout_id, rollout_data)
+            self.train_actor(rollout_id, rollout_data)
+
+        return flush_pending_metrics() or None
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.

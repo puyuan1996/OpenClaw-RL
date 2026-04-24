@@ -318,7 +318,8 @@ def evaluate():
         )
         return jsonify(result)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        logger.exception("Evaluate failed for lease=%s", lease_id)
+        return jsonify({"ok": True, "resolved": False, "error": f"pool error: {e}"})
 
 
 @app.post("/close")

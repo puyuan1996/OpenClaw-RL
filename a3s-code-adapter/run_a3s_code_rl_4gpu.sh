@@ -194,12 +194,14 @@ ray start \
   --dashboard-host=0.0.0.0 \
   --dashboard-port=8265
 
+  # --save-interval 100
+
 # ── Checkpoint args ──────────────────────────────────────────────
 CKPT_ARGS=(
   --hf-checkpoint "${HF_CKPT}"
   --ref-load "${REF_LOAD}"
   --save "${SAVE_CKPT}"
-  --save-interval 100
+  --save-interval 500
   --rotary-base 1000000
 )
 
