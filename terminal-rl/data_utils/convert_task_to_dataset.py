@@ -80,12 +80,25 @@ def convert_tasks(
     val_path = output_dir / f"val.{format}"
 
     if format == "jsonl":
-        train_wrapped = pd.DataFrame({"task": train_df.to_dict(orient="records")})
-        val_wrapped = pd.DataFrame({"task": val_df.to_dict(orient="records")})
+        train_records = train_df.to_dict(orient="records")
+        val_records = val_df.to_dict(orient="records")
+
+        train_wrapped = pd.DataFrame({
+            "task": [[{"content": r["instruction"], "role": "user"}] for r in train_records],
+            "metadata": train_records,
+        })
+        val_wrapped = pd.DataFrame({
+            "task": [[{"content": r["instruction"], "role": "user"}] for r in val_records],
+            "metadata": val_records,
+        })
+
         train_wrapped.to_json(
             train_path, orient="records", lines=True, force_ascii=False
         )
-        val_wrapped.to_json(val_path, orient="records", lines=True, force_ascii=False)
+        val_wrapped.to_json(
+            val_path, orient="records", lines=True, force_ascii=False
+        )
+
     elif format == "parquet":
         train_df.to_parquet(train_path, index=False)
         val_df.to_parquet(val_path, index=False)

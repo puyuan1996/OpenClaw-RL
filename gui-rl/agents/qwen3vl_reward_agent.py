@@ -57,7 +57,7 @@ Assign a score of +1 if ALL of the following are true:
 Otherwise assign a score of -1, for example if the step is incorrect, irrelevant, impossible in context, has no visible effect,
 undoes progress, contradicts the next observation, or hallucinates tools/objects/facts.
 
-Think carefully, then provide your reasoning and put the final score in \boxed{{}}.
+Think carefully but DO NOT over-think, then provide your reasoning and put the final score in \boxed{{}}.
 """
 
 
@@ -239,17 +239,16 @@ class Qwen3VLRewardAgent:
         image_count = 0
         if self.processor is not None:
             multimodal_inputs = slime_process_vision_info(messages, self.processor) or {}
-            proc_kwargs: Dict[str, Any] = {"text": [prompt_text], "return_tensors": "pt", **multimodal_inputs}
             images = multimodal_inputs.get("images") or []
             image_count = len(images)
             if images:
                 payload["image_data"] = [encode_image_for_rollout_engine(img) for img in images]
-            proc_out = self.processor(**proc_kwargs)
-            input_ids = proc_out["input_ids"][0].tolist()
-        else:
-            input_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
 
-        payload["input_ids"] = input_ids
+        input_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        if payload.get("image_data"):
+            payload["text"] = prompt_text
+        else:
+            payload["input_ids"] = input_ids
         return payload, prompt_text, len(input_ids), image_count
 
     def _decode_text(self, output: Any) -> str:

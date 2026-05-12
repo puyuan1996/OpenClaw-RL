@@ -14,16 +14,19 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/⚡_Fully_Async-yellow?style=for-the-badge" alt="Fully Async" />
-  <img src="https://img.shields.io/badge/💰_Zero_API_Keys-blue?style=for-the-badge" alt="Zero API Keys" />
+  <img src="https://img.shields.io/badge/💰_Zero_API_or_Zero_GPU-blue?style=for-the-badge" alt="Zero API or Zero GPU" />
   <img src="https://img.shields.io/badge/🤖_Personalized-success?style=for-the-badge" alt="Personalized" />
   <img src="https://img.shields.io/badge/🛠️_Auto_Optimization-orange?style=for-the-badge" alt="Auto" />
   <img src="https://img.shields.io/badge/💬_Language_Feedback-purple?style=for-the-badge" alt="Language Feedback" />
+  <img src="https://img.shields.io/badge/🧠_Hybrid_RL-red?style=for-the-badge" alt="Hybrid RL" />
+  <img src="https://img.shields.io/badge/🌍_Real_World_Agentic_RL-green?style=for-the-badge" alt="General Agentic RL" />
   <br><br>
   <a href="https://arxiv.org/abs/2603.10165"><img src="https://img.shields.io/badge/📄_Tech_Report-red?style=flat-square" alt="Tech Report" /></a>
   <a href="https://yinjjiew.github.io/projects/openclawrl1"><img src="https://img.shields.io/badge/Blog-Page-blue?style=flat-square" alt="OpenClaw-RL Blog" /></a>
   <a href="https://openclaw.ai"><img src="https://img.shields.io/badge/OpenClaw-Plugin-orange?style=flat-square" alt="OpenClaw Plugin" /></a>
-  <a href="https://github.com/THUDM/slime"><img src="https://img.shields.io/badge/Slime-Based-purple?style=flat-square" alt="Slime Based" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License MIT" /></a>
+  <a href="https://github.com/THUDM/slime"><img src="https://img.shields.io/badge/Slime-Supported-purple?style=flat-square" alt="Slime Based" /></a>
+  <a href="https://thinkingmachines.ai/tinker/"><img src="https://img.shields.io/badge/Tinker-Supported-yellow?style=flat-square" alt="Tinker Supported" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-green?style=flat-square" alt="License Apache 2.0" /></a>
 </p>
 
 <p align="center">
@@ -40,7 +43,14 @@
 
 ## 📰 News
 
-- **[2026/3/10]** 🔥 We have released our [**Technical Report**](https://arxiv.org/abs/2603.10165)! 🏆 Ranked **#1** on [HuggingFace Daily Papers](https://huggingface.co/papers/2603.10165)!
+- **[2026/4/15]** 🙌 We sincerely thank [Fireworks AI](https://fireworks.ai) for its generous support of this project, which has enabled more experiments and faster iteration.
+- **[2026/4/11]** ✨ Qwen3.5-4B/9B/27B is supported now, both text and multi-modal!
+- **[2026/4/4]** 👨‍👦‍👦 We support optimizing a single model based on feedback from a group of people.
+- **[2026/3/25]** 🙌 We sincerely thank [Tinker](https://thinkingmachines.ai/tinker/) for its generous support of this project, which has enabled more experiments and faster iteration.
+- **[2026/3/20]** 💻 You can use your own openclaw now, simply install [this extension](https://github.com/Gen-Verse/OpenClaw-RL/tree/main/extensions/rl-training-headers).
+- **[2026/3/13]** ☁️ OpenClaw-RL now supports both local GPU and cloud ([Tinker](https://thinkingmachines.ai/tinker/)) deployment. Launch with [**one line of code**](#combinemethod) — Hybrid RL, OPD, and Binary RL all supported!
+- **[2026/3/12]** ⚡ We support LoRA training now!
+- **[2026/3/10]** 📃 We have released our [**Technical Report**](https://arxiv.org/abs/2603.10165)! 🏆 Ranked **#1** on [HuggingFace Daily Papers](https://huggingface.co/papers/2603.10165)!
 - **[2026/3/10]** 🔥 Huge updates today! We released a [new combination method](./openclaw-combine), along with an [interesting evaluation](./openclaw-test) of these OpenClaw-RL methods. Track 2 is released too, featuring scalable RL implementations for general agent settings across [terminal](./terminal-rl), [GUI](./gui-rl), [SWE](./swe-rl), and [tool-call](./toolcall-rl) scenarios. We only focus on real-world settings!
 - **[2026/3/3]** 🙌 Working with the authors of [SDFT](https://arxiv.org/abs/2601.19897) and [SDPO](https://arxiv.org/abs/2601.20802), we have integrated their methods into [openclaw-opd](./openclaw-opd). We welcome the integration of novel and effective methods!
 - **[2026/3/3]** 📺 Check out these community tutorial videos on OpenClaw-RL: [Video 1](https://www.youtube.com/watch?v=5xnm1vB7G64) | [Video 2](https://www.youtube.com/watch?v=ZtN6Gg_bdJE)
@@ -86,7 +96,7 @@ You do not need to manually label data. The system automatically:
 
 **On-Policy Distillation (OPD):** When the next state reveals useful hindsight, a judge model extracts a textual hint. This hint augments the original prompt to create an enhanced teacher, whose token-level log-probability gap with the student becomes a directional advantage signal richer than any scalar reward.
 
-**Combination Method:** OpenClaw-RL further combines Binary RL and OPD in a unified training recipe, leveraging the dense scalar supervision of Binary RL together with the richer token-level directional signal from OPD. This combination achieves stronger and more robust optimization than either method alone.
+**Hybrid Method:** OpenClaw-RL further combines Binary RL and OPD in a unified training recipe, leveraging the dense scalar supervision of Binary RL together with the richer token-level directional signal from OPD. This combination achieves stronger and more robust optimization than either method alone.
 
 ### From Personal Agents to Real-World Agentic RL
 The same framework supports both personalized OpenClaw optimization and scalable RL for **terminal**, **GUI**, **SWE**, and **tool-call** agents in real-world settings.
@@ -106,24 +116,26 @@ Our long-term goal is to **advance personalized, practically useful agents with 
 #### Track 1 — [Personal Agent Optimization](#personalagent) (Small-Scale but Personal)
 ✅ **Release Track 1:** Fully async OpenClaw-RL framework with Binary RL + OPD  
 ✅ Best recipe discovery via demonstration experiments  
-⬜ Support Lora Training & low-precision training/inference  
-⬜ Deploy training on [Tinker](https://thinkingmachines.ai/tinker/)  
-⬜ Beyond the policy: extend learning to skills and memory  
+✅ Support LoRA Training  
+✅ Deploy training on [Tinker](https://thinkingmachines.ai/tinker/)  
+✅ Deploy training on [Fireworks AI](https://fireworks.ai)
 
 #### Track 2 — [General Agents Optimization](#generalagent) (Scalable Infra)
 ✅ **Release Track 2:** Scalable agentic RL infra for general agents  
+✅ Support Qwen3.5  
 ⬜ Support more cloud services  
 
 
-
+<!--
 ## 🤝 Contributing
 
-We welcome contributions that integrate new learning methods into the OpenClaw-RL framework! The integration of [SDFT](https://arxiv.org/abs/2601.19897) / [SDPO](https://arxiv.org/abs/2601.20802) into [openclaw-opd](./openclaw-opd) is a great example of a successful community contribution.
+We welcome contributions that integrate new learning methods into the OpenClaw-RL framework! The integration of [SDFT](https://arxiv.org/abs/2601.19897) / [SDPO](https://arxiv.org/abs/2601.20802) into [openclaw-opd](./openclaw-opd), and [supporting LoRA](https://github.com/Gen-Verse/OpenClaw-RL/pull/23) are great examples of successful community contributions.
+
+
 
 **Highly wanted contributions:**
-- ☁️ **Tinker cloud deployment** — run OpenClaw-RL training on [Tinker](https://thinkingmachines.ai/tinker/)
-- 🤖 **Qwen3.5 model support** — launch scripts and model configs for the Qwen3.5 family
-- 🔧 **LoRA & low-precision examples** — enable training on consumer-grade hardware with fewer GPUs
+- 🤖 **Qwen3.5 model support with slime** — launch scripts and model configs for the Qwen3.5 family
+- 🔧 **Low-precision training examples** — FP8/INT4 training scripts for existing methods
 
 <details>
 <summary><b>📋 Full contribution guidelines & feature wishlist</b></summary>
@@ -161,21 +173,8 @@ For changes within an existing method folder — such as supporting a new model 
 
 ## Highly Preferred Features
 
-### 1. ☁️ Deploy Training on [Tinker](https://thinkingmachines.ai/tinker/)   
 
-**Type:** New method folder
-
-**Goal:** Add a new top-level folder (e.g., `tinker/`) that provides a turnkey example for running OpenClaw-RL training on the Tinker cloud platform.
-
-**Requirements:**
-
-- A new self-contained folder at the repo root, following the same structure as other method folders.
-- A launch script that adapts GPU allocation, Ray setup, and networking for the Tinker environment.
-- The recommended training method is the **combination loss** (`openclaw-combine`), as it achieves the best results in our experiments. The example should either import or replicate the combination loss setup.
-- A `README.md` covering: Tinker-specific prerequisites, step-by-step setup, how to configure checkpoints and data paths on Tinker, and how to connect OpenClaw to the running server.
-
-
-### 2. 🤖 Qwen3.5 Model Support 
+### 1. 🤖 Qwen3.5 Model Support of slime
 
 **Type:** Extend existing method folders
 
@@ -189,16 +188,15 @@ For changes within an existing method folder — such as supporting a new model 
 - Update READMEs to list Qwen3.5 as a supported model.
 
 
-### 3. 🔧 LoRA Training & Low-Precision Training/Inference Examples 
+### 2. 🔧 Low-Precision Training/Inference Examples
 
 **Type:** Extend existing method folders
 
-**Goal:** Add LoRA fine-tuning and low-precision (e.g., INT8/INT4 inference, BF16/FP8 training) example scripts to existing method folders, enabling users to run OpenClaw-RL on consumer-grade hardware with fewer GPUs.
+**Goal:** Add low-precision (e.g., INT8/INT4 inference, BF16/FP8 training) example scripts to existing method folders, enabling users to run OpenClaw-RL on consumer-grade hardware with fewer GPUs.
 
 **Requirements:**
 
-- Add **new** `.sh` scripts within existing method folders (e.g., `openclaw-combine/run_qwen3_4b_lora.sh`, `openclaw-rl/run_qwen3_4b_lora.sh`) — do not modify existing scripts.
-- LoRA training: demonstrate parameter-efficient fine-tuning with configurable rank, alpha, and target modules. Should work with 2–4 GPUs.
+- Add **new** `.sh` scripts within existing method folders — do not modify existing scripts.
 - Low-precision inference: demonstrate launching the SGLang rollout engine with quantized weights (e.g., AWQ/GPTQ INT4) to reduce VRAM for the serving side.
 - Low-precision training: if supported by the Megatron backend, demonstrate FP8 or mixed-precision configurations that reduce training memory.
 - Update the corresponding `README.md` in each method folder with a new section documenting these scripts.
@@ -210,15 +208,13 @@ If you're interested in any of these, feel free to open an issue to discuss your
 
 </details>
 
-
+-->
 
 
 ## 📝 Contents
 
 - [Personal OpenClaw Optimization](#personalagent)
-  - [Combination Method (Binary RL + OPD)](#combinemethod)
-  - [Binary RL](#binaryrlmethod)
-  - [On-policy Distillation](#opdmethod)
+  - [Bybrid RL](#combinemethod)
   - [Method Evaluation](#evalmethod)
 - [Agentic RL in Real World Settings](#agentrl)
   - [Terminal Agent](#terminal)
@@ -233,9 +229,8 @@ If you're interested in any of these, feel free to open an issue to discuss your
 <a id="personalagent"></a>
 ## 🔧 Personal Agent Optimization Quick Start
 
-### 1. RL Server Environment
+### 1. Deployment Requirements
 
-### Prerequisites
 
 - **Hardware:** 8× GPUs (default; configurable via `NUM_GPUS`, `ACTOR_GPUS`, `ROLLOUT_GPUS`, `PRM_GPUS`)
 - **Software:** CUDA 12.9, Python 3.12
@@ -243,72 +238,45 @@ If you're interested in any of these, feel free to open an issue to discuss your
 
 For detailed environment setup, see [Slime](https://github.com/THUDM/slime) or [`./instructions/README.md`](./instructions/README.md).
 
+<!--
 
+#### Don't have a GPU?
 
+**Option 1: Tinker**
 
+Create a [Tinker API](https://thinkingmachines.ai/tinker/). That's all you need. Tinker only supports LoRA, which may not be as effective as full fine-tuning, but it's really cheap.
 
+See [`./openclaw-tinker/README.md`](./openclaw-tinker/README.md) for setup details.
+
+**Option 2: Fireworks Training SDK**
+
+Use the [Fireworks Training SDK](https://fireworks.ai). Supports full-parameter and LoRA training.
+
+See [`./openclaw-fireworks/README.md`](./openclaw-fireworks/README.md) for setup details.
+
+-->
 
 
 
 ### 2. Start the RL Server
 
-We provide three methods (RL servers):
 
-| Dimension | [Binary RL](./openclaw-rl/) | [OPD](./openclaw-opd) | [Combined](./openclaw-combine) |
-|---|---|---|---|
-| Signal type | Evaluative (good / bad) | Directional | Evaluative + directional |
-| Advantage | Sequence-level scalar | Token-level directional | Mixed sequence and token-level |
-| Density | All scored turns | Hint-accepted turns only | All scored turns |
-| Feedback type | User / environment | Explicit corrections | Both implicit and explicit feedback |
-| Signal richness | 1 scalar per sample | 1 value per token | 1 value per token |
-
-
-
-Choose your optimization method:
 
 <a id="combinemethod"></a>
-<details>
-<summary><b>Option A: Combination Method</b> — Recommended !</summary>
 
 ```bash
 cd slime
-bash ../openclaw-combine/run_qwen3_4b_openclaw_combine.sh
+bash ../openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh
 ```
 
 This method combines binary RL and OPD to achieve the best optimization.
 
 See [`./openclaw-combine/README.md`](./openclaw-combine/README.md) for algorithm details.
-</details>
 
 
-<a id="binaryrlmethod"></a>
-<details>
-<summary><b>Option B: Binary RL</b> — Best for implicit feedback (likes/dislikes, env success/failure)</summary>
-
-```bash
-cd slime
-bash ../openclaw-rl/run_qwen3_4b_openclaw_rl.sh
-```
-
-The PRM will automatically judge response quality from next-state feedback. We recommend providing frequent feedback (e.g., 👍/👎) to help the model optimize effectively.
-
-See [`./openclaw-rl/README.md`](./openclaw-rl/README.md) for algorithm details.
-</details>
 
 
-<a id="opdmethod"></a>
-<details>
-<summary><b>Option C: On-Policy Distillation (OPD)</b> — Best for rich textual feedback</summary>
 
-```bash
-cd slime
-bash ../openclaw-opd/run_qwen3_4b_openclaw_opd.sh
-```
-
-The system extracts hindsight hints from your feedback and distills them into the policy at the token level. We recommend providing concrete feedback (e.g., "you should have checked the file first" or "don't use that library").
-
-See [`./openclaw-opd/README.md`](./openclaw-opd/README.md) for algorithm details.
-</details>
 
 Once running, the model is served as an OpenAI-compatible API at:
 ```
@@ -323,26 +291,27 @@ We also provide an interesting case for evaluation. A student who uses OpenClaw 
 
 <a id="evalmethod"></a>
 <details>
-<summary><b>Eval Setting</b> — Both student and teacher use AI!</summary>
+<summary><b>Evaluation Setting</b> — Both student, TA and teacher use AI!</summary>
 
-We find that, under the combined optimization method, OpenClaw needs only 36 problem-solving interactions in the student setting and 24 grading interactions in the teacher setting to achieve a significant and clearly visible improvement.
 
-<p align="center">
-  <img src="assets/openclawrl1performance.png"  alt="Overview"  width="750">
-</p>
+<img src="assets/example.png" alt="Overview" width="750">
 
-See [`./openclaw-test/README.md`](./openclaw-test/README.md) for setup and algorithm details.
+See [`./openclaw-test/README.md`](./openclaw-test/README.md) for setup and algorithm details. Example of evaluation [results](https://github.com/Gen-Verse/OpenClaw-RL/blob/main/openclaw-test/results.txt).
 </details>
 
 
 ### 3. OpenClaw Setup
 
-Install OpenClaw from the version bundled in this repository (we will update it regularly):
+You can use your own openclaw, just install [this extension](https://github.com/Gen-Verse/OpenClaw-RL/tree/main/extensions/rl-training-headers).
+
+
 
 <details>
 <summary><b>Then configure OpenClaw to route requests to your RL server. </b></summary>
 
 Open your `openclaw.json` (or the equivalent settings file) and add a provider entry under `"models"` → `"providers"`:
+
+Example of Slime-based RL server:
 
 ```json
 {
@@ -376,26 +345,46 @@ Open your `openclaw.json` (or the equivalent settings file) and add a provider e
 
 Replace `<HOST_IP>` with the IP address of your RL server machine. The `apiKey` should match the `SGLANG_API_KEY` you set when starting the server.
 
+Example of Tinker-based RL server:
+
+
+```json
+{
+  "models": {
+    "providers": {
+      "openclaw-rl": {
+        "baseUrl": "http://localhost:30000/v1",
+        "apiKey": "no-auth-needed",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "qwen3-4b-lora",
+            "name": "Qwen3 4B (OpenClaw-RL LoRA)",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 32768,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+
+
 That's it — start chatting with your OpenClaw agent. The RL server will automatically collect conversation trajectories, compute rewards, and train the model. Your agent gets better the more you use it.
 
 </details>
 
-#### Configurations
 
-Before launching, set these important environment variables as needed:
-
-| Variable | Default | Description |
-|---|---|---|
-| `NUM_GPUS` | `8` | Total GPUs available on the machine |
-| `ACTOR_GPUS` | `4` | GPUs allocated to the training actor |
-| `ROLLOUT_GPUS` | `2` | GPUs allocated to rollout generation |
-| `PRM_GPUS` | `2` | GPUs allocated to the Process Reward Model |
-| `HF_CKPT` | (see script) | Path to the base HuggingFace checkpoint |
-| `PRM_MODEL_PATH` | (see script) | Path to the reward model HuggingFace checkpoint |
-| `SAVE_CKPT` | (see script) | Path to the saved HuggingFace checkpoint |
-| `SGLANG_API_KEY` | — | API key for the SGLang serving endpoint |
-
-You can check more details about configurations in [`./instructions`](./instructions) .
 
 
 ---
@@ -480,7 +469,7 @@ See [`./toolcall-rl/README.md`](./toolcall-rl/README.md) for setup details.
 
 ## 🙏 Acknowledgements
 
-This work aims to explore more effective paradigms for Agentic RL. Our implementation builds upon the excellent codebases of [slime](https://github.com/THUDM/slime), [OpenClaw](https://github.com/openclaw/openclaw) and [Open-AgentRL](https://github.com/Gen-Verse/Open-AgentRL). 
+This work aims to explore more effective paradigms for Agentic RL. Our implementation builds upon the excellent codebases of [slime](https://github.com/THUDM/slime), [OpenClaw](https://github.com/openclaw/openclaw), [Tinker](https://thinkingmachines.ai/tinker/) and [Open-AgentRL](https://github.com/Gen-Verse/Open-AgentRL). 
 
 We also build terminal RL using [SETA](https://github.com/camel-ai/seta)'s dataset and agent framework, GUI RL using [OSWorld](https://github.com/xlang-ai/OSWorld)'s evaluation scripts, SWE RL using [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)'s evaluation scripts, and tool-call RL based on the work of [Retool](https://github.com/ReTool-RL/ReTool).
 
@@ -492,7 +481,6 @@ When using OpenClaw-RL, please do not provide sensitive personal information dur
 
 
 ---
-
 
 
 

@@ -9,12 +9,20 @@ from slime.utils.http_utils import post
 logger = logging.getLogger(__name__)
 
 
+def create_env_client() -> TerminalEnvClient:
+    env_server_url = os.getenv("ENV_SERVER_URL", "")
+    if not env_server_url:
+        raise RuntimeError("ENV_SERVER_URL is empty.")
+
+    return TerminalEnvClient(env_server_url)
+
+
 class TerminalEnvClient:
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
         self.default_max_retries = int(os.getenv("ENV_HTTP_MAX_RETRIES", "10"))
-        self.allocate_max_retries = int(os.getenv("ENV_ALLOCATE_MAX_RETRIES", "100"))
+        self.allocate_max_retries = int(os.getenv("ENV_ALLOCATE_MAX_RETRIES", "10"))
         self.evaluate_max_retries = int(os.getenv("ENV_EVALUATE_MAX_RETRIES", "1"))
         self.close_max_retries = int(os.getenv("ENV_CLOSE_MAX_RETRIES", "3"))
         self.exec_tool_max_retries = int(os.getenv("ENV_EXEC_TOOL_MAX_RETRIES", "3"))

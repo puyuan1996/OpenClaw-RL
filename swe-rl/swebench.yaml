@@ -209,12 +209,12 @@ agent:
 
     If you have completed your assignment, please consult the first message about how to
     submit your solution (you will not be able to continue working on this task after that).
-  step_limit: 20
+  step_limit: 30
   cost_limit: 3.
 
 environment:
   cwd: "/testbed"
-  timeout: 180
+  timeout: 30
   pull_timeout: 1200
   env:
     PAGER: cat

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import datetime
-import inspect
+import json
 import logging
+import re
 import time
-import traceback
 import uuid
 from copy import deepcopy
 from typing import Any, Dict, List
@@ -92,6 +91,8 @@ def process_tool_calls(
             return tool_calls, text, finish_reason
         except Exception as exc:
             logger.error("Tool call parsing error: %s", exc)
+            import traceback
+
             traceback.print_exc()
             return None, text, finish_reason
 
@@ -115,15 +116,44 @@ def _ensure_stop_token_ids(
     return normalized
 
 
-def _to_positive_int(value: Any) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
+def create_sglang_client(
+    tokenizer: Any,
+    client_template_kwargs: Dict[str, Any],
+    max_total_tokens: int,
+    sampling_params: Dict[str, Any],
+    enable_sglang_non_think: bool,
+    sglang_url: str,
+    max_retries: int = 30,
+) -> "SGLangClient":
+    if enable_sglang_non_think:
+        raw_chat_template_kwargs = client_template_kwargs.get("chat_template_kwargs")
+        if isinstance(raw_chat_template_kwargs, dict):
+            merged_chat_template_kwargs = dict(raw_chat_template_kwargs)
+        else:
+            merged_chat_template_kwargs = {}
+        merged_chat_template_kwargs["enable_thinking"] = False
+        client_template_kwargs["chat_template_kwargs"] = merged_chat_template_kwargs
+
+    max_new_tokens = sampling_params["max_new_tokens"]
+    max_input_tokens = max_total_tokens - max_new_tokens
+    logger.info(
+        "SGLang client: url=%s, max_input_tokens=%d, max_new_tokens=%d",
+        sglang_url,
+        max_input_tokens,
+        max_new_tokens,
+    )
+
+    return SGLangClient(
+        tokenizer=tokenizer,
+        sampling_params=sampling_params,
+        url=sglang_url,
+        max_input_tokens=max_input_tokens,
+        max_retries=max_retries,
+        **client_template_kwargs,
+    )
 
 
-class SGLangTurnClient:
+class SGLangClient:
     def __init__(
         self,
         *,
@@ -135,10 +165,8 @@ class SGLangTurnClient:
         chat_template_kwargs: Dict[str, Any] | None = None,
         messages_delimiter_start: str = "<|im_start|>",
         messages_delimiter_end: str = "<|im_end|>",
-        session_id: str | None = None,
         tool_call_parser: str | None = None,
         max_input_tokens: int | None = None,
-        request_timeout: float | None = None,
         max_retries: int = 30,
     ) -> None:
         self.model_type = model_type
@@ -149,13 +177,9 @@ class SGLangTurnClient:
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.messages_delimiter_start = messages_delimiter_start
         self.messages_delimiter_end = messages_delimiter_end
-        self.session_id = session_id
         self.tool_call_parser = tool_call_parser
-        self.max_input_tokens = _to_positive_int(max_input_tokens)
-        self.request_timeout = (
-            request_timeout if (request_timeout and request_timeout > 0) else None
-        )
-        self.max_retries = max(1, max_retries)
+        self.max_input_tokens = max_input_tokens
+        self.max_retries = max_retries
 
         self.marker = "\n[OMITTED MIDDLE]\n"
         self.sep_ids = self.tokenizer.encode(self.marker, add_special_tokens=False)
@@ -184,7 +208,7 @@ class SGLangTurnClient:
 
         return input_ids[:head] + self.sep_ids + input_ids[-tail:]
 
-    async def generate_turn(
+    async def generate(
         self,
         *,
         messages: List[dict[str, Any]],
@@ -198,38 +222,9 @@ class SGLangTurnClient:
             "sampling_params": self.sampling_params,
             "return_logprob": True,
         }
-        headers: Dict[str, str] | None = None
-        if self.session_id:
-            headers = {"X-SMG-Routing-Key": self.session_id}
 
         t0 = time.monotonic()
-        supports_headers = "headers" in inspect.signature(async_post).parameters
-
-        async def _do_post():
-            if headers and supports_headers:
-                return await async_post(
-                    self.url, payload, max_retries=self.max_retries, headers=headers
-                )
-            else:
-                if headers and not supports_headers:
-                    logger.warning(
-                        "async_post() does not accept headers; routing key will be ignored for this request."
-                    )
-                return await async_post(self.url, payload, max_retries=self.max_retries)
-
-        if self.request_timeout:
-            try:
-                output = await asyncio.wait_for(
-                    _do_post(), timeout=self.request_timeout
-                )
-            except asyncio.TimeoutError:
-                elapsed = (time.monotonic() - t0) * 1000.0
-                raise TimeoutError(
-                    f"SGLang generate request timed out after {self.request_timeout}s "
-                    f"(elapsed={elapsed:.0f}ms, turn_idx={turn_idx})"
-                )
-        else:
-            output = await _do_post()
+        output = await async_post(self.url, payload, max_retries=self.max_retries)
         latency_ms = (time.monotonic() - t0) * 1000.0
 
         output_text: str = output["text"]
@@ -306,7 +301,7 @@ class SGLangTurnClient:
     ) -> List[int]:
         if self.chat_template_type == "hf":
             try:
-                return self.tokenizer.apply_chat_template(
+                result = self.tokenizer.apply_chat_template(
                     messages,
                     tools=tools or None,
                     add_generation_prompt=True,
@@ -314,12 +309,16 @@ class SGLangTurnClient:
                     **self.chat_template_kwargs,
                 )
             except Exception:
-                return self.tokenizer.apply_chat_template(
+                result = self.tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
                     tokenize=True,
                     **self.chat_template_kwargs,
                 )
+            # tokenizer may return BatchEncoding instead of list[int]
+            if hasattr(result, "input_ids"):
+                result = result["input_ids"]
+            return result if isinstance(result, list) else list(result)
 
         if self.chat_template_type == "concat":
             start = self.messages_delimiter_start

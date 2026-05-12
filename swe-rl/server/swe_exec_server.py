@@ -33,6 +33,8 @@ logger = logging.getLogger("swe_exec_server")
 
 _active_containers: dict[str, dict] = {}
 _lock = threading.Lock()
+DEFAULT_CONTAINER_PIDS_LIMIT = os.getenv("SWE_CONTAINER_PIDS_LIMIT", "1024")
+DEFAULT_CONTAINER_MEMORY = os.getenv("SWE_CONTAINER_MEMORY", "8g")
 
 
 def _docker(*args: str, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -53,6 +55,32 @@ def _is_valid_git_patch(patch_text: str) -> bool:
     has_old = ("--- a/" in text) or ("--- /dev/null" in text)
     has_new = "+++ b/" in text
     return has_old and has_new
+
+
+def _kill_container_processes(container_id: str) -> None:
+    """Kill all user processes inside a container after a timeout.
+
+    With --init, tini is PID 1 and will reap children.  This sends SIGKILL to
+    all remaining processes (except PID 1) so that zombie/orphan build-up is
+    avoided after a timeout.
+    """
+    try:
+        _docker("exec", container_id, "kill", "-9", "-1", timeout=10)
+    except Exception:
+        pass
+
+
+def _clip_eval_output(text: str) -> tuple[str, bool]:
+    """Clip eval output to bound payload size when needed.
+
+    Set SWE_EVAL_OUTPUT_MAX_CHARS<=0 to disable clipping.
+    """
+    max_chars = int(os.getenv("SWE_EVAL_OUTPUT_MAX_CHARS", "20000000"))
+    if max_chars <= 0:
+        return text, False
+    if len(text) <= max_chars:
+        return text, False
+    return text[-max_chars:], True
 
 
 # ── Health ────────────────────────────────────────────────────────────
@@ -102,10 +130,12 @@ def container_create():
 
     r = _docker(
         "run", "-d",
+        "--init",
         "--name", container_name,
+        "--pull", "never",
         "-w", cwd,
-        "--pids-limit", "256",
-        "--memory", "4g",
+        "--pids-limit", DEFAULT_CONTAINER_PIDS_LIMIT,
+        "--memory", DEFAULT_CONTAINER_MEMORY,
         image,
         "sleep", "infinity",
         timeout=timeout,
@@ -160,6 +190,7 @@ def container_exec():
             "output": output,
         })
     except subprocess.TimeoutExpired:
+        _kill_container_processes(container_id)
         return jsonify({
             "ok": True,
             "returncode": -1,
@@ -229,6 +260,8 @@ def container_evaluate():
         cwd (str):          working directory, default "/testbed"
         timeout (int):      eval timeout in seconds, default 3600
     """
+    total_start = time.perf_counter()
+    stage_started_at_ms = int(time.time() * 1000)
     data = request.get_json(force=True) or {}
     container_id = data.get("container_id")
     patch = data.get("patch", "")
@@ -254,37 +287,76 @@ def container_evaluate():
         f"git reset --hard HEAD && git clean -fd && "
         f"git apply <<'{delimiter}'\n{patch}\n{delimiter}"
     )
+    apply_start = time.perf_counter()
     r_apply = _docker(
         "exec", "-w", cwd, container_id,
         "bash", "-lc", apply_cmd,
         timeout=60,
     )
+    apply_elapsed_ms = int((time.perf_counter() - apply_start) * 1000)
     if r_apply.returncode != 0:
+        total_elapsed_ms = int((time.perf_counter() - total_start) * 1000)
         return jsonify({
             "ok": True,
             "resolved": False,
+            "returncode": -1,
+            "apply_returncode": r_apply.returncode,
+            "apply_output": (r_apply.stdout + r_apply.stderr),
             "error": f"git apply failed: {r_apply.stderr}",
+            "timing": {
+                "stage_started_at_ms": stage_started_at_ms,
+                "apply_elapsed_ms": apply_elapsed_ms,
+                "eval_elapsed_ms": 0,
+                "total_elapsed_ms": total_elapsed_ms,
+            },
         })
 
-    eval_cmd = f"bash <<'EOF'\n{eval_script}\nEOF"
+    eval_delim = f"EVAL_{uuid.uuid4().hex}"
+    eval_cmd = f"bash <<'{eval_delim}'\n{eval_script}\n{eval_delim}"
+    eval_start = time.perf_counter()
     try:
         r_eval = _docker(
             "exec", "-w", cwd, container_id,
             "bash", "-lc", eval_cmd,
             timeout=timeout,
         )
+        eval_elapsed_ms = int((time.perf_counter() - eval_start) * 1000)
+        total_elapsed_ms = int((time.perf_counter() - total_start) * 1000)
         resolved = r_eval.returncode == 0
+        eval_output = r_eval.stdout + r_eval.stderr
+        clipped_output, output_truncated = _clip_eval_output(eval_output)
         return jsonify({
             "ok": True,
             "resolved": resolved,
             "returncode": r_eval.returncode,
-            "output": (r_eval.stdout + r_eval.stderr)[-2000:],
+            "apply_returncode": r_apply.returncode,
+            "apply_output": (r_apply.stdout + r_apply.stderr),
+            "output": clipped_output,
+            "output_truncated": output_truncated,
+            "timing": {
+                "stage_started_at_ms": stage_started_at_ms,
+                "apply_elapsed_ms": apply_elapsed_ms,
+                "eval_elapsed_ms": eval_elapsed_ms,
+                "total_elapsed_ms": total_elapsed_ms,
+            },
         })
     except subprocess.TimeoutExpired:
+        eval_elapsed_ms = int((time.perf_counter() - eval_start) * 1000)
+        total_elapsed_ms = int((time.perf_counter() - total_start) * 1000)
+        _kill_container_processes(container_id)
         return jsonify({
             "ok": True,
             "resolved": False,
+            "returncode": -1,
+            "apply_returncode": r_apply.returncode,
+            "apply_output": (r_apply.stdout + r_apply.stderr),
             "error": f"Evaluation timed out after {timeout}s",
+            "timing": {
+                "stage_started_at_ms": stage_started_at_ms,
+                "apply_elapsed_ms": apply_elapsed_ms,
+                "eval_elapsed_ms": eval_elapsed_ms,
+                "total_elapsed_ms": total_elapsed_ms,
+            },
         })
 
 

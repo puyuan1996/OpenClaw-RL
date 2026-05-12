@@ -81,10 +81,19 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        provider = bridge.to_megatron_provider(load_weights=False)
+        bridge, hf_pretrained, is_local_bridge = load_function(
+            "slime.utils.megatron_bridge_utils.build_bridge_for_hf_checkpoint"
+        )(args.hf_checkpoint, load_weights=False)
+        if is_local_bridge:
+            provider = bridge.provider_bridge(hf_pretrained)
+        else:
+            provider = bridge.to_megatron_provider(load_weights=False)
+        print(
+            "Qwen35 bridge debug: "
+            f"bridge={type(bridge).__module__}.{type(bridge).__name__} "
+            f"provider={type(provider).__module__}.{type(provider).__name__} "
+            f"is_local_bridge={is_local_bridge}"
+        )
         # TODO: we should not manually set this...
         provider.tensor_model_parallel_size = args.tensor_model_parallel_size
         provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
@@ -95,6 +104,73 @@ def get_model_provider_func(
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+        # Bridge providers are constructed from HF config and ignore most CLI flags
+        # forwarded to TransformerConfig in the raw path. Activation-recompute is
+        # the most consequential one: without it, full activations stay resident
+        # for every layer and large-context RL runs OOM. Forward it explicitly so
+        # bridge runs are at least memory-comparable to raw runs.
+        if getattr(args, "recompute_granularity", None) is not None:
+            provider.recompute_granularity = args.recompute_granularity
+            provider.recompute_method = args.recompute_method
+            provider.recompute_num_layers = args.recompute_num_layers
+
+        # CLI flags that materially affect train numerics/quality and per-step
+        # speed but are NOT derivable from the HF config. Without these, bridge
+        # mode silently keeps HF-config defaults (e.g. attention_dropout=0.1
+        # for many Qwen configs), which causes train-vs-inference distribution
+        # skew and biased GRPO importance sampling. Forward only attributes the
+        # provider already exposes so we don't break providers that omit them.
+        _BRIDGE_FORWARDED_ARGS = (
+            # numerics / quality
+            "attention_dropout",
+            "hidden_dropout",
+            "attention_softmax_in_fp32",
+            
+            "accumulate_allreduce_grads_in_fp32",
+            "fp16_lm_cross_entropy",
+            "cross_entropy_loss_fusion",
+            "cross_entropy_fusion_impl",
+            # kernels / fused ops (perf, occasionally numerics)
+            "attention_backend",
+            "apply_rope_fusion",
+            "bias_swiglu_fusion",
+            "bias_dropout_fusion",
+            "bias_gelu_fusion",
+            "masked_softmax_fusion",
+            "gradient_accumulation_fusion",
+            "async_tensor_model_parallel_allreduce",
+            "tp_comm_overlap",
+            # context-parallel / sequence-parallel related
+            "context_parallel_size",
+            # dtype / precision
+            "params_dtype",
+            "bf16",
+            "fp16",
+        )
+        forwarded = []
+        skipped = []
+        for name in _BRIDGE_FORWARDED_ARGS:
+            if not hasattr(args, name):
+                continue
+            value = getattr(args, name)
+            if value is None:
+                continue
+            if not hasattr(provider, name):
+                skipped.append(name)
+                continue
+            setattr(provider, name, value)
+            forwarded.append((name, value))
+        if forwarded:
+            print(
+                "Bridge provider: forwarded CLI flags -> "
+                + ", ".join(f"{n}={v}" for n, v in forwarded)
+            )
+        if skipped:
+            print(
+                "Bridge provider: skipped CLI flags not exposed by provider -> "
+                + ", ".join(skipped)
+            )
+
         provider.finalize()
         return provider.provide
 
@@ -209,12 +285,22 @@ def get_model_provider_func(
 
 
 def wrap_model_provider_with_freeze(original_provider, args):
-    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None):
+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **extra_kwargs):
         sig = inspect.signature(original_provider)
+        provider_kwargs = {
+            "pre_process": pre_process,
+            "post_process": post_process,
+        }
         if "vp_stage" in sig.parameters:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
+            provider_kwargs["vp_stage"] = vp_stage
+
+        # Newer Megatron-LM may pass extra provider kwargs such as config.
+        # Forward only the kwargs the wrapped provider actually declares.
+        for name, value in extra_kwargs.items():
+            if name in sig.parameters:
+                provider_kwargs[name] = value
+
+        model = original_provider(**provider_kwargs)
 
         freeze_model_params(model, args)
 

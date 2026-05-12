@@ -88,12 +88,10 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
         )
         return origin_samples
 
-    if processor:
+    if processor and any(s.multimodal_inputs is not None for s in origin_samples):
         filtered_samples = []
         for sample in origin_samples:
-            from slime.utils.processing_utils import process_vision_info
-
-            multimodal_inputs = process_vision_info(sample.prompt, processor)
+            multimodal_inputs = sample.multimodal_inputs or {"images": None, "videos": None}
             processor_output = processor(text=sample.prompt, **multimodal_inputs)
             input_ids = processor_output["input_ids"][0]
             if len(input_ids) <= max_length:
@@ -273,7 +271,8 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     assert len(rollout_data_ref) == dp_size
     rollout_data = ray.get(rollout_data_ref[dp_rank].inner)
 
-    partition = rollout_data.pop("partition")
+    partition = list(rollout_data.pop("partition"))
+    rollout_data["_partition"] = partition
     total_lengths = rollout_data["total_lengths"]
 
     # save the seqlen of the whole rollout batch

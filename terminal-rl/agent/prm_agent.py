@@ -1,6 +1,12 @@
+import logging
 import json
+import os
 import random
 from typing import Any, Dict, List, Optional
+
+from inference_client import create_sglang_client
+
+logger = logging.getLogger(__name__)
 
 
 PRM_SYSTEM = """You are an evaluator for a terminal agent.
@@ -207,7 +213,7 @@ class TerminalPRMAgent:
 
     async def judge_turn(self, turn_idx: int) -> int:
         messages = self._build_messages(turn_idx)
-        _cc, interaction = await self._sglang_client.generate_turn(
+        _, interaction = await self._sglang_client.generate(
             messages=messages,
             tools=None,
             turn_idx=turn_idx,

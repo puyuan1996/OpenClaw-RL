@@ -105,6 +105,8 @@ def pack_sequences(
             multimodal_num_items = {}  # key -> list of item counts per sequence
             for i in indices:
                 for key, mm_tensor in multimodal_train_inputs[i].items():
+                    if not isinstance(mm_tensor, torch.Tensor):
+                        mm_tensor = torch.tensor(mm_tensor)
                     if key not in multimodal_data:
                         multimodal_data[key] = mm_tensor
                         multimodal_num_items[key] = [mm_tensor.size(0)]

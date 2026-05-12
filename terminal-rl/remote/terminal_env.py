@@ -16,7 +16,7 @@ from terminal_bench.parsers.parser_factory import ParserFactory
 from terminal_bench.terminal.docker_compose_manager import DockerComposeManager
 from terminal_bench.terminal.terminal import Terminal
 
-from ..custom_types import RunContext, TaskSpec, TaskTimeouts
+from ..custom_types import RunContext, TaskTimeouts
 
 from .docker_compose_utils import compose_up_no_build, prepare_task_docker_image
 
@@ -72,7 +72,7 @@ def _drain_toolkit_sessions(toolkit: Any) -> None:
 class TerminalEnv:
     def __init__(self) -> None:
         self._closed = False
-        self._task_spec: TaskSpec | None = None
+        self._task_meta: dict[str, Any] | None = None
         self._run_ctx: RunContext | None = None
         self._timeouts: TaskTimeouts | None = None
 
@@ -86,14 +86,13 @@ class TerminalEnv:
         self,
         *,
         task_meta: dict[str, Any],
-        task_spec: TaskSpec,
         run_ctx: RunContext,
         timeouts: TaskTimeouts,
     ) -> tuple[str, list[dict[str, Any]]]:
         await self.close()
 
         self._closed = False
-        self._task_spec = task_spec
+        self._task_meta = task_meta
         self._run_ctx = run_ctx
         self._timeouts = timeouts
 
@@ -106,13 +105,13 @@ class TerminalEnv:
         dataset_dir = str(os.getenv("DATASET_DIR", "")).strip()
         if not dataset_dir:
             raise ValueError("DATASET_DIR is required")
-        task_path = Path(dataset_dir) / self._task_spec.task_path
+        task_path = Path(dataset_dir) / self._task_meta["task_path"]
         output_path = Path(self._run_ctx.log_dir).resolve()
         output_path.mkdir(parents=True, exist_ok=True)
 
         def _sync_reset() -> tuple[str, list[dict[str, Any]]]:
             self._trial_handler = TrialHandler(
-                trial_name=f"{self._task_spec.task_name}.{self._run_ctx.uid}.slime-run",
+                trial_name=f"{self._task_meta['task_name']}.{self._run_ctx.run_identity()}",
                 input_path=task_path,
                 output_path=output_path,
             )
@@ -174,7 +173,10 @@ class TerminalEnv:
                 "shell_write_content_to_file": self._terminal_toolkit.shell_write_content_to_file,
             }
 
-            user_msg = f"Task name:{self._task_spec.task_name}\nTask instruction: {self._task_spec.instruction}"
+            user_msg = (
+                f"Task name:{self._task_meta['task_name']}\n"
+                f"Task instruction: {self._task_meta['instruction']}"
+            )
             function_tools = [FunctionTool(fn) for fn in self._tools.values()]
             tool_schemas = [
                 func_tool.get_openai_tool_schema() for func_tool in function_tools
@@ -217,7 +219,9 @@ class TerminalEnv:
 
         def _sync_eval() -> float:
             task_name = (
-                self._task_spec.task_name if self._task_spec is not None else "unknown"
+                self._task_meta["task_name"]
+                if self._task_meta is not None
+                else "unknown"
             )
             paths: list[Path] = [self._trial_handler.task_paths.run_tests_path]
             if self._trial_handler.task_paths.test_dir.exists():
@@ -309,7 +313,7 @@ class TerminalEnv:
         self._trial_handler = None
         self._parser = None
         self._terminal_toolkit = None
-        self._task_spec = None
+        self._task_meta = None
         self._run_ctx = None
         self._timeouts = None
 

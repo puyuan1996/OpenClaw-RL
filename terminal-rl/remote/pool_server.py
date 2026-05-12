@@ -14,7 +14,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from ..custom_types import RunContext, TaskSpec, TaskTimeouts
+from ..custom_types import RunContext, TaskTimeouts
 from ..request_utils import json_payload
 from .terminal_env import TerminalEnv
 
@@ -44,39 +44,12 @@ def _parse_timeout_overrides(
     )
 
 
-def _build_task_spec(task_meta: dict[str, Any]) -> TaskSpec:
-    return TaskSpec(
-        task_name=str(task_meta.get("task_name", "unknown")),
-        task_path=str(task_meta.get("task_path", "")),
-        instruction=str(task_meta.get("instruction", "")),
-    )
-
-
 def _build_run_ctx(
     run_ctx_payload: dict[str, Any] | None, default_log_dir: Path
 ) -> RunContext:
-    payload = run_ctx_payload if isinstance(run_ctx_payload, dict) else {}
-    uid = str(payload.get("uid") or uuid.uuid4().hex[:8])
-    try:
-        group_index = int(payload.get("group_index") or 0)
-    except (TypeError, ValueError):
-        group_index = 0
-    try:
-        sample_index = int(payload.get("sample_index") or 0)
-    except (TypeError, ValueError):
-        sample_index = 0
-
-    log_dir_raw = payload.get("log_dir")
-    if isinstance(log_dir_raw, str) and log_dir_raw:
-        log_dir = Path(log_dir_raw).resolve()
-    else:
-        log_dir = default_log_dir.resolve()
-
-    return RunContext(
-        uid=uid,
-        group_index=group_index,
-        sample_index=sample_index,
-        log_dir=log_dir,
+    return RunContext.from_payload(
+        run_ctx_payload,
+        default_log_dir=default_log_dir,
     )
 
 
@@ -134,6 +107,10 @@ class WorkerPool:
 
     def _new_env(self) -> TerminalEnv:
         return TerminalEnv()
+
+    @staticmethod
+    def _touch_run_slot(run_slot: RunSlot) -> None:
+        run_slot.last_used_ts = time.time()
 
     async def _close_run_slot(
         self, task_key: str, run_lease_id: str, run_slot: RunSlot, *, reason: str
@@ -250,7 +227,7 @@ class WorkerPool:
         async with self._lock:
             run_slot = self._get_run_slot(run_lease_id)
         async with run_slot.lock:
-            run_slot.last_used_ts = time.time()
+            self._touch_run_slot(run_slot)
 
     async def reset(
         self,
@@ -261,24 +238,23 @@ class WorkerPool:
     ) -> dict[str, Any]:
         if not isinstance(task_meta, dict):
             raise ValueError("task_meta must be a dict")
+        if not isinstance(run_ctx_payload, dict):
+            raise ValueError("run_ctx_payload must be a dict")
 
         async with self._lock:
             run_slot = self._get_run_slot(run_lease_id)
 
-        run_ctx = _build_run_ctx(
-            run_ctx_payload, default_log_dir=self.output_root / "AgentRunner_Output"
-        )
+        run_ctx = RunContext.from_payload(run_ctx_payload)
         timeouts = _parse_timeout_overrides(self.default_timeouts, task_timeouts)
-        task_spec = _build_task_spec(task_meta)
 
         async with run_slot.lock:
+            self._touch_run_slot(run_slot)
             user_msg, tool_schemas = await run_slot.env.reset(
                 task_meta=task_meta,
-                task_spec=task_spec,
                 run_ctx=run_ctx,
                 timeouts=timeouts,
             )
-            run_slot.last_used_ts = time.time()
+            self._touch_run_slot(run_slot)
             return {"user_msg": user_msg, "tool_schemas": tool_schemas}
 
     async def exec_tool(
@@ -287,16 +263,18 @@ class WorkerPool:
         async with self._lock:
             run_slot = self._get_run_slot(run_lease_id)
         async with run_slot.lock:
+            self._touch_run_slot(run_slot)
             observation = await run_slot.env.exec_tool(tool_name, arguments or {})
-            run_slot.last_used_ts = time.time()
+            self._touch_run_slot(run_slot)
             return str(observation)
 
     async def evaluate(self, run_lease_id: str) -> float:
         async with self._lock:
             run_slot = self._get_run_slot(run_lease_id)
         async with run_slot.lock:
+            self._touch_run_slot(run_slot)
             score = await run_slot.env.evaluate()
-            run_slot.last_used_ts = time.time()
+            self._touch_run_slot(run_slot)
             return float(score)
 
     async def close_run(self, run_lease_id: str) -> bool:
@@ -448,6 +426,7 @@ async def heartbeat(request: Request) -> JSONResponse:
 @app.post("/reset")
 async def reset(request: Request) -> JSONResponse:
     if POOL is None:
+        # TODO: Check if the status code meaningful
         return JSONResponse(
             {"ok": False, "error": "Pool is not initialized"}, status_code=500
         )
@@ -465,6 +444,14 @@ async def reset(request: Request) -> JSONResponse:
     if not isinstance(task_meta, dict):
         return JSONResponse(
             {"ok": False, "error": "task_meta dict is required"}, status_code=400
+        )
+    if not isinstance(run_ctx_payload, dict):
+        return JSONResponse(
+            {"ok": False, "error": "run_ctx_payload dict is required"}, status_code=400
+        )
+    if not isinstance(task_timeouts, dict):
+        return JSONResponse(
+            {"ok": False, "error": "task_timeouts dict is required"}, status_code=400
         )
 
     try:

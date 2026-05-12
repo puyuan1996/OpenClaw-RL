@@ -56,12 +56,19 @@ swe-rl/
 │   ├── swe_env_pool_server.py    # runs on GPU head node
 │   └── setup_ecs_seed.sh         # one-time ECS node initialisation
 │
-├── scripts/                      # training launch scripts
+├── configs/                      # mini-swe-agent configuration
+│   └── minisweagent_sglang_swebench.yaml       # SGLang + text-based eval config
+│
+├── scripts/                      # training & evaluation launch scripts
 │   ├── run_swe_rl_32b_remote_8nodes.sh         # 32B, 8 nodes, fresh start
 │   ├── run_swe_rl_32b_remote_8nodes_resume.sh  # 32B, 8 nodes, auto-resume (requires Megatron ckpt)
 │   ├── run_swe_rl_32b_remote_4nodes.sh         # 32B, 4 nodes
 │   ├── run_swe_rl_8b_remote_2nodes.sh          # 8B, 2 nodes
-│   └── run_swe_rl_8b_prm_5nodes_remote.sh      # 8B + PRM, 5 nodes
+│   ├── run_swe_rl_8b_prm_5nodes_remote.sh      # 8B + PRM, 5 nodes
+│   ├── launch_sglang_cluster_4nodes.sh         # MLP launcher: SGLang cluster (4 nodes)
+│   ├── deploy_sglang_cluster_4nodes.sh         # standalone SGLang cluster (4 nodes)
+│   ├── setup_minisweagent_ces.sh               # CES node setup for mini-swe-agent
+│   └── run_minisweagent_eval.sh                # mini-swe-agent eval runner
 │
 ├── eval/                         # standalone evaluation
 │   ├── eval_swe.py               # run any LLM on SWE data (no training loop)
@@ -99,6 +106,21 @@ python data/preprocess_swe_dataset.py \
   --train-split test \
   --output-dir ~/data/swe_verified
 ```
+
+For SWE-bench Verified local eval + ECS pre-warming, you can directly export
+instance IDs, docker image names, and eval JSONL in one command:
+
+```bash
+python data/export_swebench_verified_assets.py \
+  --dataset princeton-nlp/SWE-Bench_Verified \
+  --split test \
+  --output-dir /data_storage/wyj/swe_verified
+```
+
+This writes:
+- `instance_ids.txt`
+- `docker_images.txt`
+- `verified_eval.jsonl` (for `eval/eval_swe.py`)
 
 Output schema (one JSON per line):
 ```json
@@ -148,6 +170,19 @@ curl http://localhost:5000/images | python3 -m json.tool | grep count
 ```bash
 TRAIN=~/train.jsonl bash ~/pull_swe_images.sh        # all images
 N=10 TRAIN=~/train.jsonl bash ~/pull_swe_images.sh   # first 10 only
+```
+
+For SWE-bench Verified image-list pull:
+
+```bash
+IMAGE_LIST=~/swe_verified/docker_images.txt \
+bash ~/pull_swebench_verified_images.sh
+
+# pull from proxy and tag back to docker.io/swebench/*
+IMAGE_LIST=~/swe_verified/docker_images.txt \
+SRC_PREFIX=docker.io/swebench \
+PROXY_PREFIX=dockerproxy.net/swebench \
+bash ~/pull_swebench_verified_images.sh
 ```
 
 After setup, snapshot the ECS into a **custom image** so all subsequent nodes start pre-warmed. See `docs/en/SWE_REMOTE_DOCKER.md` for detailed instructions.
@@ -262,6 +297,16 @@ export OUTPUT_DIR=/path/to/eval_runs/my_run
 bash eval/run_eval_swe.sh
 ```
 
+For SWE-bench Verified local evaluation:
+
+```bash
+export SWE_EXEC_SERVER_URLS="http://172.16.0.10:5000,..."
+export EVAL_MODEL_PATH=/path/to/your/model
+export VERIFIED_DIR=/data_storage/wyj/swe_verified
+
+bash scripts/eval_swe_verified_local.sh
+```
+
 Or call the Python script directly:
 
 ```bash
@@ -313,6 +358,36 @@ tail_budget             ≈ 8050    (70%)
 ```
 
 See `docs/en/CONTEXT_MANAGEMENT.md` for full details.
+
+---
+
+## Step 5 — Evaluation with mini-swe-agent + SGLang
+
+An alternative evaluation path that decouples LLM serving from the training framework. A standalone SGLang cluster serves the model via OpenAI-compatible API, while mini-swe-agent runs on CES Docker nodes to manage SWE-bench containers and agent interactions.
+
+```bash
+# 1. Deploy SGLang cluster: submit to MLP platform with 4 GPU nodes
+#    Command to paste in MLP:
+cd /data_storage/wyj/jxl/OpenClaw-RL && source activate /data_storage/wyj/systems/envs/agentic-rl-jxl && bash swe-rl/scripts/launch_sglang_cluster_4nodes.sh
+
+#    Switch model: MODEL_SIZE=27b or MODEL_SIZE=4b
+#    Custom port:  ROUTER_PORT=8000 bash swe-rl/scripts/launch_sglang_cluster_4nodes.sh
+
+# 2. SSH to CES node, one-time setup
+bash swe-rl/scripts/setup_minisweagent_ces.sh --sglang-url http://<ROUTER_IP>:30000
+
+# 3. Run evaluation on CES node
+bash swe-rl/scripts/run_minisweagent_eval.sh \
+  --sglang-url http://<ROUTER_IP>:30000 \
+  --workers 16
+
+# Quick smoke test (5 instances)
+bash swe-rl/scripts/run_minisweagent_eval.sh \
+  --sglang-url http://<ROUTER_IP>:30000 \
+  --slice "0:5" --workers 2
+```
+
+See `docs/cn/MINISWEAGENT_SGLANG_EVAL.md` for the full design document including architecture, configuration, multi-node slicing, and troubleshooting.
 
 ---
 

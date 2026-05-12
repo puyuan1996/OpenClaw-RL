@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pull SWE docker images (SWE-Gym / SWE-bench_Verified) via dockerproxy.net
+# Pull SWE docker images (SWE-Gym / SWE-bench_Verified) via registry proxy
 # and tag them to local canonical registries.
 #
 # Usage:
@@ -15,7 +15,7 @@ N=${N:-0}   # 0 = all
 PROXY_PREFIX=${PROXY_PREFIX:-}
 SRC_PREFIX=${SRC_PREFIX:-}
 # Dataset-specific defaults
-PROXY_PREFIX_SWE_GYM=${PROXY_PREFIX_SWE_GYM:-dockerproxy.net/xingyaoww}
+PROXY_PREFIX_SWE_GYM=${PROXY_PREFIX_SWE_GYM:-slime-agent-cn-beijing.cr.volces.com/xingyaoww}
 SRC_PREFIX_SWE_GYM=${SRC_PREFIX_SWE_GYM:-docker.io/xingyaoww}
 PROXY_PREFIX_SWE_BENCH=${PROXY_PREFIX_SWE_BENCH:-dockerproxy.net/swebench}
 SRC_PREFIX_SWE_BENCH=${SRC_PREFIX_SWE_BENCH:-docker.io/swebench}

@@ -2,14 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, List
-
-
-@dataclass(frozen=True)
-class TaskSpec:
-    task_name: str
-    task_path: str
-    instruction: str
+from typing import Any, Optional, List, Dict
+import uuid
 
 
 @dataclass(frozen=True)
@@ -19,6 +13,9 @@ class RunContext:
     sample_index: int
     log_dir: Path
 
+    def run_identity(self) -> str:
+        return f"{self.uid}.{self.group_index}.{self.sample_index}"
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "uid": self.uid,
@@ -26,6 +23,18 @@ class RunContext:
             "sample_index": self.sample_index,
             "log_dir": str(self.log_dir),
         }
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: dict[str, Any],
+    ) -> "RunContext":
+        return cls(
+            uid=payload["uid"],
+            group_index=payload["group_index"],
+            sample_index=payload["sample_index"],
+            log_dir=Path(payload["log_dir"]).resolve(),
+        )
 
 
 @dataclass
@@ -37,10 +46,10 @@ class TaskTimeouts:
 
     def to_payload(self) -> dict[str, float]:
         return {
-            "ensure_image": float(self.ensure_image),
-            "reset_session": float(self.reset_session),
-            "close_session": float(self.close_session),
-            "eval": float(self.eval),
+            "ensure_image": self.ensure_image,
+            "reset_session": self.reset_session,
+            "close_session": self.close_session,
+            "eval": self.eval,
         }
 
 
@@ -48,6 +57,15 @@ from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion_message_param import (
     ChatCompletionMessageParam as OpenAIMessage,
 )
+
+
+class ToolCallRequest:
+    r"""The request for tool calling."""
+
+    tool_name: str
+    args: Dict[str, Any]
+    tool_call_id: str
+    extra_content: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -64,15 +82,20 @@ class Interaction:
 
 
 @dataclass
-class TurnContext:
-    context_messages: Optional[List[dict[str, Any]]]
-    terminated_response: Optional[Any] = None
-
-
-@dataclass
 class TurnResult:
     interaction: Interaction
     model_response: Optional[Any]
     tool_call_requests: List[Any]
-    parse_error_recorded: bool
-    terminated_response: Optional[Any] = None
+    parse_error_record: bool
+
+
+@dataclass
+class RolloutOutcome:
+    interactions: list[Interaction] = field(default_factory=list)
+    final_response: Optional[Any] = None
+    reached_iteration_limit: bool = False
+    reached_parse_error_limit: bool = False
+    model_turn_count: int = 0
+    parse_error_count: int = 0
+    prm_turn_scores: dict[int, float] = field(default_factory=dict)
+    prm_turn_details: list[dict[str, Any]] = field(default_factory=list)

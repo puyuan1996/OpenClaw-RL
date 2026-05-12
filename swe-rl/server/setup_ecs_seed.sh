@@ -78,26 +78,35 @@ for i in {1..10}; do
     sleep 1
 done
 
-# ── 4. Pull SWE-Bench Docker images ──────────────────────────────────
+# ── 4. Optional image pull (disabled by default) ─────────────────────
+# Default behavior is to skip pulling images so this script can be safely used
+# on nodes where images are already preloaded (e.g. swegym_293 parquet workflow).
+RUN_PULL_IMAGES=${RUN_PULL_IMAGES:-0}
 TRAIN=${TRAIN:-${HOME}/train.jsonl}
-if [ ! -f "${TRAIN}" ]; then
-    echo "[4/4] SKIPPED: ${TRAIN} not found."
-    echo "  Copy train.jsonl to ${TRAIN} and run:"
-    echo "    TRAIN=${TRAIN} bash ~/pull_swe_images.sh"
+if [ "${RUN_PULL_IMAGES}" != "1" ]; then
+    echo "[4/4] SKIPPED: image pull disabled by default (RUN_PULL_IMAGES=${RUN_PULL_IMAGES})."
+    echo "  If needed, enable explicitly:"
+    echo "    RUN_PULL_IMAGES=1 TRAIN=${TRAIN} bash setup_ecs_seed.sh"
 else
-    echo "[4/4] Pulling SWE-Bench Docker images from ${TRAIN}..."
-    PULL_SCRIPT=""
-    if [ -f ~/pull_swe_images.sh ]; then
-        PULL_SCRIPT=~/pull_swe_images.sh
-    elif [ -f "$(dirname "$0")/pull_swe_images.sh" ]; then
-        PULL_SCRIPT="$(dirname "$0")/pull_swe_images.sh"
-    fi
-
-    if [ -n "${PULL_SCRIPT}" ]; then
-        LOG_DIR=/var/log/swe-images TRAIN="${TRAIN}" bash "${PULL_SCRIPT}"
+    if [ ! -f "${TRAIN}" ]; then
+        echo "[4/4] SKIPPED: ${TRAIN} not found."
+        echo "  Copy train.jsonl to ${TRAIN} and run:"
+        echo "    RUN_PULL_IMAGES=1 TRAIN=${TRAIN} bash ~/pull_swe_images.sh"
     else
-        echo "  WARNING: pull_swe_images.sh not found, skipping image pull."
-        echo "  Copy it and run manually."
+        echo "[4/4] Pulling SWE-Bench Docker images from ${TRAIN}..."
+        PULL_SCRIPT=""
+        if [ -f ~/pull_swe_images.sh ]; then
+            PULL_SCRIPT=~/pull_swe_images.sh
+        elif [ -f "$(dirname "$0")/pull_swe_images.sh" ]; then
+            PULL_SCRIPT="$(dirname "$0")/pull_swe_images.sh"
+        fi
+
+        if [ -n "${PULL_SCRIPT}" ]; then
+            LOG_DIR=/var/log/swe-images TRAIN="${TRAIN}" bash "${PULL_SCRIPT}"
+        else
+            echo "  WARNING: pull_swe_images.sh not found, skipping image pull."
+            echo "  Copy it and run manually."
+        fi
     fi
 fi
 

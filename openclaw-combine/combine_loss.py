@@ -3,8 +3,21 @@
 Both branches use the same PPO-style clipped policy gradient objective,
 matching SLIME's ``policy_loss_function``, but with different advantages:
 
-- OPD samples: advantage = teacher_logp - old_logp  (token-level distillation)
+- OPD samples: advantage = teacher_logp - student_megatron_logp (token-level)
 - RL  samples: advantage = reward broadcast          (GRPO-style)
+
+The OPD *student* side is always Megatron ``batch["log_probs"]`` (recomputed
+on the training engine), not ``rollout_log_probs``, so it matches the
+student log-p engine regardless of ``--use-rollout-logprobs``.
+
+Teacher log-p source (env ``OPENCLAW_COMBINE_OPD_TEACHER_SOURCE``):
+
+- ``megatron`` (default): ``batch["prm_teacher_log_probs"]`` computed by
+  the PRM teacher model loaded via ``--prm-teacher-load`` through the same
+  Megatron code path as the student. Independent of ``--ref-load``.
+- ``inference``: ``batch["teacher_log_probs"]`` from rollout/OPD
+  (e.g. PRM SGLang prefill logprobs). Has numerical mismatch with Megatron
+  student log-probs.
 
 OPD samples carry reward=0 so GRPO advantage=0; RL samples carry
 teacher_logp ≈ rollout_logp so teacher advantage ≈ 0.  The combined
@@ -22,6 +35,18 @@ import torch
 
 from slime.backends.megatron_utils.loss import get_log_probs_and_entropy
 from slime.utils.ppo_utils import compute_approx_kl, compute_policy_loss
+
+
+def _opd_teacher_source() -> str:
+    v = os.getenv("OPENCLAW_COMBINE_OPD_TEACHER_SOURCE", "megatron").strip().lower()
+    if v in ("infer", "inference", "sglang", "rollout"):
+        return "inference"
+    if v in ("megatron", "mcore"):
+        return "megatron"
+    raise ValueError(
+        "OPENCLAW_COMBINE_OPD_TEACHER_SOURCE must be 'inference' or 'megatron', "
+        f"got {v!r}"
+    )
 
 
 def combine_loss_function(
@@ -55,21 +80,51 @@ def combine_loss_function(
     new_log_probs = torch.cat(log_probs_and_entropy["log_probs"], dim=0)
     old_log_probs = torch.cat(old_log_probs_list, dim=0)
 
-    # ---- OPD teacher advantages ----
-    teacher_log_probs_list = batch.get("teacher_log_probs")
-    if teacher_log_probs_list is not None:
-        device = new_log_probs.device
+    # ---- OPD: teacher vs student (student always Megatron log_probs) ----
+    device = new_log_probs.device
+    student_log_probs_list = batch["log_probs"]
+    teacher_source = _opd_teacher_source()
+    if teacher_source == "inference":
+        teacher_log_probs_list = batch.get("teacher_log_probs")
+    else:
+        teacher_log_probs_list = batch.get("prm_teacher_log_probs")
+        if teacher_log_probs_list is None or len(teacher_log_probs_list) == 0:
+            raise RuntimeError(
+                "OPENCLAW_COMBINE_OPD_TEACHER_SOURCE=megatron requires "
+                "batch['prm_teacher_log_probs']. Set --prm-teacher-load to "
+                "the Megatron checkpoint of the PRM teacher model."
+            )
+
+    if teacher_log_probs_list is not None and len(teacher_log_probs_list) > 0:
         teacher_advantages = torch.cat(
             [
-                t.to(device=device) - o.to(device=device)
-                for t, o in zip(teacher_log_probs_list, old_log_probs_list)
+                t.to(device=device) - s.to(device=device)
+                for t, s in zip(teacher_log_probs_list, student_log_probs_list, strict=True)
             ],
             dim=0,
         )
     else:
         teacher_advantages = torch.zeros_like(grpo_advantages)
 
-    # ---- combine: w_opd * (teacher - old) + w_rl * grpo_advantage ----
+    teacher_cat = (
+        torch.cat(
+            [t.to(device=device) for t in teacher_log_probs_list],
+            dim=0,
+        )
+        if teacher_log_probs_list is not None and len(teacher_log_probs_list) > 0
+        else None
+    )
+    student_megatron_cat = torch.cat(
+        [s.to(device=device) for s in student_log_probs_list],
+        dim=0,
+    )
+    opd_teacher_student_logprob_abs_mean = None
+    if teacher_cat is not None and teacher_cat.numel() > 0:
+        opd_teacher_student_logprob_abs_mean = sum_of_sample_mean(
+            (teacher_cat - student_megatron_cat).abs()
+        )
+
+    # ---- combine: w_opd * (teacher - student_megatron) + w_rl * grpo_advantage ----
     w_opd = float(os.getenv("OPENCLAW_COMBINE_W_OPD", "1.0"))
     w_rl = float(os.getenv("OPENCLAW_COMBINE_W_RL", "1.0"))
     combined_advantages = w_opd * teacher_advantages + w_rl * grpo_advantages
@@ -136,5 +191,10 @@ def combine_loss_function(
         )
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
+
+    if opd_teacher_student_logprob_abs_mean is not None:
+        reported_loss["opd_teacher_student_logprob_abs_mean"] = (
+            opd_teacher_student_logprob_abs_mean.clone().detach()
+        )
 
     return loss, reported_loss
