@@ -1,0 +1,7 @@
+# Untracked workspace clutter — never commit
+archive/
+
+# Per-run output (already excluded by repo-root .gitignore via `logs`,
+# but keep an explicit anchor here in case CI runs from this subdir)
+logs/
+build_outputs/

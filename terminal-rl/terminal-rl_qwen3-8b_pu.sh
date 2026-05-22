@@ -50,12 +50,16 @@ sleep 2
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 
-# ── GPU allocation (single 4-GPU node) ───────────────────────────────
+# ── GPU allocation (auto-split: half actor, half rollout) ────────────
 DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 NUM_GPUS="${NUM_GPUS:-${DETECTED_GPUS:-4}}"
-ACTOR_GPUS="${ACTOR_GPUS:-2}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+HALF_GPUS=$(( NUM_GPUS / 2 ))
+# Default: each gets half of available GPUs (4-GPU node → 2/2, 8-GPU → 4/4).
+# Important: matching node size avoids SIGSEGV in NCCL getenv() observed when
+# only a subset of GPUs are used on multi-NUMA 8-GPU nodes.
+ACTOR_GPUS="${ACTOR_GPUS:-${HALF_GPUS}}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-${HALF_GPUS}}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-${HALF_GPUS}}"
 TP_SIZE="${TP_SIZE:-${ACTOR_GPUS}}"
 
 if (( ACTOR_GPUS + ROLLOUT_GPUS > NUM_GPUS )); then
@@ -91,14 +95,67 @@ if [[ "${DEBUG_MODE}" == "1" ]]; then
 else
   RUN_NAME="terminal-rl_qwen3-8b_${NUM_GPUS}gpu_${RUN_TIMESTAMP}"
 fi
+
+# ── Unified run directory (see STORAGE.md) ───────────────────────────────
+# All outputs for this run go under runs/{RUN_ID}/ with structured subdirs.
+RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs}"
+CKPT_ROOT="${CKPT_ROOT:-${EXPORT_ROOT}/ckpt}"
+RUN_ID="${RUN_ID:-${RUN_NAME}}"
+RUN_DIR="${RUNS_ROOT}/${RUN_ID}"
+
+# Create directory structure via run_paths.py
+MAX_CKPT_KEEP="${MAX_CKPT_KEEP}" python3 "${SCRIPT_DIR}/run_paths.py" init \
+  --runs-root "${RUNS_ROOT}" \
+  --ckpt-root "${CKPT_ROOT}" \
+  --run-id "${RUN_ID}" > /dev/null 2>&1
+
+# Derive all paths from RUN_DIR
+RUN_LOG_DIR="${RUN_DIR}/logs"
+TERMINAL_SAVE_TRAJ_DIR="${RUN_DIR}/trajectories"
+WANDB_DIR="${RUN_DIR}/metrics/wandb"
+
+# ── Rollout knobs (env-configurable, baked into per-run yaml below) ──────
+# MAX_TURN: max model turns per rollout (terminal_max_iterations in generate.py).
+#   Empirical guidance based on 05-21 trajectory analysis (1743 trajectories):
+#     - 30.0% trajectories hit max_iteration=15 (TRUNCATED) → most tasks need fewer turns
+#     - Pass cases averaged 5-9 turns; tasks taking 10+ turns rarely passed
+#     - Lowering to 10 trims tail-latency rollouts ≈ 33%, saving ~3 hours / 78 rollouts at 14h
+#     - For exploratory runs needing more turns, override with MAX_TURN=15 or higher.
+MAX_TURN="${MAX_TURN:-10}"
+
+# Generate a per-run yaml that overlays MAX_TURN onto the base CUSTOM_CONFIG_PATH.
+# This is cleaner than mutating the base yaml — different concurrent runs can pick
+# different MAX_TURN without stepping on each other.
+BASE_CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH}"
+RUN_CUSTOM_CONFIG_PATH="${RUN_DIR}/config/rollout_config.yaml"
+mkdir -p "$(dirname "${RUN_CUSTOM_CONFIG_PATH}")"
+if [[ -f "${BASE_CUSTOM_CONFIG_PATH}" ]]; then
+  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" <<'PY'
+import sys, yaml
+src, dst, max_turn = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(src) as f:
+    cfg = yaml.safe_load(f) or {}
+cfg["max_iteration"] = max_turn
+with open(dst, "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=True)
+PY
+  CUSTOM_CONFIG_PATH="${RUN_CUSTOM_CONFIG_PATH}"
+  echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN})"
+else
+  echo "[config] base yaml ${BASE_CUSTOM_CONFIG_PATH} not found; MAX_TURN=${MAX_TURN} will not take effect"
+fi
+
+# Symlinks for backward compatibility
+ln -sfn "${RUN_DIR}" "${RUNS_ROOT}/latest" 2>/dev/null || true
+ln -sfn "${RUN_DIR}" "${REPO_ROOT}/tmp_doc_latest" 2>/dev/null || true
+# Keep old logs/latest symlink for tools that expect it
 LOG_BASE="${SCRIPT_DIR}/logs"
-RUN_LOG_DIR="${LOG_BASE}/${RUN_NAME}"
-mkdir -p "${RUN_LOG_DIR}"
+mkdir -p "${LOG_BASE}" 2>/dev/null || true
+ln -sfn "${RUN_LOG_DIR}" "${LOG_BASE}/latest" 2>/dev/null || true
 
 # Only create ckpt dir and set SAVE_CKPT when saving is enabled
 if (( MAX_CKPT_KEEP > 0 )); then
-  mkdir -p "${EXPORT_ROOT}/ckpt"
-  SAVE_CKPT="${SAVE_CKPT:-${EXPORT_ROOT}/ckpt/${RUN_NAME}}"
+  SAVE_CKPT="${SAVE_CKPT:-${CKPT_ROOT}/${RUN_ID}}"
 else
   SAVE_CKPT=""
 fi
@@ -146,16 +203,57 @@ echo "========================================"
 # ── Model args (source qwen3-8B.sh) ──────────────────────────────────
 source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 
-# ── Dataset ──────────────────────────────────────────────────────────
-ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-}"
+# ── Dataset & Reward Configuration ───────────────────────────────────
+# DATASET: which data to train on
+#   seta    = seta_env only (capability tasks, Docker-based evaluation)
+#   safety  = Agent-SafetyBench only (safety tasks, no Docker needed)
+#   mixed   = both combined
+#
+# SETA_SAFETY: safety reward mode for seta_env data
+#   none       = pure outcome reward (2*accuracy - 1), no safety signal
+#   clawsentry = outcome + ClawSentry L1 safety score (weighted by SAFETY_REWARD_COEF)
+#
+# SAFETY_BENCH_REWARD: reward mode for Agent-SafetyBench data
+#   rule       = fulfillable-based: refuse harmful=+1, comply harmful=-1
+#   clawsentry = use ClawSentry safety score (same mechanism as seta)
+DATASET="${DATASET:-seta}"
+SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
+SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
+
+SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
+SAFETY_DATA="${SCRIPT_DIR}/dataset/agent_safetybench_convert/train.jsonl"
+
+case "${DATASET}" in
+  seta)
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${SETA_DATA}}"
+    ;;
+  safety)
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${SAFETY_DATA}}"
+    ;;
+  mixed)
+    MIXED_DATA="${SCRIPT_DIR}/dataset/mixed_seta_safety.jsonl"
+    if [[ ! -f "${MIXED_DATA}" ]] || [[ "${SETA_DATA}" -nt "${MIXED_DATA}" ]] || [[ "${SAFETY_DATA}" -nt "${MIXED_DATA}" ]]; then
+      cat "${SETA_DATA}" "${SAFETY_DATA}" > "${MIXED_DATA}"
+      echo "[dataset] merged seta($(wc -l < "${SETA_DATA}")) + safety($(wc -l < "${SAFETY_DATA}")) -> ${MIXED_DATA}"
+    fi
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${MIXED_DATA}}"
+    ;;
+  *)
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|mixed"
+    exit 1
+    ;;
+esac
+
 if [[ -z "${ROLLOUT_PROMPT_DATA}" ]]; then
-  echo "[ERROR] ROLLOUT_PROMPT_DATA is unset. Point it to the seta_env train.jsonl."
+  echo "[ERROR] ROLLOUT_PROMPT_DATA is unset."
   exit 1
 fi
 if [[ ! -f "${ROLLOUT_PROMPT_DATA}" ]]; then
   echo "[ERROR] ROLLOUT_PROMPT_DATA=${ROLLOUT_PROMPT_DATA} not found"
   exit 1
 fi
+echo "[config] DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD}"
+echo "[config] data=${ROLLOUT_PROMPT_DATA}"
 
 # Optional dataset blacklist (issue #3 §1.X / §2.x stuck offenders).
 # Default-ON; set USE_BLACKLIST=0 to keep the raw dataset.
@@ -224,6 +322,33 @@ CHECK_WAIT_SECS="${CHECK_WAIT_SECS:-60}"
 export ROUTER_FORWARD_TIMEOUT="${ROUTER_FORWARD_TIMEOUT:-900}"
 export ROUTER_FORWARD_RETRIES="${ROUTER_FORWARD_RETRIES:-3}"
 export ROUTER_FORWARD_RETRY_BACKOFF="${ROUTER_FORWARD_RETRY_BACKOFF:-1.0}"
+
+# ── ClawSentry safety reward (L1-only, reward-only, linear-fusion baseline) ──
+# Gateway runs on the same host as router_server (CPU master). All decisions
+# are reward-shaping signals; agent actions are never blocked.
+# ClawSentry is enabled when SETA_SAFETY=clawsentry or SAFETY_BENCH_REWARD=clawsentry.
+# SAFETY_REWARD_COEF controls the linear weight (default 0.3).
+CLAWSENTRY_NEEDED="0"
+if [[ "${SETA_SAFETY}" == "clawsentry" ]] || [[ "${SAFETY_BENCH_REWARD}" == "clawsentry" ]]; then
+  CLAWSENTRY_NEEDED="1"
+fi
+export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
+export SAFETY_REWARD_SUMMARY_WEIGHT="${SAFETY_REWARD_SUMMARY_WEIGHT:-0.3}"
+export SAFETY_REWARD_TIMEOUT="${SAFETY_REWARD_TIMEOUT:-2.0}"
+export SAFETY_REWARD_ZERO_THRESHOLD="${SAFETY_REWARD_ZERO_THRESHOLD:-1.5}"
+export CS_GATEWAY_PORT="${CS_GATEWAY_PORT:-8090}"
+export CS_HTTP_HOST="${CS_HTTP_HOST:-127.0.0.1}"
+export CS_HTTP_URL="http://${CS_HTTP_HOST}:${CS_GATEWAY_PORT}"
+export CS_AUTH_TOKEN="${CS_AUTH_TOKEN:-}"
+export CS_TRAJECTORY_DB_PATH="${CS_TRAJECTORY_DB_PATH:-/tmp/clawsentry-train.db}"
+export CS_LLM_PROVIDER="${CS_LLM_PROVIDER:-}"
+export CS_L3_ENABLED="${CS_L3_ENABLED:-false}"
+export CS_EVOLVING_ENABLED="${CS_EVOLVING_ENABLED:-false}"
+
+# ── Trajectory export (parallels swe-rl export/swe_rollouts) ─────────────────
+# Trajectory export is now ON by default (writes to runs/{run_id}/trajectories/).
+# Set TERMINAL_SAVE_TRAJ_DIR="" to disable.
+export TERMINAL_SAVE_TRAJ_DIR="${TERMINAL_SAVE_TRAJ_DIR}"
 
 # Proxy bypass: some environments inject http_proxy/HTTPS_PROXY via shell rc.
 # aiohttp + requests will then try to tunnel the internal router→worker traffic
@@ -334,6 +459,7 @@ if [[ -n "${WANDB_KEY:-}" ]]; then
     --wandb-project "${WANDB_PROJECT:-terminal_rl}"
     --wandb-group   "${WANDB_GROUP:-qwen3-8b_4gpu}"
     --wandb-key     "${WANDB_KEY}"
+    --wandb-dir     "${WANDB_DIR}"
   )
 else
   WANDB_ARGS=()
@@ -364,12 +490,19 @@ else
   echo "WARN: custom config not found at ${CUSTOM_CONFIG_PATH}; skipping --custom-config-path"
 fi
 
+# NOTE: safety reward params are passed via env vars (RUNTIME_ENV_JSON below),
+# not CLI flags, because slime's argparse rejects unknown flags.
+
 # ── Start router ─────────────────────────────────────────────────────
 ROUTER_PID=""
+CS_GATEWAY_PID=""
 cleanup() {
   set +e
   if [[ -n "${ROUTER_PID}" ]] && kill -0 "${ROUTER_PID}" 2>/dev/null; then
     kill "${ROUTER_PID}" || true
+  fi
+  if [[ -n "${CS_GATEWAY_PID}" ]] && kill -0 "${CS_GATEWAY_PID}" 2>/dev/null; then
+    kill "${CS_GATEWAY_PID}" || true
   fi
 }
 trap cleanup EXIT INT TERM
@@ -399,6 +532,45 @@ done
 curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/status" || true
 echo
 
+# ── Start ClawSentry gateway (L1-only, reward-only) ──────────────────
+if [[ "${CLAWSENTRY_NEEDED}" == "1" ]]; then
+  CS_GATEWAY_LOG="${RUN_LOG_DIR}/clawsentry_gateway.log"
+  log "Starting clawsentry-gateway on ${CS_HTTP_HOST}:${CS_GATEWAY_PORT} (L1-only, reward-only)"
+  if ! command -v clawsentry >/dev/null 2>&1; then
+    log "WARN: 'clawsentry' CLI not found in PATH; safety reward will fail-open to 0"
+  else
+    (
+      CS_HTTP_HOST="${CS_HTTP_HOST}" \
+      CS_HTTP_PORT="${CS_GATEWAY_PORT}" \
+      CS_AUTH_TOKEN="${CS_AUTH_TOKEN}" \
+      CS_TRAJECTORY_DB_PATH="${CS_TRAJECTORY_DB_PATH}" \
+      CS_LLM_PROVIDER="${CS_LLM_PROVIDER}" \
+      CS_L3_ENABLED="${CS_L3_ENABLED}" \
+      CS_EVOLVING_ENABLED="${CS_EVOLVING_ENABLED}" \
+      clawsentry gateway \
+        --gateway-host "${CS_HTTP_HOST}" \
+        --gateway-port "${CS_GATEWAY_PORT}" \
+        > "${CS_GATEWAY_LOG}" 2>&1 &
+      echo $! > "${RUN_LOG_DIR}/clawsentry_gateway.pid"
+    )
+    CS_GATEWAY_PID="$(cat "${RUN_LOG_DIR}/clawsentry_gateway.pid" 2>/dev/null || echo '')"
+    log "ClawSentry gateway PID=${CS_GATEWAY_PID}, log=${CS_GATEWAY_LOG}"
+
+    CS_OK=0
+    for ((i=1; i<=20; i++)); do
+      if curl -fsS --max-time 2 --noproxy '*' "${CS_HTTP_URL}/health" >/dev/null 2>&1; then
+        log "clawsentry-gateway ready (attempt ${i})"
+        CS_OK=1
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${CS_OK}" != "1" ]]; then
+      log "WARN: clawsentry-gateway not healthy at ${CS_HTTP_URL}/health; safety reward will fail-open to 0"
+    fi
+  fi
+fi
+
 # Pre-flight: sanity check each pool worker before launching training
 # (issue #3 §1.X-E: early detection of worker transport flakes).
 log "Probing worker endpoints..."
@@ -421,7 +593,7 @@ fi
 log "HAS_NVLINK=${HAS_NVLINK}"
 
 # ── Dump run config ──────────────────────────────────────────────────
-cat > "${RUN_LOG_DIR}/run_config.json" <<CFGEOF
+cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
 {
   "run_name": "${RUN_NAME}",
   "timestamp": "${RUN_TIMESTAMP}",
@@ -442,6 +614,16 @@ cat > "${RUN_LOG_DIR}/run_config.json" <<CFGEOF
   "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
   "worker_urls": "${WORKER_URLS}",
   "env_server_url": "${ENV_SERVER_URL}",
+  "safety_reward_enable": "${CLAWSENTRY_NEEDED}",
+  "seta_safety": "${SETA_SAFETY}",
+  "safety_bench_reward": "${SAFETY_BENCH_REWARD}",
+  "safety_reward_coef": "${SAFETY_REWARD_COEF}",
+  "safety_reward_summary_weight": "${SAFETY_REWARD_SUMMARY_WEIGHT}",
+  "safety_reward_zero_threshold": "${SAFETY_REWARD_ZERO_THRESHOLD}",
+  "clawsentry_url": "${CS_HTTP_URL}",
+  "clawsentry_llm_provider": "${CS_LLM_PROVIDER}",
+  "clawsentry_l3_enabled": "${CS_L3_ENABLED}",
+  "clawsentry_evolving_enabled": "${CS_EVOLVING_ENABLED}",
   "log_dir": "${RUN_LOG_DIR}"
 }
 CFGEOF
@@ -482,6 +664,19 @@ RUNTIME_ENV_JSON="{
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
     \"USE_REMOTE_ENV\": \"${USE_REMOTE_ENV}\",
     \"ENV_SERVER_URL\": \"${ENV_SERVER_URL}\",
+    \"NO_PROXY\": \"${NO_PROXY}\",
+    \"no_proxy\": \"${NO_PROXY}\",
+    \"CS_HTTP_URL\": \"${CS_HTTP_URL}\",
+    \"CS_AUTH_TOKEN\": \"${CS_AUTH_TOKEN}\",
+    \"SETA_SAFETY\": \"${SETA_SAFETY}\",
+    \"SAFETY_BENCH_REWARD\": \"${SAFETY_BENCH_REWARD}\",
+    \"SAFETY_REWARD_COEF\": \"${SAFETY_REWARD_COEF}\",
+    \"SAFETY_REWARD_SUMMARY_WEIGHT\": \"${SAFETY_REWARD_SUMMARY_WEIGHT}\",
+    \"SAFETY_REWARD_TIMEOUT\": \"${SAFETY_REWARD_TIMEOUT}\",
+    \"SAFETY_REWARD_ZERO_THRESHOLD\": \"${SAFETY_REWARD_ZERO_THRESHOLD}\",
+    \"TERMINAL_SAVE_TRAJ_DIR\": \"${TERMINAL_SAVE_TRAJ_DIR}\",
+    \"RUN_DIR\": \"${RUN_DIR}\",
+    \"DATASET\": \"${DATASET}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"
   }
 }"

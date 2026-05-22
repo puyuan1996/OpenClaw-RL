@@ -24,6 +24,14 @@ CPU_ERR_LOG="${TMP_DOC_LATEST}/cpu_err.log"
 echo "[$(date +'%F %T')] pool_server_pu wrapper starting" | tee "${CPU_POOL_LOG}"
 echo "  full log: ${CPU_POOL_LOG}"
 echo "  err log:  ${CPU_ERR_LOG}"
+echo "  ======================================================="
+echo "  Press Ctrl-C to stop. Live logs below:"
+echo "  ======================================================="
+echo
+
+# Force unbuffered output so uvicorn access logs show immediately on the
+# foreground terminal (instead of being held in stdio buffers).
+export PYTHONUNBUFFERED=1
 
 # Background error filter: every 30s, extract error lines from the full log.
 (
@@ -50,4 +58,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Run the real pool_server, tee-ing output to the shared log.
-bash "${SCRIPT_DIR}/run_pool_server.sh" 2>&1 | tee -a "${CPU_POOL_LOG}"
+# stdbuf forces line-buffered stdout/stderr so logs appear in real time on the
+# foreground terminal AND in the shared log file simultaneously.
+stdbuf -oL -eL bash "${SCRIPT_DIR}/run_pool_server.sh" 2>&1 | tee -a "${CPU_POOL_LOG}"

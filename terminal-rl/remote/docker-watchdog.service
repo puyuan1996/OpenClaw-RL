@@ -1,0 +1,51 @@
+[Unit]
+Description=Docker Watchdog for OpenClaw-RL pool_server (long-run hardened)
+Documentation=file:///mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/remote/docker_watchdog_v2.sh
+After=docker.service network-online.target
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/remote/docker_watchdog_v2.sh
+
+# Self-protection
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+OOMScoreAdjust=-900
+
+# Logs go to journal AND a flat file via the script itself.
+# Don't double-rotate via journal here (we do truncate-in-place inside the script).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=docker-watchdog
+
+# Watchdog needs the host's PID namespace to inspect containerd-shim and to manage dockerd.
+# These ensure systemd doesn't sandbox us into a private mount/PID ns.
+PrivateTmp=no
+PrivateMounts=no
+ProtectSystem=no
+ProtectHome=no
+NoNewPrivileges=no
+
+# Resource hints — leave headroom even when host is under pressure
+LimitNOFILE=65536
+LimitNPROC=infinity
+TasksMax=infinity
+
+# Environment — override here if needed (or via systemctl edit docker-watchdog)
+# Force no-proxy for all watchdog HTTP calls (we only talk to localhost / unix socket)
+Environment=no_proxy=*
+Environment=NO_PROXY=*
+Environment=http_proxy=
+Environment=https_proxy=
+Environment=HTTP_PROXY=
+Environment=HTTPS_PROXY=
+Environment=ALL_PROXY=
+Environment=all_proxy=
+# Environment=MAX_RUNNING_CONTAINERS=80
+# Environment=POOL_PORT=18081
+# Environment=BRIDGE_NETS_WARN=200
+
+[Install]
+WantedBy=multi-user.target
