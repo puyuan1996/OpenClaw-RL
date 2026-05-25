@@ -69,6 +69,7 @@ _FINAL_ANSWER_PATTERNS = [
     re.compile(r"答案\s*[:：]\s*([-+]?\d+(?:\.\d+)?)"),
 ]
 _SESSION_GROUP_RE = re.compile(r"(?:^|-)grp(\d+)(?:-|$)")
+_SESSION_REPLICA_RE = re.compile(r"(?:^|-)rep(\d+)(?:-|$)")
 _ALLOWED_BINOPS = {
     ast.Add: add,
     ast.Sub: sub,
@@ -1480,13 +1481,21 @@ class CodeRLAPIServer:
         feedback: dict[str, Any],
     ):
         turn_num = int(turn_id) if turn_id is not None else self._turn_counts.get(session_id, 0)
+        details = feedback.get("details") if isinstance(feedback.get("details"), dict) else {}
+        details = dict(details)
+        group_match = _SESSION_GROUP_RE.search(session_id)
+        replica_match = _SESSION_REPLICA_RE.search(session_id)
+        if group_match and "sample_group_index" not in details:
+            details["sample_group_index"] = int(group_match.group(1))
+        if replica_match and "sample_replica_index" not in details:
+            details["sample_replica_index"] = int(replica_match.group(1))
         payload = {
             "session_id": session_id,
             "turn_id": turn_num,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "event_type": feedback.get("event_type", "unknown"),
             "severity": feedback.get("severity", "info"),
-            "details": feedback.get("details", {}),
+            "details": details,
         }
         self._turn_feedback.setdefault(session_id, {}).setdefault(turn_num, []).append(payload)
         self._incr_stat("feedback_events_total")

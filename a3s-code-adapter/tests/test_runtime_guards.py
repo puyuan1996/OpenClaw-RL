@@ -423,6 +423,34 @@ def test_snapshot_stats_reports_rollout_proxy_state(monkeypatch) -> None:
     assert snapshot["reward"]["require_verifier_feedback"] is True
 
 
+def test_feedback_record_infers_group_and_replica_from_session_id(monkeypatch) -> None:
+    module = _load_module(monkeypatch, "code_rl_api_server")
+    server = object.__new__(module.CodeRLAPIServer)
+    server._turn_counts = {"a3s-code-run-grp000027-rep03-abcd": 1}
+    server._pending_turn_data = {}
+    server._turn_feedback = {}
+    server._stats = module.collections.Counter()
+    server._stats_lock = threading.Lock()
+    server._feedback_record_file = ""
+    records = []
+    server._append_jsonl = lambda _path, payload: records.append(payload)
+    server._append_trace_event = lambda *_args, **_kwargs: None
+
+    server._record_feedback(
+        "a3s-code-run-grp000027-rep03-abcd",
+        1,
+        {
+            "event_type": "task_verifier_reward",
+            "details": {"score": 0.75},
+        },
+    )
+
+    details = records[0]["details"]
+    assert details["score"] == 0.75
+    assert details["sample_group_index"] == 27
+    assert details["sample_replica_index"] == 3
+
+
 def test_pause_wait_blocks_until_submission_resumes(monkeypatch) -> None:
     module = _load_module(monkeypatch, "code_rl_api_server")
     server = object.__new__(module.CodeRLAPIServer)

@@ -90,6 +90,9 @@ export A3S_API_KEY="${SGLANG_API_KEY:-apiKey}"
 export A3S_CODE_TRAFFIC_SESSION_LIMIT=32
 export A3S_CODE_TRAFFIC_CONCURRENCY=4
 export A3S_CODE_SESSION_GROUP_SIZE="${N_SAMPLES_PER_PROMPT:-4}"
+# 可选：只跑指定 tag 或 seed id，用于放大有效 verifier 信号、剔除过慢任务。
+export A3S_CODE_INCLUDE_SEED_TAGS=clawgym
+export A3S_CODE_INCLUDE_SEED_IDS="seed-id-1,seed-id-2"
 
 bash a3s-code-adapter/run_a3s_code_agent_traffic.sh
 ```
