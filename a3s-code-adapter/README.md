@@ -32,11 +32,11 @@
 
 ```bash
 python -m pip install -r requirements.txt
-python -m pip install 'a3s-code>=3.0.0'
-python -c "import a3s_code; print(a3s_code.__file__)"
+python -m pip install --upgrade a3s-code
+python -c "import importlib.metadata as md, a3s_code; print(md.version('a3s-code')); print(a3s_code.__file__)"
 ```
 
-本 adapter 的长期使用方式是安装发布包，例如 `pip install a3s-code`。只有在对应 SDK 能力尚未发布时，才临时通过 wheel 覆盖当前环境；不要依赖本地源码目录作为常态运行方式。
+本 adapter 的长期使用方式是安装最新发布包，例如 `pip install --upgrade a3s-code`。traffic 脚本默认设置 `A3S_CODE_REQUIRED_VERSION=latest`；如果 `A3S_CODE_REPO_ROOT` 指向 AI45Lab/Code checkout，会读取 `sdk/python/pyproject.toml` 中的当前版本并校验已安装包。只有在对应 SDK 能力尚未发布时，才临时通过 wheel 覆盖当前环境；不要依赖本地源码目录作为常态运行方式。
 
 当前训练链路要求 `a3s-code` 至少支持：
 

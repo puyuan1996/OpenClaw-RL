@@ -88,6 +88,7 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 SLIME_ROOT="${PROJECT_ROOT}/slime"
 MEGATRON_ROOT="${PROJECT_ROOT}/Megatron-LM"
 CODE_RL_DIR="${A3S_CODE_ADAPTER_DIR:-${SCRIPT_DIR}}"
+export A3S_CODE_REQUIRED_VERSION="${A3S_CODE_REQUIRED_VERSION:-latest}"
 A3S_CODE_MODEL_VARIANT="${A3S_CODE_MODEL_VARIANT:-qwen3.5-4b}"
 TRAIN_BACKEND="${TRAIN_BACKEND:-${A3S_CODE_TRAIN_BACKEND:-megatron}}"
 case "${TRAIN_BACKEND}" in
@@ -1135,6 +1136,7 @@ RUNTIME_ENV_JSON="$(cat <<JSON
     "CODE_RL_TRAIN_SIDE": "${CODE_RL_TRAIN_SIDE}",
     "CODE_RL_REWARD_MODE": "${CODE_RL_REWARD_MODE}",
     "CODE_RL_REQUIRE_VERIFIER_FEEDBACK": "${CODE_RL_REQUIRE_VERIFIER_FEEDBACK}",
+    "A3S_CODE_REQUIRED_VERSION": "${A3S_CODE_REQUIRED_VERSION}",
     "A3S_CODE_SEED_DATA_FILE": "${A3S_CODE_SEED_DATA_FILE:-}",
     "A3S_CODE_TASK_TEMPLATE_ROOT": "${A3S_CODE_TASK_TEMPLATE_ROOT:-}",
     "A3S_CODE_ENABLE_TASK_VERIFIER_REWARD": "${A3S_CODE_ENABLE_TASK_VERIFIER_REWARD:-1}",
@@ -1213,6 +1215,7 @@ cat > "${RUN_ROOT}/launch_info.json" <<EOF
   "router_balance_abs_threshold": "${A3S_CODE_ROUTER_BALANCE_ABS_THRESHOLD:-}",
   "seed_data_file": "${A3S_CODE_SEED_DATA_FILE:-${CODE_RL_DIR}/seed_data/code_task_seeds.json}",
   "task_template_root": "${A3S_CODE_TASK_TEMPLATE_ROOT:-${CODE_RL_DIR}/task_templates}",
+  "a3s_code_required_version": "${A3S_CODE_REQUIRED_VERSION}",
   "task_verifier_reward_enabled": $([[ "${A3S_CODE_ENABLE_TASK_VERIFIER_REWARD:-1}" == "1" ]] && echo true || echo false),
   "a3s_code_builtin_skills": $([[ "${A3S_CODE_BUILTIN_SKILLS:-1}" == "1" ]] && echo true || echo false),
   "a3s_code_planning": "${A3S_CODE_PLANNING:-1}",

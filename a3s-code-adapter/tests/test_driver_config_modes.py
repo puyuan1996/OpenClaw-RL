@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata as importlib_metadata
 import importlib.util
 import json
 import sys
@@ -72,6 +73,38 @@ def test_build_agent_config_shared_mode(monkeypatch, tmp_path: Path):
     assert "context_tokens =" not in content
     assert "max_tokens =" not in content
     assert "/session/sess-123" not in content
+
+
+def test_driver_rejects_wrong_required_a3s_code_version(monkeypatch, tmp_path: Path):
+    with pytest.raises(RuntimeError, match="a3s-code version mismatch|installed distribution a3s-code is not visible"):
+        _load_driver_module(
+            monkeypatch,
+            tmp_path,
+            config_mode="shared",
+            extra_env={"A3S_CODE_REQUIRED_VERSION": "0.0.0-test"},
+        )
+
+
+def test_driver_latest_required_uses_a3s_code_repo_version(monkeypatch, tmp_path: Path):
+    a3s_code_root = tmp_path / "Code"
+    sdk_python = a3s_code_root / "sdk" / "python"
+    sdk_python.mkdir(parents=True)
+    (sdk_python / "pyproject.toml").write_text(
+        '[project]\nname = "a3s-code"\nversion = "9.9.9"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(importlib_metadata, "version", lambda name: "9.9.8")
+
+    with pytest.raises(RuntimeError, match="required 9.9.9, imported distribution 9.9.8"):
+        _load_driver_module(
+            monkeypatch,
+            tmp_path,
+            config_mode="shared",
+            extra_env={
+                "A3S_CODE_REPO_ROOT": str(a3s_code_root),
+                "A3S_CODE_REQUIRED_VERSION": "latest",
+            },
+        )
 
 
 def test_build_agent_config_per_session_mode(monkeypatch, tmp_path: Path):

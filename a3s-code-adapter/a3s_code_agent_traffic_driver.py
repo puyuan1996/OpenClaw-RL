@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib.metadata as importlib_metadata
 import os
 import random
 import re
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,14 +90,55 @@ def _bootstrap_a3s_code() -> None:
 
     raise RuntimeError(
         "a3s_code is not importable. Install a packaged SDK first, for example:\n"
-        "  python -m pip install 'a3s-code>=3.0.0'\n"
+        "  python -m pip install --upgrade a3s-code\n"
         "If the required a3s-code PR has not been released yet, build a wheel from "
         "the a3s-code repository and install that wheel into this environment."
     )
 
 
+def _latest_a3s_code_version_from_repo() -> str | None:
+    repo_root = Path(
+        os.getenv(
+            "A3S_CODE_REPO_ROOT",
+            str(Path(__file__).resolve().parents[2] / "a3s-lab" / "Code"),
+        )
+    )
+    pyproject = repo_root / "sdk" / "python" / "pyproject.toml"
+    if not pyproject.exists():
+        return None
+    try:
+        with pyproject.open("rb") as handle:
+            project = tomllib.load(handle).get("project", {})
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(f"Could not read a3s-code version from {pyproject}") from exc
+    version = str(project.get("version", "")).strip()
+    return version or None
+
+
+def _enforce_required_a3s_code_version() -> None:
+    required = os.getenv("A3S_CODE_REQUIRED_VERSION", "").strip()
+    if not required:
+        return
+    if required.lower() in {"latest", "current"}:
+        required = _latest_a3s_code_version_from_repo() or ""
+    try:
+        actual = importlib_metadata.version("a3s-code")
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "A3S_CODE_REQUIRED_VERSION is set but installed distribution a3s-code is not visible"
+        ) from exc
+    if not required:
+        return
+    if actual != required:
+        raise RuntimeError(
+            f"a3s-code version mismatch: required {required}, imported distribution {actual}. "
+            "Install the latest AI45Lab/Code wheel or PyPI package into this environment before running agent-RL."
+        )
+
+
 _clear_proxy_env_for_local_rl()
 _bootstrap_a3s_code()
+_enforce_required_a3s_code_version()
 from a3s_code import Agent, PermissionPolicy, SessionOptions  # noqa: E402
 
 
