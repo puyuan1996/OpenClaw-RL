@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_UTILS_PATH = ROOT / "a3s_code_benchmarks" / "benchmark_runtime_utils.py"
+SKILLSBENCH_RUNNER_PATH = ROOT / "a3s_code_benchmarks" / "official" / "skillsbench_a3s_code_runner.py"
 
 
 class _FakeTokenizer:
@@ -210,6 +211,8 @@ def _install_sglang_stubs(monkeypatch) -> None:
 def _install_a3s_code_stub(monkeypatch) -> None:
     a3s_code = types.ModuleType("a3s_code")
     a3s_code.Agent = type("Agent", (), {})
+    a3s_code.ConfirmationPolicy = type("ConfirmationPolicy", (), {})
+    a3s_code.FileSessionStore = type("FileSessionStore", (), {})
     a3s_code.PermissionPolicy = type("PermissionPolicy", (), {})
     a3s_code.SessionOptions = type("SessionOptions", (), {})
     monkeypatch.setitem(sys.modules, "a3s_code", a3s_code)
@@ -240,6 +243,17 @@ def _load_runtime_utils(monkeypatch, a3s_code_root: Path):
     return module
 
 
+def _load_skillsbench_runner(monkeypatch):
+    _install_a3s_code_stub(monkeypatch)
+    module_name = f"skillsbench_runner_test_{time.time_ns()}"
+    spec = importlib.util.spec_from_file_location(module_name, SKILLSBENCH_RUNNER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_find_existing_wheel_requires_current_a3s_code_version(monkeypatch, tmp_path: Path) -> None:
     a3s_root = tmp_path / "Code"
     sdk_dir = a3s_root / "sdk" / "python"
@@ -258,6 +272,57 @@ def test_find_existing_wheel_requires_current_a3s_code_version(monkeypatch, tmp_
     fresh.write_text("new", encoding="utf-8")
 
     assert module.find_existing_wheel(wheel_dir) == fresh
+
+
+def test_render_openai_agent_config_uses_current_acl_shape(monkeypatch, tmp_path: Path) -> None:
+    module = _load_runtime_utils(monkeypatch, tmp_path / "Code")
+
+    content = module.render_openai_agent_config(
+        base_url="http://127.0.0.1:30000",
+        model_name="qwen",
+        api_key="key",
+        context_tokens=200000,
+        output_tokens=12000,
+        session_id_header="X-Session-Id",
+    )
+
+    assert 'apiKey = "key"' in content
+    assert 'baseUrl = "http://127.0.0.1:30000"' in content
+    assert 'sessionIdHeader = "X-Session-Id"' in content
+    assert "toolCall = true" in content
+    assert "limit = {" in content
+    assert "context = 200000" in content
+    assert "output = 12000" in content
+    assert "api_key =" not in content
+    assert "base_url =" not in content
+    assert "max_tokens =" not in content
+    assert "context_tokens =" not in content
+
+
+def test_skillsbench_runner_config_uses_current_acl_shape(monkeypatch) -> None:
+    runner = _load_skillsbench_runner(monkeypatch)
+    monkeypatch.setenv("A3S_CODE_CONTEXT_TOKENS", "200000")
+    monkeypatch.setenv("A3S_CODE_OUTPUT_TOKENS", "12000")
+
+    content = runner._render_config(
+        provider="openai",
+        base_url="http://100.80.0.1:19080/v1",
+        model_name="qwen",
+        api_key="key",
+        session_id_header="X-Session-Id",
+    )
+
+    assert 'apiKey = "key"' in content
+    assert 'baseUrl = "http://100.80.0.1:19080/v1"' in content
+    assert 'sessionIdHeader = "X-Session-Id"' in content
+    assert "toolCall = true" in content
+    assert "limit = {" in content
+    assert "context = 200000" in content
+    assert "output = 12000" in content
+    assert "api_key =" not in content
+    assert "base_url =" not in content
+    assert "max_tokens =" not in content
+    assert "context_tokens =" not in content
 
 
 def test_find_existing_wheel_rejects_stale_only_wheel(monkeypatch, tmp_path: Path) -> None:

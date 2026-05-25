@@ -690,12 +690,12 @@ def _render_agent_config(base_url: str, *, session_id_header: str | None = None)
     return (
         f'default_model = "openai/{A3S_MODEL_NAME}"\n\n'
         'providers "openai" {\n'
-        f'  api_key = "{A3S_API_KEY}"\n'
-        f'  base_url = "{base_url}"\n'
+        f'  apiKey = "{A3S_API_KEY}"\n'
+        f'  baseUrl = "{base_url}"\n'
         f"{session_header_line}\n"
         f'  models "{A3S_MODEL_NAME}" {{\n'
         f'    name = "{A3S_MODEL_NAME}"\n'
-        "    tool_call = true\n\n"
+        "    toolCall = true\n\n"
         "    limit = {\n"
         f"      context = {MODEL_CONTEXT_TOKENS}\n"
         f"      output = {MODEL_OUTPUT_TOKENS}\n"

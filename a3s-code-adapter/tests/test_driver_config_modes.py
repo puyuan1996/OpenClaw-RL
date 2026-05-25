@@ -65,11 +65,13 @@ def test_build_agent_config_shared_mode(monkeypatch, tmp_path: Path):
     assert config_path.name == "shared-agent.acl"
     assert 'providers "openai"' in content
     assert 'models "test-model"' in content
-    assert 'base_url = "http://127.0.0.1:30000"' in content
+    assert 'baseUrl = "http://127.0.0.1:30000"' in content
     assert 'sessionIdHeader = "X-Session-Id"' in content
     assert "limit = {" in content
     assert "context = " in content
     assert "output = " in content
+    assert "base_url =" not in content
+    assert "tool_call =" not in content
     assert "context_tokens =" not in content
     assert "max_tokens =" not in content
     assert "/session/sess-123" not in content
@@ -116,10 +118,12 @@ def test_build_agent_config_per_session_mode(monkeypatch, tmp_path: Path):
     assert config_path.name == "sess-123.acl"
     assert 'providers "openai"' in content
     assert 'models "test-model"' in content
-    assert 'base_url = "http://127.0.0.1:30000/session/sess-123"' in content
+    assert 'baseUrl = "http://127.0.0.1:30000/session/sess-123"' in content
     assert "limit = {" in content
     assert "context = " in content
     assert "output = " in content
+    assert "base_url =" not in content
+    assert "tool_call =" not in content
     assert "context_tokens =" not in content
     assert "max_tokens =" not in content
     assert "sessionIdHeader" not in content

@@ -218,18 +218,20 @@ def render_agent_config(
 ) -> str:
     session_header_line = ""
     if session_id_header:
-        session_header_line = f'  session_id_header = "{session_id_header}"\n'
+        session_header_line = f'  sessionIdHeader = "{session_id_header}"\n'
     return (
         f'default_model = "{provider}/{model_name}"\n\n'
         f'providers "{provider}" {{\n'
-        f'  api_key = "{api_key}"\n'
-        f'  base_url = "{base_url}"\n'
+        f'  apiKey = "{api_key}"\n'
+        f'  baseUrl = "{base_url}"\n'
         f"{session_header_line}"
         f'  models "{model_name}" {{\n'
         f'    name = "{model_name}"\n'
-        f"    max_tokens = {output_tokens}\n"
-        f"    context_tokens = {context_tokens}\n"
-        "    tool_call = true\n\n"
+        "    toolCall = true\n\n"
+        "    limit = {\n"
+        f"      context = {context_tokens}\n"
+        f"      output = {output_tokens}\n"
+        "    }\n"
         "  }\n"
         "}\n"
     )
