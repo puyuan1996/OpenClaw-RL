@@ -125,6 +125,17 @@ def test_build_agent_config_per_session_mode(monkeypatch, tmp_path: Path):
     assert "sessionIdHeader" not in content
 
 
+def test_force_general_agent_style_prefixes_ambiguous_test_prompt(monkeypatch, tmp_path: Path):
+    driver = _load_driver_module(monkeypatch, tmp_path, config_mode="shared")
+
+    prompt = "Please update the output files and run the relevant tests."
+    guarded = driver._force_general_agent_style(prompt)
+
+    assert guarded.endswith(prompt)
+    assert any("\u4e00" <= char <= "\u9fff" for char in guarded)
+    assert driver._force_general_agent_style(guarded) == guarded
+
+
 def test_load_seed_tasks_defaults_to_all_tags(monkeypatch, tmp_path: Path):
     driver = _load_driver_module(monkeypatch, tmp_path, config_mode="shared")
 

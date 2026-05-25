@@ -59,6 +59,7 @@ _NON_STANDARD_BODY_KEYS = {
     "turn_type",
     "channel",
 }
+_DEFAULT_DROPPED_MODEL_TOOLS = {"task", "parallel_task"}
 _MATH_EXPR_PATTERNS = [
     re.compile(r"(?:compute|calculate|evaluate|what is|what's)\s+([^=\n\r?]+)", re.IGNORECASE),
     re.compile(r"(?:solve|answer)\s*[:：]?\s*([^=\n\r?]+)", re.IGNORECASE),
@@ -119,6 +120,15 @@ def _env_flag(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _csv_env_set(name: str, default: set[str]) -> set[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return set(default)
+    if raw.strip().lower() in {"", "0", "none", "null", "false", "off", "disabled"}:
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -558,6 +568,10 @@ class CodeRLAPIServer:
         self.response_trim_margin_tokens = int(
             os.getenv("CODE_RL_RESPONSE_TRIM_MARGIN_TOKENS", "8")
         )
+        self.drop_model_tools = _csv_env_set(
+            "CODE_RL_DROP_MODEL_TOOLS",
+            _DEFAULT_DROPPED_MODEL_TOOLS,
+        )
         self.drop_repetitive_samples = _env_flag("CODE_RL_DROP_REPETITIVE_SAMPLES", True)
         self.pause_wait_timeout_sec = _env_float("CODE_RL_PAUSE_WAIT_TIMEOUT_SEC", 1800.0)
         self.pause_drain_timeout_sec = _env_float("CODE_RL_PAUSE_DRAIN_TIMEOUT_SEC", 1800.0)
@@ -661,6 +675,32 @@ class CodeRLAPIServer:
         self._thread: threading.Thread | None = None
         self._housekeeping_task: asyncio.Task | None = None
         self.app = self._build_app()
+
+    def _filter_model_tools(self, tools: Any) -> list[dict[str, Any]] | None:
+        if not isinstance(tools, list):
+            return tools
+        if not self.drop_model_tools:
+            return tools
+
+        filtered: list[dict[str, Any]] = []
+        dropped: list[str] = []
+        for tool in tools:
+            name = ""
+            if isinstance(tool, dict):
+                function_def = tool.get("function")
+                if isinstance(function_def, dict):
+                    name = str(function_def.get("name", "")).strip()
+            if name and name in self.drop_model_tools:
+                dropped.append(name)
+                continue
+            filtered.append(tool)
+
+        if dropped:
+            self._incr_stat("dropped_model_tools_total", len(dropped))
+            for name in dropped:
+                self._incr_stat(f"dropped_model_tool_{name}")
+            logger.info("[Code-RL] dropped model tools: %s", sorted(set(dropped)))
+        return filtered or None
 
     def _incr_stat(self, key: str, value: int | float = 1) -> None:
         stats = getattr(self, "_stats", None)
@@ -1641,10 +1681,15 @@ class CodeRLAPIServer:
         if session_id in self._pending_records and messages:
             self._flush_pending_record(session_id, messages[-1])
 
-        tools = body.get("tools")
+        original_tools = body.get("tools")
+        tools = self._filter_model_tools(original_tools)
         forward_body = {
             key: value for key, value in body.items() if key not in _NON_STANDARD_BODY_KEYS
         }
+        if tools is None:
+            forward_body.pop("tools", None)
+        else:
+            forward_body["tools"] = tools
         forward_body["stream"] = False
         forward_body.pop("stream_options", None)
         forward_body["logprobs"] = True
@@ -2169,6 +2214,56 @@ class CodeRLAPIServer:
 
         self._maybe_cleanup_session(session_id)
 
+    def _drop_pending_turns_without_required_feedback(self, session_id: str, reason: str):
+        if not self._require_verifier_feedback:
+            return
+        pending = self._pending_turn_data.get(session_id)
+        if not pending:
+            return
+
+        dropped_turns: list[int] = []
+        for turn_num in sorted(list(pending.keys())):
+            if self._has_verifier_feedback(session_id, turn_num):
+                continue
+            turn_data = pending.pop(turn_num)
+            dropped_turns.append(turn_num)
+            self._incr_stat("dropped_samples_total")
+            self._incr_stat("dropped_missing_verifier_feedback")
+            self._append_sample_trace(
+                session_id=session_id,
+                turn_data=turn_data,
+                reward_info={"score": 0.0, "source": "none"},
+                prm_result=None,
+                feedback_summary={"events": [], "finalize_reason": reason},
+                metadata={
+                    "source": "a3s_code",
+                    "session_id": session_id,
+                    "turn_id": turn_num,
+                    "turn_type": turn_data.get("turn_type", "unknown"),
+                    "session_done": bool(turn_data.get("session_done", False)),
+                    "finalize_reason": reason,
+                    "train_metadata": {
+                        "reward_source": "none",
+                        "suggested_use": "analysis_only",
+                        "eligible_for_rl": False,
+                        "exclude_reason": "missing_verifier_feedback",
+                    },
+                },
+                decision="dropped_missing_verifier_feedback",
+                exclude_reason="missing_verifier_feedback",
+            )
+
+        if not pending:
+            self._pending_turn_data.pop(session_id, None)
+        if dropped_turns:
+            logger.info(
+                "[Code-RL] dropped pending turns without verifier feedback "
+                "session=%s turns=%s reason=%s",
+                session_id,
+                dropped_turns,
+                reason,
+            )
+
     async def _submit_turn_sample(
         self,
         turn_data: dict[str, Any],
@@ -2491,6 +2586,7 @@ class CodeRLAPIServer:
         logger.info("[Code-RL] finalizing session=%s reason=%s", session_id, reason)
         self._finalizing_sessions.add(session_id)
         self._flush_pending_record(session_id, None)
+        self._drop_pending_turns_without_required_feedback(session_id, reason)
         self._maybe_submit_ready_samples(session_id, force_no_prm=True)
         self._maybe_cleanup_session(session_id)
 

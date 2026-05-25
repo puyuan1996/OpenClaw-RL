@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import importlib
 import importlib.util
 import queue
@@ -354,6 +355,30 @@ def test_short_repetition_guard_flags_degenerate_outputs(monkeypatch) -> None:
 
     assert module._has_short_repetition(degenerate)
     assert not module._has_short_repetition(normal)
+
+
+def test_default_model_tool_filter_drops_delegation_tools(monkeypatch) -> None:
+    module = _load_module(monkeypatch, "code_rl_api_server")
+    monkeypatch.delenv("CODE_RL_DROP_MODEL_TOOLS", raising=False)
+    server = object.__new__(module.CodeRLAPIServer)
+    server.drop_model_tools = module._csv_env_set(
+        "CODE_RL_DROP_MODEL_TOOLS",
+        module._DEFAULT_DROPPED_MODEL_TOOLS,
+    )
+    server._stats = module.collections.Counter()
+    server._stats_lock = threading.Lock()
+
+    tools = [
+        {"type": "function", "function": {"name": "read"}},
+        {"type": "function", "function": {"name": "task"}},
+        {"type": "function", "function": {"name": "parallel_task"}},
+    ]
+
+    filtered = module.CodeRLAPIServer._filter_model_tools(server, tools)
+
+    assert [tool["function"]["name"] for tool in filtered] == ["read"]
+    assert server._stats["dropped_model_tool_task"] == 1
+    assert server._stats["dropped_model_tool_parallel_task"] == 1
 
 
 def test_snapshot_stats_reports_rollout_proxy_state(monkeypatch) -> None:
@@ -729,6 +754,47 @@ def test_verifier_labeled_repetitive_failure_is_trainable(monkeypatch) -> None:
     _, samples = server.output_queue.get_nowait()
     assert samples[0].reward == {"score": 0.0}
     assert metadata_store["train_metadata"]["repetition_kept_by_verifier"] is True
+
+
+def test_finalize_drops_pending_turn_without_required_verifier_feedback(monkeypatch) -> None:
+    module = _load_module(monkeypatch, "code_rl_api_server")
+    server = object.__new__(module.CodeRLAPIServer)
+    server._require_verifier_feedback = True
+    server._prm_enabled = False
+    server._pending_records = {}
+    server._pending_turn_data = {
+        "s1": {
+            1: {
+                "turn_num": 1,
+                "turn_type": "main",
+                "prompt_ids": [1],
+                "response_ids": [2],
+                "response_text": "unfinished",
+                "tool_calls": [],
+                "session_done": False,
+            }
+        }
+    }
+    server._turn_feedback = {"s1": {}}
+    server._prm_tasks = {}
+    server._submit_tasks = {}
+    server._finalizing_sessions = set()
+    server._overflow_terminated_sessions = set()
+    server._session_latest_messages = {"s1": []}
+    server._session_last_activity = {"s1": 1.0}
+    server._session_effective = {"s1": 0}
+    server._turn_counts = {"s1": 1}
+    server._stats = collections.Counter()
+    server._stats_lock = threading.Lock()
+    server._trace_record_file = None
+    server._trace_counter = iter([1])
+
+    module.CodeRLAPIServer._finalize_session(server, "s1", reason="idle_timeout")
+
+    assert "s1" not in server._pending_turn_data
+    assert "s1" not in server._finalizing_sessions
+    assert server._stats["dropped_missing_verifier_feedback"] == 1
+    assert server._stats["dropped_samples_total"] == 1
 
 
 def test_cleanup_waits_for_submit_tasks(monkeypatch) -> None:

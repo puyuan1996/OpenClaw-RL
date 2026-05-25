@@ -208,6 +208,30 @@ SIMULATED_USER_MAX_ATTEMPTS = int(
 REQUEST_TIMEOUT_SEC = float(os.getenv("A3S_CODE_REQUEST_TIMEOUT_SEC", "600"))
 RL_HEALTH_CHECK_INTERVAL_SEC = max(1.0, float(os.getenv("A3S_CODE_RL_HEALTH_CHECK_INTERVAL_SEC", "15")))
 RL_UNAVAILABLE_EXIT_SEC = max(0.0, float(os.getenv("A3S_CODE_RL_UNAVAILABLE_EXIT_SEC", "300")))
+TRAFFIC_BACKPRESSURE = _env_flag("A3S_CODE_TRAFFIC_BACKPRESSURE", True)
+TRAFFIC_BACKPRESSURE_INTERVAL_SEC = max(
+    1.0,
+    float(os.getenv("A3S_CODE_TRAFFIC_BACKPRESSURE_INTERVAL_SEC", "5")),
+)
+TRAFFIC_BACKPRESSURE_TIMEOUT_SEC = max(
+    0.0,
+    float(os.getenv("A3S_CODE_TRAFFIC_BACKPRESSURE_TIMEOUT_SEC", "0")),
+)
+_rollout_batch_size = int(os.getenv("ROLLOUT_BATCH_SIZE", "0") or 0)
+_samples_per_prompt = int(os.getenv("N_SAMPLES_PER_PROMPT", str(SESSION_GROUP_SIZE)) or SESSION_GROUP_SIZE)
+_default_raw_train_batch_size = (
+    _rollout_batch_size * _samples_per_prompt
+    if _rollout_batch_size > 0 and _samples_per_prompt > 0
+    else 0
+)
+TRAFFIC_RAW_TRAIN_BATCH_SIZE = max(
+    0,
+    int(os.getenv("A3S_CODE_TRAFFIC_RAW_TRAIN_BATCH_SIZE", str(_default_raw_train_batch_size)) or 0),
+)
+TRAFFIC_MAX_BATCH_OVERSHOOT = max(
+    0,
+    int(os.getenv("A3S_CODE_TRAFFIC_MAX_BATCH_OVERSHOOT", "0") or 0),
+)
 KEEP_WORKSPACES = _env_flag("A3S_CODE_KEEP_WORKSPACES", False)
 KEEP_WORKSPACES_ON_ERROR = _env_flag("A3S_CODE_KEEP_WORKSPACES_ON_ERROR", KEEP_WORKSPACES)
 KEEP_CONFIGS = _env_flag("A3S_CODE_KEEP_CONFIGS", False)
@@ -230,6 +254,8 @@ TOOL_TIMEOUT_MS = int(os.getenv("A3S_CODE_TOOL_TIMEOUT_MS", "240000"))
 MAX_PARSE_RETRIES = int(os.getenv("A3S_CODE_MAX_PARSE_RETRIES", "4"))
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("A3S_CODE_CIRCUIT_BREAKER_THRESHOLD", "5"))
 BUILTIN_SKILLS = _env_flag("A3S_CODE_BUILTIN_SKILLS", True)
+DISABLE_DELEGATION_TOOLS = _env_flag("A3S_CODE_DISABLE_DELEGATION_TOOLS", False)
+FORCE_GENERAL_AGENT_STYLE = _env_flag("A3S_CODE_FORCE_GENERAL_AGENT_STYLE", True)
 PLANNING_MODE = os.getenv("A3S_CODE_PLANNING_MODE", "").strip().lower()
 if PLANNING_MODE and PLANNING_MODE not in {"auto", "enabled", "disabled"}:
     raise RuntimeError(
@@ -792,6 +818,96 @@ def _wait_for_rl_service(worker_id: int) -> bool:
     return False
 
 
+def _get_int_at(payload: dict[str, Any], path: tuple[str, ...], default: int = 0) -> int:
+    value: Any = payload
+    for key in path:
+        if not isinstance(value, dict):
+            return default
+        value = value.get(key)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _should_wait_for_rl_backpressure(stats: dict[str, Any]) -> tuple[bool, str]:
+    if not bool(stats.get("submission_enabled", True)):
+        epoch = _get_int_at(stats, ("submission_epoch",), 0)
+        return True, f"submission_paused epoch={epoch}"
+
+    if TRAFFIC_RAW_TRAIN_BATCH_SIZE <= 0:
+        return False, ""
+
+    submitted = _get_int_at(stats, ("counters", "submitted_samples_total"), 0)
+    current_batch_submitted = submitted % TRAFFIC_RAW_TRAIN_BATCH_SIZE
+    if current_batch_submitted <= 0:
+        return False, ""
+
+    pending_sessions = _get_int_at(stats, ("pending", "sessions"), 0)
+    projected = current_batch_submitted + pending_sessions
+    limit = TRAFFIC_RAW_TRAIN_BATCH_SIZE + TRAFFIC_MAX_BATCH_OVERSHOOT
+    if projected >= limit:
+        return (
+            True,
+            "batch_capacity "
+            f"submitted_mod={current_batch_submitted} pending_sessions={pending_sessions} "
+            f"projected={projected} limit={limit}",
+        )
+    return False, ""
+
+
+def _wait_for_rl_backpressure(worker_id: int) -> bool:
+    if not TRAFFIC_BACKPRESSURE:
+        return True
+
+    start = time.monotonic()
+    warned = False
+    with httpx.Client(timeout=10.0, trust_env=False) as client:
+        while not SHUTDOWN_EVENT.is_set():
+            try:
+                response = client.get(f"{RL_BASE_URL}/stats")
+                response.raise_for_status()
+                stats = response.json()
+            except Exception as exc:
+                if not warned:
+                    print(
+                        f"[a3s-code-driver] worker={worker_id} backpressure_probe_failed "
+                        f"error={type(exc).__name__}: {exc}; continuing without throttle",
+                        flush=True,
+                    )
+                return True
+
+            should_wait, reason = _should_wait_for_rl_backpressure(stats)
+            if not should_wait:
+                if warned:
+                    print(
+                        f"[a3s-code-driver] worker={worker_id} backpressure_released",
+                        flush=True,
+                    )
+                return True
+
+            elapsed = time.monotonic() - start
+            if TRAFFIC_BACKPRESSURE_TIMEOUT_SEC > 0 and elapsed >= TRAFFIC_BACKPRESSURE_TIMEOUT_SEC:
+                print(
+                    f"[a3s-code-driver] worker={worker_id} backpressure_timeout "
+                    f"elapsed={elapsed:.0f}s reason={reason}",
+                    flush=True,
+                )
+                return True
+
+            if not warned:
+                print(
+                    f"[a3s-code-driver] worker={worker_id} backpressure_wait reason={reason} "
+                    f"raw_train_batch_size={TRAFFIC_RAW_TRAIN_BATCH_SIZE} "
+                    f"max_overshoot={TRAFFIC_MAX_BATCH_OVERSHOOT}",
+                    flush=True,
+                )
+                warned = True
+            time.sleep(TRAFFIC_BACKPRESSURE_INTERVAL_SEC)
+
+    return False
+
+
 def _next_session_index() -> int | None:
     global SESSION_COUNTER
     with COUNTER_LOCK:
@@ -901,6 +1017,21 @@ def _fallback_seed_prompt(seed: SeedTask, template_meta: TemplateMeta) -> str:
         f"{f'Extra constraints: {constraints}. ' if constraints else ''}"
         f"Acceptance notes: {acceptance}."
     )
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _force_general_agent_style(prompt: str) -> str:
+    if not FORCE_GENERAL_AGENT_STYLE or _has_cjk(prompt):
+        return prompt
+    # Some a3s-code SDK versions route artifact-production tasks containing
+    # words like "test" into a read-only verification style. Prefix with a
+    # direct coding-agent instruction until the SDK exposes explicit style
+    # selection for this adapter.
+    prefix = "\u8bf7\u4f5c\u4e3a\u53ef\u5199\u5de5\u4f5c\u533a\u7f16\u7a0b\u4ee3\u7406\u5b8c\u6210\u4ee5\u4e0b\u4efb\u52a1\u3002 "
+    return prefix + prompt
 
 
 def _rewrite_seed_task(client: httpx.Client, seed: SeedTask, template_meta: TemplateMeta) -> str:
@@ -1440,7 +1571,25 @@ def _run_one_session(worker_id: int, session_index: int, seeds: list[SeedTask]) 
         opts.max_parse_retries = MAX_PARSE_RETRIES
         opts.max_tool_rounds = MAX_TOOL_ROUNDS
         opts.circuit_breaker_threshold = CIRCUIT_BREAKER_THRESHOLD
-        opts.permission_policy = PermissionPolicy(default_decision="allow")
+        if DISABLE_DELEGATION_TOOLS:
+            opts.auto_parallel = False
+            opts.max_parallel_tasks = 0
+            opts.add_instruction(
+                "no-delegation-tools",
+                (
+                    "Do not use task or parallel_task. Complete the requested "
+                    "workspace task directly in this session with the normal "
+                    "filesystem, edit, bash, and program tools. Delegated child "
+                    "agents can run with read-only restrictions and are not "
+                    "appropriate for artifact-production benchmark tasks."
+                ),
+            )
+            opts.permission_policy = PermissionPolicy(
+                default_decision="allow",
+                deny=["task", "parallel_task"],
+            )
+        else:
+            opts.permission_policy = PermissionPolicy(default_decision="allow")
         opts.thinking_budget = THINKING_BUDGET if THINKING_BUDGET > 0 else None
         opts.continuation_enabled = CONTINUATION_ENABLED
         opts.max_continuation_turns = MAX_CONTINUATION_TURNS
@@ -1467,7 +1616,8 @@ def _run_one_session(worker_id: int, session_index: int, seeds: list[SeedTask]) 
                 f"turn={main_turn_number} prompt_chars={len(user_prompt)}",
                 flush=True,
             )
-            result = _send_with_timeout(session, user_prompt)
+            agent_prompt = _force_general_agent_style(user_prompt)
+            result = _send_with_timeout(session, agent_prompt)
             latest_response = result.text
             print(
                 f"[a3s-code-driver] worker={worker_id} session_id={session_id} "
@@ -1567,6 +1717,8 @@ def _worker_main(worker_id: int, seeds: list[SeedTask]) -> None:
     while not SHUTDOWN_EVENT.is_set():
         if not _wait_for_rl_service(worker_id):
             return
+        if not _wait_for_rl_backpressure(worker_id):
+            return
         session_index = _next_session_index()
         if session_index is None:
             return
@@ -1611,7 +1763,11 @@ def main() -> None:
         f"concurrency={CONCURRENCY} session_start_index={SESSION_START_INDEX} "
         f"session_limit={SESSION_LIMIT or 'inf'} "
         f"session_group_size={SESSION_GROUP_SIZE} "
+        f"backpressure={TRAFFIC_BACKPRESSURE} raw_train_batch_size={TRAFFIC_RAW_TRAIN_BATCH_SIZE} "
+        f"max_batch_overshoot={TRAFFIC_MAX_BATCH_OVERSHOOT} "
         f"max_main_turns={MAX_MAIN_TURNS} max_tool_rounds={MAX_TOOL_ROUNDS} "
+        f"disable_delegation_tools={DISABLE_DELEGATION_TOOLS} "
+        f"force_general_agent_style={FORCE_GENERAL_AGENT_STYLE} "
         f"agent_env_backend={AGENT_ENV_BACKEND} "
         f"agent_docker_image={AGENT_DOCKER_IMAGE if AGENT_ENV_BACKEND == 'docker' else 'n/a'} "
         f"tool_timeout_ms={TOOL_TIMEOUT_MS} turn_timeout_sec={TURN_TIMEOUT_SEC:.0f} "
