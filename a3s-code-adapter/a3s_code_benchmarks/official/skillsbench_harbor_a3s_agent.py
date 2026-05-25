@@ -57,7 +57,18 @@ DEFAULT_NO_PROXY_ENTRIES = [
     "server",
     "selenium",
     "web",
+    "10.0.0.0/8",
+    "10.*",
+    "100.64.0.0/10",
+    "100.*",
+    "172.16.0.0/12",
+    "172.16.*",
+    "192.168.0.0/16",
+    "192.168.*",
     "*.local",
+    ".cluster.local",
+    ".pjlab.local",
+    ".svc",
     ".pjlab.org.cn",
     ".i.h.pjlab.org.cn",
     "mirrors.i.h.pjlab.org.cn",
@@ -626,6 +637,24 @@ esac
 proxy_host="${{A3S_CODE_BENCHMARK_PROXY_HOST:-{install_proxy_host}}}"
 proxy_port="${{A3S_CODE_BENCHMARK_PROXY_PORT:-{install_proxy_port}}}"
 maven_non_proxy_hosts="${{A3S_CODE_MAVEN_NON_PROXY_HOSTS:-{DEFAULT_MAVEN_NON_PROXY_HOSTS}}}"
+profile_no_proxy="${{A3S_CODE_NO_PROXY:-{','.join(DEFAULT_NO_PROXY_ENTRIES)}}}"
+model_base_url="${{A3S_CODE_MODEL_BASE_URL:-}}"
+model_no_proxy="${{A3S_CODE_MODEL_NO_PROXY:-1}}"
+case "${{model_no_proxy,,}}" in
+  0|false|no|off) model_base_url="" ;;
+esac
+if [ -n "$model_base_url" ]; then
+  model_host="$(printf '%s\n' "$model_base_url" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://([^/:]+).*#\1#')"
+  if [ -n "$model_host" ] && [ "$model_host" != "$model_base_url" ]; then
+    case ",$profile_no_proxy," in
+      *",$model_host,"*) ;;
+      *) profile_no_proxy="${{profile_no_proxy}},${{model_host}}" ;;
+    esac
+  fi
+fi
+export A3S_CODE_NO_PROXY="$profile_no_proxy"
+export NO_PROXY="$profile_no_proxy"
+export no_proxy="$profile_no_proxy"
 maven_network_timeout_ms="${{A3S_CODE_MAVEN_NETWORK_TIMEOUT_MS:-15000}}"
 maven_mirror_url="${{A3S_CODE_MAVEN_MIRROR_URL:-}}"
 maven_mirror_of="${{A3S_CODE_MAVEN_MIRROR_OF:-central}}"
@@ -945,8 +974,9 @@ export HTTPS_PROXY="$benchmark_proxy"
 export https_proxy="$benchmark_proxy"
 export ALL_PROXY="$benchmark_proxy"
 export all_proxy="$benchmark_proxy"
-export NO_PROXY="${{A3S_CODE_NO_PROXY:-{','.join(DEFAULT_NO_PROXY_ENTRIES)}}}"
-export no_proxy="${{A3S_CODE_NO_PROXY:-{','.join(DEFAULT_NO_PROXY_ENTRIES)}}}"
+export A3S_CODE_NO_PROXY="$profile_no_proxy"
+export NO_PROXY="$profile_no_proxy"
+export no_proxy="$profile_no_proxy"
 export MAVEN_OPTS="-Dhttp.proxyHost=$proxy_host -Dhttp.proxyPort=$proxy_port -Dhttps.proxyHost=$proxy_host -Dhttps.proxyPort=$proxy_port -Dhttp.nonProxyHosts=$maven_non_proxy_hosts -Dhttps.nonProxyHosts=$maven_non_proxy_hosts"
 export JAVA_OPTS="-Dhttp.proxyHost=$proxy_host -Dhttp.proxyPort=$proxy_port -Dhttps.proxyHost=$proxy_host -Dhttps.proxyPort=$proxy_port -Dhttp.nonProxyHosts=$maven_non_proxy_hosts -Dhttps.nonProxyHosts=$maven_non_proxy_hosts"
 export SBT_OPTS="-Dhttp.proxyHost=$proxy_host -Dhttp.proxyPort=$proxy_port -Dhttps.proxyHost=$proxy_host -Dhttps.proxyPort=$proxy_port -Dhttp.nonProxyHosts=$maven_non_proxy_hosts -Dhttps.nonProxyHosts=$maven_non_proxy_hosts"

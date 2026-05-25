@@ -11,13 +11,17 @@ import subprocess
 import sys
 import threading
 import time
-import tomllib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[import-not-found]
 
 
 def _env_flag(name: str, default: bool) -> bool:
