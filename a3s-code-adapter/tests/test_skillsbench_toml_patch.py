@@ -105,6 +105,18 @@ def test_subprocess_env_respects_model_no_proxy_flag(monkeypatch) -> None:
     assert "35.220.164.252" not in env["NO_PROXY"].split(",")
 
 
+def test_subprocess_env_exports_a3s_code_no_proxy(monkeypatch) -> None:
+    monkeypatch.delenv("A3S_CODE_MODEL_NO_PROXY", raising=False)
+    monkeypatch.setenv("NO_PROXY", "localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+
+    env = _subprocess_env({"A3S_CODE_MODEL_BASE_URL": "http://10.102.232.67:18080/v1"})
+
+    assert "10.102.232.67" in env["NO_PROXY"].split(",")
+    assert env["A3S_CODE_NO_PROXY"] == env["NO_PROXY"]
+    assert env["no_proxy"] == env["NO_PROXY"]
+
+
 def test_agent_env_does_not_embed_model_api_key(monkeypatch) -> None:
     pytest.importorskip("harbor")
     from a3s_code_benchmarks.official.skillsbench_harbor_a3s_agent import A3SCodeHarbor

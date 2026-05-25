@@ -18,7 +18,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 try:
     from a3s_code import Agent, ConfirmationPolicy, FileSessionStore, PermissionPolicy, SessionOptions
@@ -360,6 +360,12 @@ class _ProxyBridgeHandler(socketserver.BaseRequestHandler):
                 return
 
             parsed = urlparse(target)
+            if not (parsed.scheme and parsed.hostname):
+                decoded_target = unquote(target)
+                if decoded_target != target:
+                    decoded = urlparse(decoded_target)
+                    if decoded.scheme and decoded.hostname:
+                        parsed = decoded
             if parsed.scheme and parsed.hostname:
                 host = parsed.hostname
                 port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -570,11 +576,17 @@ def _configure_proxy_env() -> None:
         proxy = ""
     runtime_proxy_env = _env_flag("A3S_CODE_AGENT_RUNTIME_PROXY", False)
     no_proxy_raw = (os.getenv("A3S_CODE_NO_PROXY") or os.getenv("NO_PROXY") or DEFAULT_NO_PROXY).strip()
+    no_proxy_entries = [
+        entry.strip()
+        for entry in no_proxy_raw.split(",")
+        if entry.strip() and entry.strip() != "*"
+    ]
+    model_host = (urlparse(os.getenv("A3S_CODE_MODEL_BASE_URL", "")).hostname or "").strip()
+    if _env_flag("A3S_CODE_MODEL_NO_PROXY", True) and model_host:
+        no_proxy_entries.append(model_host)
     no_proxy = ",".join(
         dict.fromkeys(
-            entry.strip()
-            for entry in no_proxy_raw.split(",")
-            if entry.strip() and entry.strip() != "*"
+            no_proxy_entries
         )
     )
     proxy_mode = os.getenv("A3S_CODE_AGENT_PROXY_MODE", "bridge").strip().lower()
@@ -591,6 +603,7 @@ def _configure_proxy_env() -> None:
         for env_name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
             os.environ.pop(env_name, None)
     if no_proxy:
+        os.environ["A3S_CODE_NO_PROXY"] = no_proxy
         os.environ["NO_PROXY"] = no_proxy
         os.environ["no_proxy"] = no_proxy
 

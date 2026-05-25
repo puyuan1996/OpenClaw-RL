@@ -626,29 +626,43 @@ class A3SCodeHarbor(BaseInstalledAgent):
         install_proxy_port = 3128
         if install_proxy_url:
             install_proxy_host, install_proxy_port = _proxy_host_port(install_proxy_url)
+        install_default_env = self._default_env()
+        install_default_no_proxy = install_default_env["A3S_CODE_NO_PROXY"]
+        install_default_model_base_url = install_default_env["A3S_CODE_MODEL_BASE_URL"]
+        install_default_model_no_proxy = os.getenv("A3S_CODE_MODEL_NO_PROXY", "1")
         install_script = f"""#!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy
 benchmark_proxy={shlex.quote(install_proxy_url)}
+default_profile_no_proxy={shlex.quote(install_default_no_proxy)}
+default_model_base_url={shlex.quote(install_default_model_base_url)}
+default_model_no_proxy={shlex.quote(install_default_model_no_proxy)}
 case "${{benchmark_proxy,,}}" in
   ""|0|false|no|none|off|direct) benchmark_proxy="" ;;
 esac
 proxy_host="${{A3S_CODE_BENCHMARK_PROXY_HOST:-{install_proxy_host}}}"
 proxy_port="${{A3S_CODE_BENCHMARK_PROXY_PORT:-{install_proxy_port}}}"
 maven_non_proxy_hosts="${{A3S_CODE_MAVEN_NON_PROXY_HOSTS:-{DEFAULT_MAVEN_NON_PROXY_HOSTS}}}"
-profile_no_proxy="${{A3S_CODE_NO_PROXY:-{','.join(DEFAULT_NO_PROXY_ENTRIES)}}}"
-model_base_url="${{A3S_CODE_MODEL_BASE_URL:-}}"
-model_no_proxy="${{A3S_CODE_MODEL_NO_PROXY:-1}}"
+profile_no_proxy="${{A3S_CODE_NO_PROXY:-$default_profile_no_proxy}}"
+model_base_url="${{A3S_CODE_MODEL_BASE_URL:-$default_model_base_url}}"
+model_no_proxy="${{A3S_CODE_MODEL_NO_PROXY:-$default_model_no_proxy}}"
 case "${{model_no_proxy,,}}" in
   0|false|no|off) model_base_url="" ;;
 esac
 if [ -n "$model_base_url" ]; then
-  model_host="$(printf '%s\n' "$model_base_url" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://([^/:]+).*#\1#')"
+  model_host="$model_base_url"
+  case "$model_host" in
+    *://*) model_host="${{model_host#*://}}" ;;
+  esac
+  model_host="${{model_host%%/*}}"
+  model_host="${{model_host%%:*}}"
+  model_host="${{model_host#[}}"
+  model_host="${{model_host%]}}"
   if [ -n "$model_host" ] && [ "$model_host" != "$model_base_url" ]; then
     case ",$profile_no_proxy," in
       *",$model_host,"*) ;;
-      *) profile_no_proxy="${{profile_no_proxy}},${{model_host}}" ;;
+      *) profile_no_proxy="${{profile_no_proxy:+${{profile_no_proxy}},}}${{model_host}}" ;;
     esac
   fi
 fi

@@ -205,6 +205,7 @@ def _subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         if parsed.hostname:
             no_proxy_entries.add(parsed.hostname)
     merged_no_proxy = ",".join(sorted(no_proxy_entries))
+    env["A3S_CODE_NO_PROXY"] = merged_no_proxy
     env["NO_PROXY"] = merged_no_proxy
     env["no_proxy"] = merged_no_proxy
     return env
