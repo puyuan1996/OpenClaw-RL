@@ -1,0 +1,16 @@
+{
+  "template": "skill_catalog",
+  "repo_summary": "a small Python repo that scans reusable skill folders and exports a machine-readable catalog for internal agent workflows",
+  "key_files": [
+    "scripts/build_catalog.py parses SKILL.md files and writes catalog/skills_index.json",
+    "skills/*/SKILL.md holds the human-facing metadata and examples for each skill",
+    "tests/test_catalog.py validates the exported catalog structure",
+    "README.md explains how internal teams consume the generated index"
+  ],
+  "test_command": "pytest -q",
+  "realism_notes": [
+    "Requests usually mention benchmark coverage, pairing recommendations, or validation rules for skill metadata",
+    "Practical asks often touch both the generated catalog and the human-readable README",
+    "The repo is still small, so a good task stays scoped to one export path or one validation rule at a time"
+  ]
+}

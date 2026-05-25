@@ -23,6 +23,7 @@ import ast
 import collections
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -36,6 +37,8 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.io_struct import Function, Tool
 
 from slime.utils.metric_utils import has_repetition
 from slime.utils.processing_utils import load_tokenizer
@@ -64,6 +67,7 @@ _FINAL_ANSWER_PATTERNS = [
     re.compile(r"final answer\s*[:：]\s*([-+]?\d+(?:\.\d+)?)", re.IGNORECASE),
     re.compile(r"答案\s*[:：]\s*([-+]?\d+(?:\.\d+)?)"),
 ]
+_SESSION_GROUP_RE = re.compile(r"(?:^|-)grp(\d+)(?:-|$)")
 _ALLOWED_BINOPS = {
     ast.Add: add,
     ast.Sub: sub,
@@ -83,11 +87,61 @@ _ALLOWED_UNARYOPS = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _has_short_repetition(text: str) -> bool:
+    tokens = re.findall(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", text)
+    if len(tokens) < 24:
+        return False
+
+    normalized = [token.lower() for token in tokens if token.strip()]
+    if not normalized:
+        return False
+
+    counts = collections.Counter(normalized)
+    most_common = counts.most_common(1)[0][1]
+    if most_common / len(normalized) >= 0.45 and len(counts) <= max(6, len(normalized) // 8):
+        return True
+
+    for ngram_size in (1, 2, 3):
+        if len(normalized) < ngram_size * 8:
+            continue
+        ngrams = [
+            tuple(normalized[i : i + ngram_size])
+            for i in range(0, len(normalized) - ngram_size + 1, ngram_size)
+        ]
+        if ngrams and collections.Counter(ngrams).most_common(1)[0][1] >= 8:
+            return True
+
+    return False
+
+
 def _env_flag(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a float, got {raw!r}") from exc
+
+
+def _json_env_dict(name: str) -> dict[str, Any]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{name} must be a valid JSON object") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} must be a JSON object, got {type(value).__name__}")
+    return value
 
 
 def _normalize_openai_chat_url(url: str) -> str:
@@ -146,8 +200,26 @@ def _normalize_messages_for_template(messages: list[dict[str, Any]]) -> list[dic
         raw = item.get("content")
         if not isinstance(raw, str) and raw is not None:
             item["content"] = _flatten_message_content(raw)
+        if item.get("tool_calls"):
+            item["tool_calls"] = [_normalize_tool_call(tc) for tc in item["tool_calls"]]
         out.append(item)
     return out
+
+
+def _normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
+    item = dict(tool_call)
+    function = item.get("function")
+    if isinstance(function, dict):
+        function = dict(function)
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                parsed_arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                parsed_arguments = {}
+            function["arguments"] = parsed_arguments if isinstance(parsed_arguments, dict) else {}
+        item["function"] = function
+    return item
 
 
 def _normalize_messages_for_matching(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -188,6 +260,21 @@ def _extract_logprobs_from_chat_response(choice: dict[str, Any]) -> list[float]:
     if not isinstance(content, list):
         return []
     return [float(item.get("logprob", 0.0)) for item in content if isinstance(item, dict)]
+
+
+def _is_sglang_chat_batch_error(status_code: int, response_text: str) -> bool:
+    return (
+        status_code == 400
+        and "input_ids should be a list of lists for batch processing" in response_text
+    )
+
+
+def _normalize_finish_reason(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("type") or value.get("reason")
+    if value is None:
+        return "stop"
+    return str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -366,17 +453,31 @@ async def reward_func(args, sample_or_samples, **kwargs):
     }
 
 
+def _normalize_input_ids_for_generate(raw_input_ids) -> list[int]:
+    """Convert tokenizer outputs to a plain JSON-serializable token-id list."""
+    input_ids = raw_input_ids
+    if hasattr(input_ids, "keys") and "input_ids" in input_ids:
+        input_ids = input_ids["input_ids"]
+    if hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    if isinstance(input_ids, tuple):
+        input_ids = list(input_ids)
+    if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+        input_ids = input_ids[0]
+    return [int(token_id) for token_id in input_ids]
+
+
 async def generate(args, sample: Sample, sampling_params, evaluation: bool = False) -> Sample:
     tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
     messages = sample.prompt
     if not isinstance(messages, list):
         messages = [{"role": "user", "content": str(sample.prompt)}]
 
-    input_ids = tokenizer.apply_chat_template(
+    input_ids = _normalize_input_ids_for_generate(tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
-    )
+    ))
     payload = {
         "input_ids": input_ids,
         "sampling_params": sampling_params,
@@ -433,6 +534,9 @@ class CodeRLAPIServer:
         self.sglang_chat_url = (
             f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/chat/completions"
         )
+        self.sglang_generate_url = (
+            f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+        )
         self.sglang_health_url = (
             f"http://{args.sglang_router_ip}:{args.sglang_router_port}/health"
         )
@@ -440,7 +544,8 @@ class CodeRLAPIServer:
         self.host = os.getenv("HOST", "0.0.0.0")
         self.port = int(os.getenv("PORT", "30000"))
         self.served_model_name = os.getenv("SERVED_MODEL_NAME", "qwen3-4b-2507")
-        matched_context_tokens = os.getenv("CODE_RL_MATCHED_CONTEXT_TOKENS", "8192")
+        self.tool_call_parser = os.getenv("TOOL_CALL_PARSER", "qwen25")
+        matched_context_tokens = os.getenv("CODE_RL_MATCHED_CONTEXT_TOKENS", "16384")
         self.max_train_tokens = int(os.getenv("CODE_RL_MAX_TRAIN_TOKENS", matched_context_tokens))
         self.context_length = int(
             os.getenv(
@@ -448,12 +553,18 @@ class CodeRLAPIServer:
                 os.getenv("ROLLOUT_MAX_CONTEXT_LEN", matched_context_tokens),
             )
         )
-        self.context_safety_margin = int(os.getenv("CODE_RL_CONTEXT_SAFETY_MARGIN", "256"))
-        self.max_response_tokens = int(os.getenv("CODE_RL_MAX_RESPONSE_TOKENS", "0"))
+        self.context_safety_margin = int(os.getenv("CODE_RL_CONTEXT_SAFETY_MARGIN", "512"))
+        self.max_response_tokens = int(os.getenv("CODE_RL_MAX_RESPONSE_TOKENS", "4096"))
         self.response_trim_margin_tokens = int(
             os.getenv("CODE_RL_RESPONSE_TRIM_MARGIN_TOKENS", "8")
         )
         self.drop_repetitive_samples = _env_flag("CODE_RL_DROP_REPETITIVE_SAMPLES", True)
+        self.pause_wait_timeout_sec = _env_float("CODE_RL_PAUSE_WAIT_TIMEOUT_SEC", 1800.0)
+        self.pause_drain_timeout_sec = _env_float("CODE_RL_PAUSE_DRAIN_TIMEOUT_SEC", 1800.0)
+        self.generation_timeout_sec = _env_float("CODE_RL_GENERATION_TIMEOUT_SEC", 600.0)
+        self._inflight_generation_requests = 0
+        self._inflight_generation_condition = threading.Condition()
+        self._submission_epoch = 0
 
         self._index_counter = count(0)
         self._group_counter = count(0)
@@ -471,19 +582,21 @@ class CodeRLAPIServer:
         self._overflow_terminated_sessions: set[str] = set()
         self._turn_feedback: dict[str, dict[int, list[dict[str, Any]]]] = {}
 
-        self._submit_side = _env_flag("CODE_RL_SUBMIT_SIDE", True)
+        self._submit_side = _env_flag("CODE_RL_SUBMIT_SIDE", False)
         self._train_side = _env_flag("CODE_RL_TRAIN_SIDE", False)
         self._reward_mode = os.getenv("CODE_RL_REWARD_MODE", "hybrid").strip().lower()
+        self._require_verifier_feedback = _env_flag("CODE_RL_REQUIRE_VERIFIER_FEEDBACK", False)
         self._idle_flush_sec = int(os.getenv("CODE_RL_SESSION_IDLE_FLUSH_SEC", "30"))
 
         self._prm_openai_url = _normalize_openai_chat_url(os.getenv("CODE_RL_PRM_OPENAI_URL", ""))
         self._prm_openai_model = os.getenv("CODE_RL_PRM_OPENAI_MODEL_NAME", os.getenv("CODE_RL_PRM_MODEL_NAME", "")).strip()
         self._prm_openai_api_key = os.getenv("CODE_RL_PRM_API_KEY", "")
+        self._prm_openai_extra_body = _json_env_dict("CODE_RL_PRM_OPENAI_EXTRA_BODY")
         self._prm_use_openai = bool(self._prm_openai_url and self._prm_openai_model)
         self._prm_enabled = bool(getattr(args, "prm_enable", False) or self._prm_use_openai)
         self._prm_m = int(os.getenv("PRM_M", getattr(args, "prm_m", 3)))
         self._prm_temperature = float(getattr(args, "prm_temperature", 0.6))
-        self._prm_max_tokens = int(getattr(args, "prm_max_new_tokens", 4096))
+        self._prm_max_tokens = int(getattr(args, "prm_max_new_tokens", 8192))
         self._prm_timeout_sec = float(os.getenv("CODE_RL_PRM_TIMEOUT_SEC", "180"))
         prm_ip = getattr(args, "prm_router_ip", None)
         prm_port = getattr(args, "prm_router_port", None)
@@ -504,6 +617,8 @@ class CodeRLAPIServer:
 
         self._eval_scores: list[float] = []
         self._eval_scores_lock = threading.Lock()
+        self._stats = collections.Counter()
+        self._stats_lock = threading.Lock()
 
         self._record_file = (
             os.getenv("CODE_RL_RECORD_FILE", "")
@@ -547,6 +662,81 @@ class CodeRLAPIServer:
         self._housekeeping_task: asyncio.Task | None = None
         self.app = self._build_app()
 
+    def _incr_stat(self, key: str, value: int | float = 1) -> None:
+        stats = getattr(self, "_stats", None)
+        lock = getattr(self, "_stats_lock", None)
+        if stats is None:
+            return
+        if lock is None:
+            stats[key] += value
+            return
+        with lock:
+            stats[key] += value
+
+    def snapshot_stats(self) -> dict[str, Any]:
+        stats = getattr(self, "_stats", collections.Counter())
+        lock = getattr(self, "_stats_lock", None)
+        if lock is None:
+            counters = dict(stats)
+        else:
+            with lock:
+                counters = dict(stats)
+
+        inflight_condition = getattr(self, "_inflight_generation_condition", None)
+        if inflight_condition is None:
+            inflight = int(getattr(self, "_inflight_generation_requests", 0))
+            submission_epoch = int(getattr(self, "_submission_epoch", 0))
+        else:
+            with inflight_condition:
+                inflight = int(getattr(self, "_inflight_generation_requests", 0))
+                submission_epoch = int(getattr(self, "_submission_epoch", 0))
+
+        eval_scores = getattr(self, "_eval_scores", [])
+        eval_scores_lock = getattr(self, "_eval_scores_lock", None)
+        if eval_scores_lock is None:
+            eval_scores_snapshot = list(eval_scores)
+        else:
+            with eval_scores_lock:
+                eval_scores_snapshot = list(eval_scores)
+
+        pending_turn_data = getattr(self, "_pending_turn_data", {})
+        prm_tasks = getattr(self, "_prm_tasks", {})
+        submit_tasks = getattr(self, "_submit_tasks", {})
+        queue_size = None
+        try:
+            queue_size = self.output_queue.qsize()
+        except Exception:
+            pass
+
+        return {
+            "submission_enabled": bool(getattr(self, "submission_enabled", None) and self.submission_enabled.is_set()),
+            "submission_epoch": submission_epoch,
+            "inflight_generation_requests": inflight,
+            "queue_size": queue_size,
+            "counters": counters,
+            "pending": {
+                "sessions": len(pending_turn_data),
+                "turns": sum(len(turns) for turns in pending_turn_data.values()),
+                "records": len(getattr(self, "_pending_records", {})),
+                "finalizing_sessions": len(getattr(self, "_finalizing_sessions", set())),
+                "prm_tasks": sum(len(tasks) for tasks in prm_tasks.values()),
+                "live_submit_tasks": sum(
+                    1 for tasks in submit_tasks.values() for task in tasks if not task.done()
+                ),
+            },
+            "reward": {
+                "mode": getattr(self, "_reward_mode", "unknown"),
+                "prm_backend": getattr(self, "_prm_backend", "unknown"),
+                "require_verifier_feedback": bool(getattr(self, "_require_verifier_feedback", False)),
+                "eval_scores_count": len(eval_scores_snapshot),
+                "eval_score_mean": (
+                    sum(eval_scores_snapshot) / len(eval_scores_snapshot)
+                    if eval_scores_snapshot
+                    else None
+                ),
+            },
+        }
+
     def _build_synthetic_chat_response(
         self,
         *,
@@ -586,6 +776,225 @@ class CodeRLAPIServer:
             },
         }
 
+    def _build_sglang_sampling_params(
+        self,
+        forward_body: dict[str, Any],
+        requested_max_tokens: int | None,
+    ) -> dict[str, Any]:
+        sampling_params: dict[str, Any] = {
+            "temperature": float(forward_body.get("temperature", 0.0) or 0.0),
+            "top_p": float(forward_body.get("top_p", 1.0) or 1.0),
+            "top_k": int(forward_body.get("top_k", -1) or -1),
+            "max_new_tokens": max(1, requested_max_tokens or self.max_response_tokens),
+        }
+        stop = forward_body.get("stop")
+        if stop:
+            sampling_params["stop"] = stop
+        stop_token_ids = forward_body.get("stop_token_ids")
+        if isinstance(stop_token_ids, list) and stop_token_ids:
+            sampling_params["stop_token_ids"] = stop_token_ids
+        min_new_tokens = forward_body.get("min_new_tokens")
+        if min_new_tokens is not None:
+            try:
+                sampling_params["min_new_tokens"] = int(min_new_tokens)
+            except (TypeError, ValueError):
+                pass
+        return sampling_params
+
+    def _parse_tool_calls_from_generate_text(
+        self,
+        response_text: str,
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        if not isinstance(tools, list) or not tools:
+            return response_text, []
+
+        tool_defs: list[Tool] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function_def = tool.get("function")
+            if not isinstance(function_def, dict):
+                continue
+            name = str(function_def.get("name", "")).strip()
+            if not name:
+                continue
+            tool_defs.append(
+                Tool(
+                    type=str(tool.get("type", "function")),
+                    function=Function(
+                        name=name,
+                        description=str(function_def.get("description", "")),
+                        parameters=function_def.get("parameters") or {},
+                    ),
+                )
+            )
+        if not tool_defs:
+            return response_text, []
+
+        try:
+            parser = FunctionCallParser(
+                tools=tool_defs,
+                tool_call_parser=self.tool_call_parser,
+            )
+            normal_text, calls = parser.parse_non_stream(response_text)
+            return normal_text, [call.model_dump() for call in calls]
+        except Exception as exc:
+            logger.warning("[Code-RL] tool-call parse fallback failed: %s", exc)
+            return response_text, []
+
+    def _wrap_generate_output_as_chat_response(
+        self,
+        data: dict[str, Any],
+        *,
+        prompt_token_count: int,
+        model_name: str,
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        raw_text = _flatten_message_content(data.get("text", ""))
+        content, tool_calls = self._parse_tool_calls_from_generate_text(raw_text, tools)
+        meta_info = data.get("meta_info") if isinstance(data.get("meta_info"), dict) else {}
+
+        logprob_items: list[dict[str, Any]] = []
+        for item in meta_info.get("output_token_logprobs") or []:
+            token_id = None
+            logprob = 0.0
+            if isinstance(item, list):
+                if item:
+                    try:
+                        logprob = float(item[0] or 0.0)
+                    except (TypeError, ValueError):
+                        logprob = 0.0
+                if len(item) > 1:
+                    token_id = item[1]
+            elif isinstance(item, dict):
+                token_id = item.get("token_id")
+                try:
+                    logprob = float(item.get("logprob", 0.0))
+                except (TypeError, ValueError):
+                    logprob = 0.0
+
+            token_text = ""
+            if token_id is not None:
+                try:
+                    token_text = self.tokenizer.decode(
+                        [int(token_id)],
+                        skip_special_tokens=False,
+                    )
+                except Exception:
+                    token_text = ""
+            logprob_items.append({"token": token_text, "logprob": logprob})
+
+        completion_tokens = meta_info.get("completion_tokens")
+        if completion_tokens is None:
+            completion_tokens = len(
+                self.tokenizer(raw_text or "", add_special_tokens=False)["input_ids"]
+            )
+        prompt_tokens = meta_info.get("prompt_tokens", prompt_token_count)
+
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content,
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+
+        now = int(time.time())
+        return {
+            "id": meta_info.get("id") or f"chatcmpl-generate-{now}-{next(self._group_counter)}",
+            "object": "chat.completion",
+            "created": now,
+            "model": model_name or self.served_model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": _normalize_finish_reason(meta_info.get("finish_reason")),
+                    "logprobs": {"content": logprob_items},
+                }
+            ],
+            "usage": {
+                "prompt_tokens": int(prompt_tokens),
+                "completion_tokens": int(completion_tokens),
+                "total_tokens": int(prompt_tokens) + int(completion_tokens),
+            },
+            "_code_rl_raw_response_text": raw_text,
+        }
+
+    async def _generate_chat_fallback(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        forward_body: dict[str, Any],
+        prompt_ids: list[int],
+        prompt_token_count: int,
+        requested_max_tokens: int | None,
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        payload = {
+            "input_ids": prompt_ids,
+            "sampling_params": self._build_sglang_sampling_params(
+                forward_body,
+                requested_max_tokens,
+            ),
+            "return_logprob": True,
+        }
+        response = await client.post(self.sglang_generate_url, json=payload)
+        if response.status_code != 200:
+            logger.error(
+                "[Code-RL] SGLang /generate returned %d: %s",
+                response.status_code,
+                response.text[:1000],
+            )
+            detail: Any
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text[:2000]
+            raise HTTPException(status_code=response.status_code, detail=detail)
+        return self._wrap_generate_output_as_chat_response(
+            response.json(),
+            prompt_token_count=prompt_token_count,
+            model_name=str(forward_body.get("model") or self.served_model_name),
+            tools=tools,
+        )
+
+    async def _wait_for_submission_enabled(self, *, session_id: str, turn_type: str) -> None:
+        if self.submission_enabled.is_set():
+            return
+
+        timeout_sec = max(0.0, float(self.pause_wait_timeout_sec))
+        logger.info(
+            "[Code-RL] waiting for submission resume session=%s turn_type=%s timeout=%.1fs",
+            session_id,
+            turn_type,
+            timeout_sec,
+        )
+        deadline = asyncio.get_running_loop().time() + timeout_sec
+        while True:
+            if self.submission_enabled.is_set():
+                logger.info(
+                    "[Code-RL] submission resumed session=%s turn_type=%s",
+                    session_id,
+                    turn_type,
+                )
+                return
+            remaining_sec = deadline - asyncio.get_running_loop().time()
+            if remaining_sec <= 0:
+                break
+            await asyncio.sleep(min(1.0, remaining_sec))
+
+        logger.warning(
+            "[Code-RL] submission pause wait timed out session=%s turn_type=%s timeout=%.1fs",
+            session_id,
+            turn_type,
+            timeout_sec,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="submission paused for weight update; retry after resume",
+        )
+
     # -----------------------------------------------------------------------
     # FastAPI app
     # -----------------------------------------------------------------------
@@ -614,6 +1023,11 @@ class CodeRLAPIServer:
         async def healthz():
             return {"ok": True}
 
+        @app.get("/stats")
+        async def stats():
+            owner: CodeRLAPIServer = app.state.owner
+            return owner.snapshot_stats()
+
         async def _handle_chat(
             request: Request,
             path_session_id: str | None = None,
@@ -625,8 +1039,6 @@ class CodeRLAPIServer:
         ):
             owner: CodeRLAPIServer = request.app.state.owner
             await owner._check_auth(authorization)
-            if not owner.submission_enabled.is_set():
-                raise HTTPException(status_code=503, detail="submission paused for weight update")
 
             body = await request.json()
             messages = body.get("messages")
@@ -642,15 +1054,32 @@ class CodeRLAPIServer:
             request_meta = {
                 "channel": x_channel or body.get("channel") or "api",
             }
-
-            stream = bool(body.get("stream", False))
-            result = await owner._handle_request(
-                body,
+            await owner._wait_for_submission_enabled(
                 session_id=session_id,
                 turn_type=turn_type,
-                session_done=session_done,
-                request_meta=request_meta,
             )
+
+            request_epoch = owner._begin_generation_request(
+                session_id=session_id,
+                turn_type=turn_type,
+            )
+            if request_epoch is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="submission paused for weight update; retry after resume",
+                )
+            try:
+                stream = bool(body.get("stream", False))
+                result = await owner._handle_request(
+                    body,
+                    session_id=session_id,
+                    turn_type=turn_type,
+                    session_done=session_done,
+                    request_meta=request_meta,
+                    submission_epoch=request_epoch,
+                )
+            finally:
+                owner._end_generation_request(session_id=session_id, turn_type=turn_type)
             if stream:
                 return StreamingResponse(
                     owner._stream_response(result),
@@ -725,9 +1154,90 @@ class CodeRLAPIServer:
             if turn_id is None:
                 turn_id = owner._turn_counts.get(str(session_id))
             owner._record_feedback(str(session_id), turn_id, body)
+            if str(body.get("event_type", "")) in {"verifier_reward", "task_verifier_reward"}:
+                owner._maybe_submit_ready_samples(str(session_id), force_no_prm=True)
             return {"ok": True, "session_id": session_id, "turn_id": turn_id}
 
         return app
+
+    # -----------------------------------------------------------------------
+    # Request drain for weight updates
+    # -----------------------------------------------------------------------
+
+    def advance_submission_epoch(self) -> int:
+        with self._inflight_generation_condition:
+            self._submission_epoch += 1
+            epoch = self._submission_epoch
+            self._inflight_generation_condition.notify_all()
+        logger.info("[Code-RL] advanced submission epoch to %d", epoch)
+        return epoch
+
+    def _current_submission_epoch(self) -> int:
+        with self._inflight_generation_condition:
+            return self._submission_epoch
+
+    def _begin_generation_request(self, *, session_id: str, turn_type: str) -> int | None:
+        with self._inflight_generation_condition:
+            if not self.submission_enabled.is_set():
+                logger.info(
+                    "[Code-RL] rejecting generation start while submission is paused "
+                    "session=%s turn_type=%s epoch=%d",
+                    session_id,
+                    turn_type,
+                    self._submission_epoch,
+                )
+                return None
+            self._inflight_generation_requests += 1
+            current = self._inflight_generation_requests
+            epoch = self._submission_epoch
+        logger.info(
+            "[Code-RL] generation request started session=%s turn_type=%s inflight=%d epoch=%d",
+            session_id,
+            turn_type,
+            current,
+            epoch,
+        )
+        return epoch
+
+    def _end_generation_request(self, *, session_id: str, turn_type: str) -> None:
+        with self._inflight_generation_condition:
+            self._inflight_generation_requests = max(0, self._inflight_generation_requests - 1)
+            current = self._inflight_generation_requests
+            self._inflight_generation_condition.notify_all()
+        logger.info(
+            "[Code-RL] generation request finished session=%s turn_type=%s inflight=%d",
+            session_id,
+            turn_type,
+            current,
+        )
+
+    def wait_for_inflight_generation_requests(self, timeout_sec: float | None = None) -> bool:
+        timeout = self.pause_drain_timeout_sec if timeout_sec is None else max(0.0, timeout_sec)
+        deadline = time.monotonic() + timeout if timeout > 0 else None
+        next_log = time.monotonic()
+
+        with self._inflight_generation_condition:
+            while self._inflight_generation_requests > 0:
+                now = time.monotonic()
+                if now >= next_log:
+                    logger.info(
+                        "[Code-RL] waiting for %d in-flight generation request(s) before pause/update",
+                        self._inflight_generation_requests,
+                    )
+                    next_log = now + 30.0
+                if deadline is None:
+                    wait_time = 5.0
+                else:
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        logger.warning(
+                            "[Code-RL] timed out waiting for %d in-flight generation request(s)",
+                            self._inflight_generation_requests,
+                        )
+                        return False
+                    wait_time = min(5.0, remaining)
+                self._inflight_generation_condition.wait(timeout=wait_time)
+            return True
 
     # -----------------------------------------------------------------------
     # Housekeeping
@@ -939,11 +1449,20 @@ class CodeRLAPIServer:
             "details": feedback.get("details", {}),
         }
         self._turn_feedback.setdefault(session_id, {}).setdefault(turn_num, []).append(payload)
+        self._incr_stat("feedback_events_total")
+        self._incr_stat(f"feedback_events_{payload['event_type']}")
         self._append_jsonl(self._feedback_record_file, payload)
         self._append_trace_event("feedback", payload)
 
     def _consume_turn_feedback(self, session_id: str, turn_num: int) -> list[dict[str, Any]]:
         return self._turn_feedback.get(session_id, {}).pop(turn_num, [])
+
+    def _has_verifier_feedback(self, session_id: str, turn_num: int) -> bool:
+        feedback_events = self._turn_feedback.get(session_id, {}).get(turn_num, [])
+        return any(
+            str(event.get("event_type", "unknown")) in {"verifier_reward", "task_verifier_reward"}
+            for event in feedback_events
+        )
 
     def _aggregate_feedback(self, feedback_events: list[dict[str, Any]]) -> dict[str, Any]:
         sanitized = False
@@ -993,6 +1512,7 @@ class CodeRLAPIServer:
                         "max_tokens": self._prm_max_tokens,
                         "stream": False,
                     }
+                    payload.update(self._prm_openai_extra_body)
                     response = await client.post(self._prm_openai_url, json=payload, headers=headers)
                     response.raise_for_status()
                     data = response.json()
@@ -1112,8 +1632,11 @@ class CodeRLAPIServer:
         turn_type: str,
         session_done: bool,
         request_meta: dict[str, Any],
+        submission_epoch: int,
     ) -> dict[str, Any]:
         self._touch_session(session_id)
+        self._incr_stat("chat_requests_total")
+        self._incr_stat(f"chat_requests_{turn_type}")
         messages = body["messages"]
         if session_id in self._pending_records and messages:
             self._flush_pending_record(session_id, messages[-1])
@@ -1128,22 +1651,6 @@ class CodeRLAPIServer:
         forward_body["top_logprobs"] = 1
         if "model" not in forward_body:
             forward_body["model"] = self.served_model_name
-
-        # Convert multimodal message format to string-only for SGLang compatibility
-        if "messages" in forward_body:
-            converted_messages = []
-            for msg in forward_body["messages"]:
-                if isinstance(msg.get("content"), list):
-                    text_parts = []
-                    for part in msg["content"]:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
-                    converted_msg = msg.copy()
-                    converted_msg["content"] = "\n".join(text_parts)
-                    converted_messages.append(converted_msg)
-                else:
-                    converted_messages.append(msg)
-            forward_body["messages"] = converted_messages
 
         normalized_messages = _normalize_messages_for_template(messages)
         prompt_text = self.tokenizer.apply_chat_template(
@@ -1179,6 +1686,7 @@ class CodeRLAPIServer:
                 prompt_token_count=prompt_token_count,
             )
             synthesized_overflow_terminal = True
+            self._incr_stat("overflow_terminal_total")
             if turn_type == "main":
                 turn_type = "overflow_terminal"
 
@@ -1210,6 +1718,7 @@ class CodeRLAPIServer:
                         prompt_token_count=prompt_token_count,
                     )
                     synthesized_overflow_terminal = True
+                    self._incr_stat("overflow_terminal_total")
                     if turn_type == "main":
                         turn_type = "overflow_terminal"
                 else:
@@ -1240,9 +1749,43 @@ class CodeRLAPIServer:
                     forward_body["max_completion_tokens"] = capped_max_tokens
 
         if output is None:
-            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                response = await client.post(self.sglang_chat_url, json=forward_body)
-                if response.status_code != 200:
+            request_timeout = (
+                None if self.generation_timeout_sec <= 0 else self.generation_timeout_sec
+            )
+            async with httpx.AsyncClient(timeout=request_timeout, trust_env=False) as client:
+                try:
+                    response = await client.post(self.sglang_chat_url, json=forward_body)
+                except httpx.TimeoutException as exc:
+                    logger.warning(
+                        "[Code-RL] SGLang generation timed out session=%s turn_type=%s "
+                        "timeout=%.1fs",
+                        session_id,
+                        turn_type,
+                        self.generation_timeout_sec,
+                    )
+                    raise HTTPException(
+                        status_code=504,
+                        detail={
+                            "message": "SGLang generation timed out",
+                            "timeout_sec": self.generation_timeout_sec,
+                        },
+                    ) from exc
+                if response.status_code == 200:
+                    output = response.json()
+                elif _is_sglang_chat_batch_error(response.status_code, response.text):
+                    logger.warning(
+                        "[Code-RL] SGLang chat request hit known batch-input error; "
+                        "falling back to /generate"
+                    )
+                    output = await self._generate_chat_fallback(
+                        client,
+                        forward_body=forward_body,
+                        prompt_ids=prompt_ids,
+                        prompt_token_count=prompt_token_count,
+                        requested_max_tokens=requested_max_tokens,
+                        tools=tools,
+                    )
+                else:
                     logger.error(
                         "[Code-RL] SGLang returned %d: %s",
                         response.status_code,
@@ -1254,7 +1797,6 @@ class CodeRLAPIServer:
                     except Exception:
                         detail = response.text[:2000]
                     raise HTTPException(status_code=response.status_code, detail=detail)
-                output = response.json()
 
         choice = output.get("choices", [{}])[0]
         assistant_msg = choice.get("message", {}) or {}
@@ -1281,26 +1823,31 @@ class CodeRLAPIServer:
         response_text = _flatten_message_content(content)
         should_track_turn = (turn_type == "main" and not synthesized_overflow_terminal) or self._submit_side
         if should_track_turn:
+            self._incr_stat("tracked_turns_total")
             response_msg = dict(assistant_msg)
             if response_msg.get("content") is None:
                 response_msg["content"] = ""
 
-            normalized_response = _normalize_messages_for_template([response_msg])[0]
-            full_conversation = normalized_messages + [normalized_response]
-            full_text = self.tokenizer.apply_chat_template(
-                full_conversation,
-                tools=tools,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            if full_text.startswith(prompt_text):
-                response_text = full_text[len(prompt_text):]
+            fallback_raw_response_text = output.get("_code_rl_raw_response_text")
+            if isinstance(fallback_raw_response_text, str):
+                response_text = fallback_raw_response_text
             else:
-                logger.warning(
-                    "[Code-RL] prompt_text is not a prefix of full_text for session=%s",
-                    session_id,
+                normalized_response = _normalize_messages_for_template([response_msg])[0]
+                full_conversation = normalized_messages + [normalized_response]
+                full_text = self.tokenizer.apply_chat_template(
+                    full_conversation,
+                    tools=tools,
+                    tokenize=False,
+                    add_generation_prompt=False,
                 )
-                response_text = full_text
+                if full_text.startswith(prompt_text):
+                    response_text = full_text[len(prompt_text):]
+                else:
+                    logger.warning(
+                        "[Code-RL] prompt_text is not a prefix of full_text for session=%s",
+                        session_id,
+                    )
+                    response_text = full_text
 
             response_ids = self.tokenizer(response_text, add_special_tokens=False)["input_ids"]
             response_logprobs = _extract_logprobs_from_chat_response(choice)
@@ -1351,6 +1898,7 @@ class CodeRLAPIServer:
                 "prompt_token_count": len(prompt_ids),
                 "response_token_count": len(response_ids),
                 "synthesized_overflow_terminal": synthesized_overflow_terminal,
+                "submission_epoch": submission_epoch,
             }
 
             self._pending_turn_data.setdefault(session_id, {})[turn_num] = turn_data
@@ -1425,7 +1973,26 @@ class CodeRLAPIServer:
         self,
         turn_data: dict[str, Any],
         prm_result: dict[str, Any] | None,
+        feedback_events: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        for event in reversed(feedback_events):
+            event_type = str(event.get("event_type", "unknown"))
+            if event_type not in {"verifier_reward", "task_verifier_reward"}:
+                continue
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            raw_score = details.get("score", details.get("reward"))
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(score):
+                continue
+            return {
+                "score": score,
+                "source": "verifier",
+                "details": details,
+            }
+
         if prm_result is not None:
             return {
                 "score": float(prm_result.get("score", 0.0)),
@@ -1512,6 +2079,12 @@ class CodeRLAPIServer:
             metadata["train_metadata"]["promoted_from_neutral"] = True
         return metadata
 
+    def _resolve_sample_group_index(self, session_id: str) -> int:
+        match = _SESSION_GROUP_RE.search(session_id)
+        if match:
+            return int(match.group(1))
+        return next(self._group_counter)
+
     def _append_sample_trace(
         self,
         *,
@@ -1565,6 +2138,8 @@ class CodeRLAPIServer:
 
         for turn_num in sorted(list(pending.keys())):
             task = prm_tasks.get(turn_num)
+            if self._require_verifier_feedback and not self._has_verifier_feedback(session_id, turn_num):
+                continue
             if self._prm_enabled:
                 if task is not None and not task.done():
                     continue
@@ -1600,22 +2175,44 @@ class CodeRLAPIServer:
         session_id: str,
         prm_result: dict[str, Any] | None,
     ):
-        turn_data["response_has_repetition"] = bool(
-            turn_data.get("response_has_repetition", False) or has_repetition(turn_data["response_text"])
+        response_text = turn_data["response_text"]
+        assistant_message = turn_data.get("assistant_message")
+        assistant_content = ""
+        if isinstance(assistant_message, dict):
+            assistant_content = _flatten_message_content(assistant_message.get("content")).strip()
+        tool_call_only = (
+            bool(turn_data.get("tool_calls"))
+            and not assistant_content
+            and not str(turn_data.get("reasoning_content") or "").strip()
         )
-        reward_info = self._resolve_reward(turn_data, prm_result)
-        score = float(reward_info["score"])
-        reward_source = reward_info["source"]
+        text_repetition = bool(response_text.strip()) and not tool_call_only and (
+            has_repetition(response_text) or _has_short_repetition(response_text)
+        )
+        turn_data["response_has_repetition"] = bool(
+            (turn_data.get("response_has_repetition", False) or text_repetition)
+            and not tool_call_only
+        )
         feedback_events = self._consume_turn_feedback(session_id, turn_data["turn_num"])
         feedback_summary = self._aggregate_feedback(feedback_events)
+        reward_info = self._resolve_reward(turn_data, prm_result, feedback_events)
+        score = float(reward_info["score"])
+        reward_source = reward_info["source"]
+        self._incr_stat("resolved_samples_total")
+        self._incr_stat(f"reward_source_{reward_source}")
 
         signal_missing = reward_source == "none"
         neutral_signal = (reward_source != "none") and score == 0.0
         policy_excluded = turn_data["turn_type"] != "main" and not self._train_side
+        stale_submission_epoch = (
+            int(turn_data.get("submission_epoch", self._current_submission_epoch()))
+            != self._current_submission_epoch()
+        )
 
         promoted_from_neutral = False
         exclude_reason: str | None = None
-        if signal_missing:
+        if stale_submission_epoch:
+            exclude_reason = "stale_submission_epoch"
+        elif signal_missing:
             exclude_reason = "no_reward_signal"
         elif neutral_signal:
             exclude_reason = "neutral_reward"
@@ -1624,6 +2221,7 @@ class CodeRLAPIServer:
 
         if (
             neutral_signal
+            and not stale_submission_epoch
             and not policy_excluded
             and self._session_effective.get(session_id, 0) == 0
         ):
@@ -1646,13 +2244,19 @@ class CodeRLAPIServer:
         response_text = turn_data["response_text"]
         response_logprobs = turn_data["response_logprobs"]
         response_has_repetition = bool(turn_data["response_has_repetition"])
-        if self.drop_repetitive_samples and response_has_repetition:
+        verifier_labeled = reward_source == "verifier"
+        if response_has_repetition and verifier_labeled:
+            metadata["train_metadata"]["repetition_kept_by_verifier"] = True
+
+        if self.drop_repetitive_samples and response_has_repetition and not verifier_labeled:
             logger.warning(
                 "[Code-RL] dropping repetitive sample session=%s turn=%d response_tokens=%d",
                 session_id,
                 turn_data["turn_num"],
                 len(response_ids),
             )
+            self._incr_stat("dropped_samples_total")
+            self._incr_stat("dropped_repetitive")
             self._append_sample_trace(
                 session_id=session_id,
                 turn_data=turn_data,
@@ -1666,6 +2270,30 @@ class CodeRLAPIServer:
             self._maybe_cleanup_session(session_id)
             return
 
+        if stale_submission_epoch:
+            logger.info(
+                "[Code-RL] dropping ready sample from stale submission epoch "
+                "session=%s turn=%d sample_epoch=%s current_epoch=%d",
+                session_id,
+                turn_data["turn_num"],
+                turn_data.get("submission_epoch"),
+                self._current_submission_epoch(),
+            )
+            self._incr_stat("dropped_samples_total")
+            self._incr_stat("dropped_stale_epoch")
+            self._append_sample_trace(
+                session_id=session_id,
+                turn_data=turn_data,
+                reward_info=reward_info,
+                prm_result=prm_result,
+                feedback_summary=feedback_summary,
+                metadata=metadata,
+                decision="dropped_stale_epoch",
+                exclude_reason="stale_submission_epoch",
+            )
+            self._maybe_cleanup_session(session_id)
+            return
+
         if exclude_reason is not None:
             logger.info(
                 "[Code-RL] skipping excluded sample session=%s turn=%d reason=%s source=%s",
@@ -1674,6 +2302,8 @@ class CodeRLAPIServer:
                 exclude_reason,
                 reward_source,
             )
+            self._incr_stat("excluded_samples_total")
+            self._incr_stat(f"excluded_{exclude_reason}")
             self._append_sample_trace(
                 session_id=session_id,
                 turn_data=turn_data,
@@ -1713,6 +2343,8 @@ class CodeRLAPIServer:
                     len(response_ids),
                     self.max_response_tokens,
                 )
+                self._incr_stat("dropped_samples_total")
+                self._incr_stat("dropped_long_response")
                 self._append_sample_trace(
                     session_id=session_id,
                     turn_data=turn_data,
@@ -1735,6 +2367,8 @@ class CodeRLAPIServer:
                 total_tokens,
                 self.max_train_tokens,
             )
+            self._incr_stat("dropped_samples_total")
+            self._incr_stat("dropped_overlong")
             self._append_sample_trace(
                 session_id=session_id,
                 turn_data=turn_data,
@@ -1755,6 +2389,8 @@ class CodeRLAPIServer:
                 session_id,
                 turn_data["turn_num"],
             )
+            self._incr_stat("dropped_samples_total")
+            self._incr_stat("dropped_paused")
             self._append_sample_trace(
                 session_id=session_id,
                 turn_data=turn_data,
@@ -1780,12 +2416,14 @@ class CodeRLAPIServer:
         sample.rollout_log_probs = response_logprobs
         sample.status = Sample.Status.COMPLETED
         sample.index = next(self._index_counter)
-        sample.group_index = next(self._group_counter)
+        sample.group_index = self._resolve_sample_group_index(session_id)
         sample.reward = {"score": score}
         sample.metadata = metadata
 
         if exclude_reason is None:
             self._session_effective[session_id] = self._session_effective.get(session_id, 0) + 1
+            self._incr_stat("submitted_samples_total")
+            self._incr_stat(f"submitted_reward_source_{reward_source}")
 
         logger.info(
             "[Code-RL] submitted sample session=%s turn=%d index=%d score=%.1f exclude=%s source=%s",

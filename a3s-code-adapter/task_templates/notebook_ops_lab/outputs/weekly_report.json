@@ -1,0 +1,17 @@
+{
+  "weeks": [
+    "2026-W10",
+    "2026-W10",
+    "2026-W11",
+    "2026-W11",
+    "2026-W12",
+    "2026-W12"
+  ],
+  "total_tickets": 680,
+  "total_customer_escalations": 18,
+  "top_channel": "email",
+  "channels": {
+    "email": 398,
+    "chat": 282
+  }
+}

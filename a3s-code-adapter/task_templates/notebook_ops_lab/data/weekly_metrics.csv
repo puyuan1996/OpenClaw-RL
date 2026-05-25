@@ -1,0 +1,7 @@
+week,channel,tickets,resolved_within_sla,customer_escalations
+2026-W10,email,120,111,2
+2026-W10,chat,86,80,1
+2026-W11,email,132,118,4
+2026-W11,chat,95,87,2
+2026-W12,email,146,126,6
+2026-W12,chat,101,88,3

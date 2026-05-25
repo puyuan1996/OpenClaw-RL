@@ -1,7 +1,11 @@
 __pycache__/
 .pytest_cache/
+.artifacts/
 generated_configs/
 generated_workspaces/
 workspace_template_cache/
 results/
+runs/
+traffic_runs/
+task_mixes/
 simulated_user_backends.json

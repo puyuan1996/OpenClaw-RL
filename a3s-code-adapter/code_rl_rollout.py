@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import os
 import queue
 import threading
 import time
@@ -37,6 +38,7 @@ class AsyncRolloutWorker:
         self.data_buffer = data_buffer
         self.running = True
         self.output_queue = queue.Queue(maxsize=100000)
+        self.partial_groups: dict[int, list[Sample]] = {}
         self.worker_thread = None
         self._submission_enabled = threading.Event()
         self._server = CodeRLAPIServer(
@@ -68,8 +70,14 @@ class AsyncRolloutWorker:
     def pause_submission(self):
         if self._submission_enabled.is_set():
             self._submission_enabled.clear()
+            epoch = self._server.advance_submission_epoch()
+            drained = self._server.wait_for_inflight_generation_requests()
             discarded_groups = 0
             discarded_samples = 0
+            if self.partial_groups:
+                discarded_groups += len(self.partial_groups)
+                discarded_samples += sum(len(group) for group in self.partial_groups.values())
+                self.partial_groups.clear()
             while True:
                 try:
                     _, group = self.output_queue.get_nowait()
@@ -81,10 +89,11 @@ class AsyncRolloutWorker:
             if discarded_groups:
                 print(
                     "[CodeRLWorker] submission paused; "
+                    f"epoch={epoch} drained={drained} "
                     f"discarded {discarded_groups} queued groups / {discarded_samples} samples"
                 )
             else:
-                print("[CodeRLWorker] submission paused")
+                print(f"[CodeRLWorker] submission paused; epoch={epoch} drained={drained}")
 
     def resume_submission(self):
         if not self._submission_enabled.is_set():
@@ -106,33 +115,69 @@ class AsyncRolloutWorker:
 
 async def _drain_output_queue(args, worker: AsyncRolloutWorker) -> list[list[Sample]]:
     target_data_size = args.rollout_batch_size
+    target_group_size = max(1, int(getattr(args, "n_samples_per_prompt", 1)))
+    idle_timeout_sec = float(os.getenv("CODE_RL_ROLLOUT_IDLE_TIMEOUT_SEC", "0") or 0)
+    hard_timeout_sec = float(os.getenv("CODE_RL_ROLLOUT_DRAIN_TIMEOUT_SEC", "0") or 0)
     data: list[list[Sample]] = []
-    completed_groups: dict[int, list[Sample]] = {}
+    completed_groups = worker.partial_groups
     start = time.time()
-    last_progress = start
+    last_activity = start
+    last_status_log = start
 
     while len(data) < target_data_size:
         completed = worker.get_completed_groups()
         if completed:
-            last_progress = time.time()
+            last_activity = time.time()
             for group_id, group in completed:
-                completed_groups[group_id] = group
+                completed_groups.setdefault(group_id, []).extend(group)
 
         for group_id in list(completed_groups.keys()):
             if len(data) >= target_data_size:
                 break
+            group = completed_groups[group_id]
+            if len(group) < target_group_size:
+                continue
             group = completed_groups.pop(group_id)
+            if len(group) > target_group_size:
+                group, remainder = group[:target_group_size], group[target_group_size:]
+                if remainder:
+                    completed_groups[group_id] = remainder
             if any(sample.status == Sample.Status.ABORTED for sample in group):
                 continue
             data.append(group)
+            last_activity = time.time()
 
-        if time.time() - last_progress > 30:
+        now = time.time()
+        if hard_timeout_sec > 0 and now - start > hard_timeout_sec:
+            raise TimeoutError(
+                "Timed out waiting for API-produced samples: "
+                f"groups={len(data)}/{target_data_size}, group_size={target_group_size}, "
+                f"elapsed={now - start:.1f}s, hard_timeout={hard_timeout_sec:.1f}s"
+            )
+        if idle_timeout_sec > 0 and now - last_activity > idle_timeout_sec:
+            raise TimeoutError(
+                "Timed out waiting for API-produced samples after no accepted group progress: "
+                f"groups={len(data)}/{target_data_size}, group_size={target_group_size}, "
+                f"idle={now - last_activity:.1f}s, idle_timeout={idle_timeout_sec:.1f}s, "
+                f"pending_groups={len(completed_groups)}, queue={worker.get_queue_size()}"
+            )
+
+        if now - last_status_log > 30:
+            stats = None
+            snapshot = getattr(getattr(worker, "_server", None), "snapshot_stats", None)
+            if callable(snapshot):
+                try:
+                    stats = snapshot()
+                except Exception:
+                    stats = None
             print(
                 f"[CodeRLWorker] waiting for API-produced samples: {len(data)}/{target_data_size}, "
-                f"queue={worker.get_queue_size()}",
+                f"group_size={target_group_size} pending_groups={len(completed_groups)} "
+                f"queue={worker.get_queue_size()} idle={now - last_activity:.1f}s "
+                f"stats={stats}",
                 flush=True,
             )
-            last_progress = time.time()
+            last_status_log = now
 
         if len(data) < target_data_size:
             await asyncio.sleep(0.05)

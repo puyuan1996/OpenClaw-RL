@@ -8,7 +8,7 @@
       "plain text list output should keep working",
       "tests cover the new output mode"
     ],
-    "tags": ["cli", "serialization", "tests"]
+    "tags": ["cli", "serialization", "automation", "tests"]
   },
   {
     "id": "taskboard-empty-title",
@@ -108,5 +108,254 @@
       "change is small and focused"
     ],
     "tags": ["docs", "automation"]
+  },
+  {
+    "id": "taskboard-delete-command",
+    "template": "mini_taskboard",
+    "seed": "Add a delete command so users can remove a task instead of hand-editing the JSON file.",
+    "acceptance": [
+      "delete removes a task by id",
+      "missing ids fail with a clear message",
+      "tests cover deleting from the middle of the list"
+    ],
+    "tags": ["feature", "cli", "edit", "tests"]
+  },
+  {
+    "id": "taskboard-search-substring",
+    "template": "mini_taskboard",
+    "seed": "People want to find tasks by title keyword without scrolling the whole board; add a substring filter.",
+    "acceptance": [
+      "list supports filtering by title substring",
+      "matching is case-insensitive or clearly documented",
+      "tests cover matching and no-match cases"
+    ],
+    "tags": ["feature", "cli", "search", "automation"]
+  },
+  {
+    "id": "taskboard-clear-done",
+    "template": "mini_taskboard",
+    "seed": "Completed tasks pile up over time; add a command to remove all done items while keeping open tasks intact.",
+    "acceptance": [
+      "new cleanup command removes only done tasks",
+      "running it on an all-open board is safe",
+      "tests cover mixed and empty states"
+    ],
+    "tags": ["feature", "cli", "cleanup"]
+  },
+  {
+    "id": "taskboard-export-markdown",
+    "template": "mini_taskboard",
+    "seed": "We want to paste task status into notes, so support exporting the board as a markdown checklist.",
+    "acceptance": [
+      "markdown output is easy to paste into docs",
+      "open and done tasks are clearly distinguished",
+      "tests or snapshot checks verify the format"
+    ],
+    "tags": ["feature", "reporting", "export", "docs"]
+  },
+  {
+    "id": "taskboard-import-text-file",
+    "template": "mini_taskboard",
+    "seed": "Add a small import command that reads task titles from a plain text file, one line per task.",
+    "acceptance": [
+      "blank lines are ignored cleanly",
+      "imported tasks get stable ids and open status",
+      "tests cover a simple input file"
+    ],
+    "tags": ["feature", "automation", "import", "advanced"]
+  },
+  {
+    "id": "taskboard-corrupt-db-error",
+    "template": "mini_taskboard",
+    "seed": "If the JSON database is malformed, the CLI should fail with a friendly error instead of a raw traceback.",
+    "acceptance": [
+      "invalid JSON exits non-zero with a readable message",
+      "valid databases still load normally",
+      "tests cover the malformed-file case"
+    ],
+    "tags": ["robustness", "storage", "ux", "tests"]
+  },
+  {
+    "id": "taskboard-created-at-ordering",
+    "template": "mini_taskboard",
+    "seed": "Store created timestamps so list output can optionally show newest tasks first without losing backward compatibility.",
+    "acceptance": [
+      "new tasks record a created timestamp",
+      "older files without timestamps still load",
+      "tests cover the new ordering mode"
+    ],
+    "tags": ["storage", "sorting", "advanced"]
+  },
+  {
+    "id": "taskboard-list-summary-footer",
+    "template": "mini_taskboard",
+    "seed": "Add a short summary footer to list output so people can quickly see how many tasks are open vs done.",
+    "acceptance": [
+      "list output includes a concise summary",
+      "empty boards keep the current no-task behavior",
+      "tests cover mixed task states"
+    ],
+    "tags": ["reporting", "ux", "cli"]
+  },
+  {
+    "id": "skill-catalog-benchmark-map",
+    "template": "skill_catalog",
+    "seed": "The exported skill catalog should surface benchmark references so reviewers can map each skill to the scenarios it supports.",
+    "acceptance": [
+      "catalog output includes benchmark references for each skill when present",
+      "README explains how the benchmark mapping is intended to be used",
+      "tests cover the new catalog field"
+    ],
+    "tags": ["skills", "catalog", "benchmark", "docs", "tests"],
+    "complexity": "high",
+    "sampling_weight": 4,
+    "scenario": "An internal agent-enablement team is aligning reusable skills with SkillsBench and ClawMark scenarios before a training refresh.",
+    "target_skills": ["skill-authoring", "documentation", "benchmark-mapping"],
+    "constraints": [
+      "keep the catalog deterministic and file-based",
+      "avoid introducing any network dependency",
+      "keep the README addition concise and reviewer-friendly"
+    ],
+    "benchmark_refs": [
+      "skillsbench/scheduling-email-assistant",
+      "clawmark/content_operation/task1"
+    ],
+    "followup_axes": [
+      "check that missing benchmark metadata stays backward compatible",
+      "verify the README example matches the generated JSON"
+    ]
+  },
+  {
+    "id": "skill-catalog-pairing-report",
+    "template": "skill_catalog",
+    "seed": "Reviewers want to see which skills pair well together, especially the email plus calendar workflow, so add pairing information to the generated catalog.",
+    "acceptance": [
+      "catalog output captures skill pairing recommendations",
+      "existing fields remain stable for current consumers",
+      "tests cover at least one pair recommendation"
+    ],
+    "tags": ["skills", "catalog", "workflow", "benchmark", "tests"],
+    "complexity": "high",
+    "sampling_weight": 4,
+    "scenario": "The team is preparing a benchmark-facing skills showcase and needs the machine-readable catalog to explain likely skill compositions.",
+    "target_skills": ["skill-composition", "email", "calendar"],
+    "constraints": [
+      "do not hardcode pairings outside the skill metadata",
+      "preserve stable ordering in the exported JSON"
+    ],
+    "benchmark_refs": [
+      "skillsbench/scheduling-email-assistant",
+      "clawmark/executive_assistant/task1"
+    ],
+    "followup_axes": [
+      "ask for one regression check around ordering stability",
+      "confirm how a missing pairing section should behave"
+    ]
+  },
+  {
+    "id": "skill-catalog-script-validation",
+    "template": "skill_catalog",
+    "seed": "If a skill lists executable helper scripts, the catalog build should fail clearly when one of those script paths is missing.",
+    "acceptance": [
+      "missing script references fail with a readable error",
+      "valid skills still export successfully",
+      "tests cover both the success and failure paths"
+    ],
+    "tags": ["skills", "validation", "catalog", "tests", "robustness"],
+    "complexity": "high",
+    "sampling_weight": 3,
+    "scenario": "A broken script path slipped into a benchmark-prep branch and reviewers want the catalog generator to catch that before release.",
+    "target_skills": ["skill-validation", "tooling", "quality-gates"],
+    "constraints": [
+      "keep the failure deterministic",
+      "make the error actionable for whoever edits the skill file next"
+    ],
+    "benchmark_refs": [
+      "skillsbench/scheduling-email-assistant"
+    ],
+    "followup_axes": [
+      "ask for a sharper error message",
+      "check that the README still reflects the happy path"
+    ]
+  },
+  {
+    "id": "notebook-ops-anomaly-summary",
+    "template": "notebook_ops_lab",
+    "seed": "The weekly report should call out the worst SLA regression so reviewers can spot the anomaly without reading the whole notebook.",
+    "acceptance": [
+      "exported report includes a structured anomaly summary",
+      "the anomaly is derived from the CSV data rather than hardcoded",
+      "tests cover the new summary block"
+    ],
+    "tags": ["notebook", "analytics", "reporting", "tests", "anomaly"],
+    "complexity": "high",
+    "sampling_weight": 4,
+    "scenario": "Ops leads are using this repo as a lightweight benchmark-style analysis task and want the first-pass export to resemble a concise incident briefing.",
+    "target_skills": ["jupyter-notebook", "data-analysis", "reporting"],
+    "constraints": [
+      "keep the notebook and export script aligned",
+      "avoid adding heavyweight dependencies"
+    ],
+    "benchmark_refs": [
+      "skillsbench/trend-anomaly-causal-inference",
+      "clawmark/content_operation/task1"
+    ],
+    "followup_axes": [
+      "ask whether the notebook narrative reflects the new anomaly field",
+      "verify that the anomaly logic still works on a calm week"
+    ]
+  },
+  {
+    "id": "notebook-ops-markdown-brief",
+    "template": "notebook_ops_lab",
+    "seed": "Add a markdown handoff brief so someone can paste the weekly summary into docs or chat without opening the notebook.",
+    "acceptance": [
+      "a markdown brief is generated alongside the JSON report",
+      "the brief highlights the top channel and total escalations",
+      "tests cover the generated artifact"
+    ],
+    "tags": ["notebook", "docs", "reporting", "export", "tests"],
+    "complexity": "high",
+    "sampling_weight": 3,
+    "scenario": "A program manager wants a portable weekly brief that mirrors the notebook findings and can be dropped into a review thread.",
+    "target_skills": ["jupyter-notebook", "documentation", "brief-writing"],
+    "constraints": [
+      "keep the brief short and deterministic",
+      "do not break the existing JSON export"
+    ],
+    "benchmark_refs": [
+      "skillsbench/sales-pivot-analysis",
+      "clawmark/research_assistant/task1"
+    ],
+    "followup_axes": [
+      "ask for one formatting or wording polish on the markdown brief",
+      "check that the notebook notes still match the exported summary"
+    ]
+  },
+  {
+    "id": "notebook-ops-channel-filter",
+    "template": "notebook_ops_lab",
+    "seed": "Analysts want to export the report for a single channel without hand-editing the CSV, but the default full report should keep working.",
+    "acceptance": [
+      "export script supports a channel filter",
+      "default behavior still produces the full report",
+      "tests cover filtered and unfiltered modes"
+    ],
+    "tags": ["notebook", "analytics", "cli", "filtering", "tests"],
+    "complexity": "high",
+    "sampling_weight": 3,
+    "scenario": "The repo is being reused for benchmark-like analytics drills where reviewers sometimes want the email-only or chat-only slice on demand.",
+    "target_skills": ["jupyter-notebook", "data-analysis", "automation"],
+    "constraints": [
+      "keep backwards compatibility for existing callers",
+      "reflect any new filter behavior in the notebook or README if needed"
+    ],
+    "benchmark_refs": [
+      "skillsbench/sales-pivot-analysis"
+    ],
+    "followup_axes": [
+      "ask for one edge case around an unknown channel filter",
+      "verify that the unfiltered numbers did not drift"
+    ]
   }
 ]

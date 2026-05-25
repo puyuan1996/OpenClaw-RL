@@ -1,154 +1,163 @@
-# a3s-code-adapter for OpenClaw-RL
+# a3s-code-adapter
 
-从 `a3s-code-rl` 迁移的 a3s-code Agent 数据采集适配层，用于自动生成 RL 训练样本。
+`a3s-code-adapter` 将真实 `a3s-code` Agent 会话接入 OpenClaw-RL / slime 在线强化学习流程。它不依赖离线 SFT 指令数据，而是让 `a3s-code` 在隔离 workspace 中完成真实代码任务，并把可训练 turn、工具反馈、verifier 结果和可选 PRM 分数组织成 slime `Sample`。
 
-## 功能
+核心目标是支持完整 agent-RL，而不是 smoke test：
 
-通过真实的 a3s-code Agent 会话自动生成训练样本，替代手动交互。
+- 用 OpenAI-compatible RL proxy 拦截 `a3s-code` 对策略模型的请求。
+- 用 traffic driver 按任务 seed 持续生成 agent session。
+- 用 verifier/PRM/debug reward 生成奖励信号。
+- 用 GRPO 分组样本训练策略模型，支持多回答组内归一化。
+- 支持长上下文、Docker workspace、LoRA/FSDP 和可选 benchmark eval。
 
-## 目录结构
+## 目录
 
-```
-a3s-code-adapter/
-├── code_rl_api_server.py           # RL Proxy，拦截请求并记录样本
-├── code_rl_rollout.py              # Rollout 接口，管理样本队列
-├── a3s_code_agent_traffic_driver.py # 流量驱动器，持续生成会话
-├── check_simulated_user_backends.py # 模拟用户后端健康检查
-├── run_a3s_code_rl_4gpu.sh         # 主启动脚本（RL 训练）
-├── run_a3s_code_agent_traffic.sh   # 流量驱动启动脚本
-├── refresh_simulated_user_backends.sh # 刷新模拟用户后端（自动调用）
-├── seed_data/                      # 种子任务数据
-│   └── code_task_seeds.json
-├── task_templates/                 # 任务模板
-│   └── mini_taskboard/
-├── simulated_user_backends.json    # 模拟用户后端配置（自动生成）
-├── generated_workspaces/           # 运行时生成的会话工作区
-├── generated_configs/              # 运行时生成的配置文件
-├── results/                        # 运行日志（按时间戳命名）
-└── docs/                           # 文档目录
-```
+| 路径 | 作用 |
+| --- | --- |
+| `code_rl_api_server.py` | OpenAI-compatible RL proxy；负责会话跟踪、转发策略模型、记录 turn、接收 verifier/PRM 反馈并提交样本。 |
+| `code_rl_rollout.py` | slime rollout 入口；从 proxy 等待已标注样本并返回训练 batch。 |
+| `a3s_code_agent_traffic_driver.py` | 启动真实 `a3s-code` session，复制任务模板，运行工具/Verifier，并向 proxy 回传反馈。 |
+| `run_a3s_code_rl.sh` | 通用训练入口；启动 Ray、slime、SGLang rollout engine 和 RL proxy。 |
+| `run_a3s_code_agent_traffic.sh` | traffic driver 入口；可与训练脚本分进程或分机器运行。 |
+| `seed_data/` | 内置任务 seed。 |
+| `task_templates/` | 供 agent 操作的任务 workspace 模板。 |
+| `a3s_code_benchmarks/` | 可选 SkillsBench / ClawMark 评测 runtime。默认训练不会自动启用。 |
+| `tests/` | adapter 单元测试。 |
 
-## 快速启动
+运行产物默认写入 `RUN_ROOT` 或 `ARTIFACT_ROOT` 下，包括 `a3s_workspaces/`、`a3s_configs/`、`a3s_results/`、`logs/` 和 `launch_info.json`。
 
-### 前置条件
+## 环境准备
 
-1. **安装 a3s-code SDK**:
-   ```bash
-   pip install a3s-code --trusted-host mirrors.i.h.pjlab.org.cn \
-     -i http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/
-
-   # 验证
-   python3 -c "import a3s_code; print('OK')"
-   ```
-
-2. **确保 RL 服务运行** (端口 30000)
-
-### 启动方式
-
-**方式 1：一键启动（推荐）**
-```bash
-cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL
-bash start_training.sh a3s-code
-```
-
-**方式 2：分离启动（调试用）**
-```bash
-# 终端 1：启动 RL 训练服务
-cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/slime
-bash ../a3s-code-adapter/run_a3s_code_rl_4gpu.sh
-
-# 终端 2：启动流量驱动（等 RL 服务启动后）
-cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/a3s-code-adapter
-bash run_a3s_code_agent_traffic.sh
-```
-
-## 关键配置
-
-### RL 训练配置
-```bash
-NUM_GPUS=4              # GPU 总数
-ACTOR_GPUS=2            # Actor 使用的 GPU 数
-ROLLOUT_GPUS=2          # Rollout 使用的 GPU 数
-ENABLE_PRM=1            # 启用 PRM 打分
-PRM_BACKEND=external_openai  # PRM 后端类型
-```
-
-### 流量驱动配置
-```bash
-A3S_CODE_TRAFFIC_CONCURRENCY=1      # 并发会话数
-A3S_CODE_MAX_MAIN_TURNS=4           # 最大主轮次
-A3S_CODE_MAX_TOOL_ROUNDS=16         # 最大工具调用轮次
-CODE_RL_MATCHED_CONTEXT_TOKENS=8192 # 上下文长度
-```
-
-### 模拟用户配置
-模拟用户后端会在启动时自动检查和更新，无需手动配置。
-
-## 监控训练进度
+在训练环境中安装依赖，并确保 `a3s-code` SDK 可直接从 Python 导入：
 
 ```bash
-# 查看运行信息
-cat runs/<run_id>/launch_info.json
-
-# 查看训练样本记录（按时间戳命名）
-ls -lt results/
-tail -f results/a3s_code_agent_traffic_<timestamp>.jsonl
-
-# 查看 PRM 打分记录
-tail -f runs/<run_id>/code_rl_prm_record.jsonl
-
-# Ray Dashboard
-# 浏览器访问 http://localhost:8265
+python -m pip install -r requirements.txt
+python -m pip install 'a3s-code>=3.0.0'
+python -c "import a3s_code; print(a3s_code.__file__)"
 ```
 
-## 与 openclaw-combine 的区别
+本 adapter 的长期使用方式是安装发布包，例如 `pip install a3s-code`。只有在对应 SDK 能力尚未发布时，才临时通过 wheel 覆盖当前环境；不要依赖本地源码目录作为常态运行方式。
 
-| 特性 | openclaw-combine | a3s-code-adapter |
-|------|------------------|------------------|
-| 数据来源 | 手动交互式对话 | 自动化 Agent 任务执行 |
-| 种子数据 | 无 | `seed_data/code_task_seeds.json` |
-| 工作区隔离 | 无 | 每个会话独立工作区 |
-| 模拟用户 | 无 | 支持任务改写增加多样性 |
+当前训练链路要求 `a3s-code` 至少支持：
 
-## 故障排查
+- OpenAI provider 的 `sessionIdHeader`，用于共享配置下按 session 路由请求。
+- Skill `allowed-tools` 的 YAML list、legacy 空格分隔和空值语义。
+- ACL 中 canonical token limit 写法：`limit = { context = ..., output = ... }`。
 
-### a3s_code 模块导入失败
+## 启动训练
+
+先启动训练服务。下面示例使用 4 卡 Qwen3.5-4B，路径和资源都可以通过环境变量覆盖：
+
 ```bash
-# 检查安装
-python3 -c "import a3s_code; print(a3s_code.__file__)"
+export HF_CKPT=/path/to/Qwen3.5-4B
+export ARTIFACT_ROOT=/path/to/openclaw-rl-artifacts
+export NUM_GPUS=4
+export ACTOR_GPUS=2
+export ROLLOUT_GPUS=2
+export ROLLOUT_BATCH_SIZE=8
+export N_SAMPLES_PER_PROMPT=4
+export CODE_RL_REWARD_MODE=verifier
+export CODE_RL_REQUIRE_VERIFIER_FEEDBACK=1
 
-# 重新安装
-pip install a3s-code --trusted-host mirrors.i.h.pjlab.org.cn \
-  -i http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/
+bash a3s-code-adapter/run_a3s_code_rl.sh
 ```
 
-### RL Proxy 端口 30000 被占用
+模型选择通过 `A3S_CODE_MODEL_VARIANT` 控制。当前脚本内置这些 variant，默认权重路径面向本地集群镜像，可用 `HF_CKPT` 覆盖：
+
+- `qwen3.5-4b`
+- `qwen3-4b`
+- `qwen3.6-35b-a3b`
+- `qwen3.5-122b-a10b`
+- `qwen3.5-122b-a10b-fp8`
+- `qwen3-next-80b-a3b-instruct`
+- `glm4.7-flash`
+
+启动后确认 proxy 健康：
+
 ```bash
-# 检查端口
-ss -ltnp | grep 30000
-
-# 清理旧进程
-pkill -f "code_rl_api_server"
-ray stop --force
+curl http://127.0.0.1:30000/healthz
+curl http://127.0.0.1:30000/stats
 ```
 
-### 训练报错 UnboundLocalError
-已修复。如遇到，请重启训练服务。
+## 注入 agent traffic
 
-## 文档
+训练服务就绪后，在另一个进程启动真实 `a3s-code` 会话：
 
-详细文档位于 `docs/` 目录：
-- `README.md` - 文档索引
-- `architecture_analysis_*.md` - 系统架构
-- `dataflow_training_*.md` - 训练逻辑
-- `optimization_guide_*.md` - 优化建议
-- `fixes_summary_*.md` - 问题修复总结
+```bash
+export RL_BASE_URL=http://127.0.0.1:30000
+export A3S_MODEL_NAME=qwen3.5-4b
+export A3S_API_KEY="${SGLANG_API_KEY:-apiKey}"
+export A3S_CODE_TRAFFIC_SESSION_LIMIT=32
+export A3S_CODE_TRAFFIC_CONCURRENCY=4
+export A3S_CODE_SESSION_GROUP_SIZE="${N_SAMPLES_PER_PROMPT:-4}"
 
-## 迁移说明
+bash a3s-code-adapter/run_a3s_code_agent_traffic.sh
+```
 
-本适配层从 `/mnt/shared-storage-user/puyuan/SafeCode/a3s-code-rl` 迁移，主要调整：
-- 路径适配 OpenClaw-RL 目录结构
-- 模型配置使用 `qwen3-4B.sh` (rotary_base=1M)
-- 启动方式使用 `ray job submit` + `train_async.py`
-- 日志文件按时间戳命名
-- 修复消息格式兼容性问题
+如果 workspace/verifier 需要 Docker 隔离，启用 Docker backend：
+
+```bash
+export A3S_CODE_AGENT_ENV_BACKEND=docker
+export A3S_CODE_WORKER_LOCAL_DOCKER=1
+export A3S_CODE_AGENT_DOCKER_IMAGE=<image-with-python-and-a3s-code>
+export A3S_CODE_AGENT_DOCKER_NETWORK=host
+```
+
+在多机部署时，GPU 节点只需运行 `run_a3s_code_rl.sh`，CPU/Docker 节点只需拿到 `RL_BASE_URL`、任务数据路径和相同的 `a3s-code` Python 环境后运行 `run_a3s_code_agent_traffic.sh`。
+
+## 奖励信号
+
+推荐正式 agent 任务优先使用 verifier reward：
+
+```bash
+export CODE_RL_REWARD_MODE=verifier
+export CODE_RL_REQUIRE_VERIFIER_FEEDBACK=1
+export A3S_CODE_ENABLE_TASK_VERIFIER_REWARD=1
+```
+
+traffic driver 会按模板的 verifier command 运行检查，并向 proxy 回传 `task_verifier_reward`。Proxy 只提交带有效 verifier feedback 的训练样本，避免无奖励 turn 污染 GRPO。
+
+可选模式：
+
+- `verifier`：只使用任务 verifier，适合 ClawGym / 单测类任务。
+- `prm`：使用外部或本地 PRM，对没有 hidden verifier 的多轮 next-state 打分。
+- `hybrid`：优先 verifier，缺失时使用 PRM 或规则信号。
+- `debug`：用于链路调试，不适合作为正式训练奖励。
+
+## GRPO 分组
+
+GRPO 需要同一 prompt 的多个回答进行组内归一化。traffic driver 通过 session id 中的 `grpXXXXXX-repYY` 组织回答组。关键变量：
+
+```bash
+export ROLLOUT_BATCH_SIZE=8
+export N_SAMPLES_PER_PROMPT=4
+export A3S_CODE_SESSION_GROUP_SIZE=4
+export NUM_ROLLOUT=200
+```
+
+总 session 预算约为：
+
+```text
+(NUM_ROLLOUT - START_ROLLOUT_ID) * ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT
+```
+
+如果只生成 1 个回答，GRPO 的组内优势会退化。资源允许时应保持 `N_SAMPLES_PER_PROMPT >= 4`。
+
+## 验证
+
+运行核心单测：
+
+```bash
+PYTHONPATH=a3s-code-adapter python -m pytest \
+  a3s-code-adapter/tests/test_runtime_guards.py \
+  a3s-code-adapter/tests/test_driver_config_modes.py \
+  a3s-code-adapter/tests/test_benchmark_eval_builder.py \
+  a3s-code-adapter/tests/test_skillsbench_toml_patch.py -q
+```
+
+检查脚本语法：
+
+```bash
+bash -n a3s-code-adapter/run_a3s_code_rl.sh
+bash -n a3s-code-adapter/run_a3s_code_agent_traffic.sh
+```

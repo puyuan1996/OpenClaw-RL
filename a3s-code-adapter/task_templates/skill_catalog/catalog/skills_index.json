@@ -1,0 +1,28 @@
+[
+  {
+    "slug": "calendar_planning",
+    "title": "Calendar Planning",
+    "summary": "Compare meeting constraints and existing commitments, then propose the earliest workable slot with a short explanation.",
+    "tags": [
+      "scheduling",
+      "calendar",
+      "coordination"
+    ],
+    "scripts": [
+      "scripts/find_slots.py"
+    ]
+  },
+  {
+    "slug": "email_triage",
+    "title": "Email Triage",
+    "summary": "Triage a noisy inbox into a short action list, separating blocking items from routine follow-ups.",
+    "tags": [
+      "email",
+      "prioritization",
+      "escalation"
+    ],
+    "scripts": [
+      "scripts/filter_priority.py"
+    ]
+  }
+]

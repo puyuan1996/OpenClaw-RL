@@ -1,0 +1,16 @@
+{
+  "template": "notebook_ops_lab",
+  "repo_summary": "a lightweight analytics repo with a Jupyter notebook, CSV metrics, and a Python export script for weekly support operations reporting",
+  "key_files": [
+    "analysis/weekly_ops_report.ipynb captures the analyst workflow and narrative checkpoints",
+    "scripts/export_report.py converts CSV data into outputs/weekly_report.json",
+    "data/weekly_metrics.csv is the source dataset used by both the notebook and the export script",
+    "tests/test_report.py verifies the exported report stays consistent"
+  ],
+  "test_command": "pytest -q",
+  "realism_notes": [
+    "Natural asks often mention keeping the notebook and export script in sync",
+    "Teams usually want one extra briefing artifact such as markdown or anomaly notes",
+    "The task should stay small enough for a single agent pass, not a full analytics platform rewrite"
+  ]
+}
