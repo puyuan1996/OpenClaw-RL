@@ -36,7 +36,7 @@ python -m pip install --upgrade a3s-code
 python -c "import importlib.metadata as md, a3s_code; print(md.version('a3s-code')); print(a3s_code.__file__)"
 ```
 
-本 adapter 的长期使用方式是安装最新发布包，例如 `pip install --upgrade a3s-code`。traffic 脚本默认设置 `A3S_CODE_REQUIRED_VERSION=latest`；如果显式设置 `A3S_CODE_REPO_ROOT` 指向 AI45Lab/Code checkout，会读取 `sdk/python/pyproject.toml` 中的当前版本并校验已安装包。只有在对应 SDK 能力尚未发布时，才临时通过 wheel 覆盖当前环境；不要依赖本地源码目录作为常态运行方式。评测工具需要向任务容器注入 wheel 时，会优先使用 `A3S_CODE_WHEEL_PATH` / 现有 wheel；未显式设置源码目录时，会从已安装版本或包索引获取 wheel，而不是默认从本地源码编译。
+本 adapter 的长期使用方式是安装最新发布包，例如 `pip install --upgrade a3s-code`。traffic 脚本默认设置 `A3S_CODE_REQUIRED_VERSION=latest`，且不会自动探测相邻的 AI45Lab/Code checkout；如果显式设置 `A3S_CODE_REPO_ROOT` 指向 AI45Lab/Code checkout，才会读取 `sdk/python/pyproject.toml` 中的当前版本并校验已安装包。只有在对应 SDK 能力尚未发布时，才临时通过 wheel 覆盖当前环境；不要依赖本地源码目录作为常态运行方式。评测工具需要向任务容器注入 wheel 时，会优先使用 `A3S_CODE_WHEEL_PATH` / 现有 wheel；未显式设置源码目录时，会从已安装版本或包索引获取 wheel，而不是默认从本地源码编译。
 
 当前训练链路要求 `a3s-code` 至少支持：
 
