@@ -239,14 +239,11 @@ class A3SCodeHarbor(BaseInstalledAgent):
         super().__init__(*args, version=version, **kwargs)
         self._wheel_path = Path(wheel_path).expanduser().resolve() if wheel_path else ensure_a3s_code_wheel()
         wheel_version = _wheel_version(self._wheel_path)
-        if _env_flag("A3S_CODE_UPLOAD_ALL_COMPATIBLE_WHEELS", False):
-            self._wheel_paths = [
-                path
-                for path in sorted(self._wheel_path.parent.glob("a3s_code-*.whl"))
-                if _wheel_version(path) == wheel_version
-            ] or [self._wheel_path]
-        else:
-            self._wheel_paths = [self._wheel_path]
+        self._wheel_paths = [
+            path
+            for path in sorted(self._wheel_path.parent.glob("a3s_code-*.whl"))
+            if _wheel_version(path) == wheel_version
+        ] or [self._wheel_path]
 
     @staticmethod
     def name() -> str:
@@ -1012,6 +1009,8 @@ fi
 fi
 rm -rf /tmp/a3s-code-venv-check {REMOTE_VENV_DIR}
 "$agent_python_bin" -m venv {REMOTE_VENV_DIR}
+echo "Uploaded a3s-code wheels:"
+ls -la {remote_wheels_dir}
 {REMOTE_VENV_PYTHON} -m pip install --no-index --find-links {remote_wheels_dir} a3s-code=={wheel_version}
 chmod +x /installed-agent/skillsbench_a3s_code_runner.py
 """
