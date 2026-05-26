@@ -11,8 +11,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-A3S_CODE_ROOT = Path(os.getenv("A3S_CODE_REPO_ROOT", str(Path.home() / "workspace" / "a3s-lab" / "Code")))
-A3S_CODE_SDK_PYTHON = A3S_CODE_ROOT / "sdk" / "python"
+A3S_CODE_ROOT_ENV = os.getenv("A3S_CODE_REPO_ROOT", "").strip()
+A3S_CODE_ROOT = Path(A3S_CODE_ROOT_ENV).expanduser() if A3S_CODE_ROOT_ENV else None
+A3S_CODE_SDK_PYTHON = A3S_CODE_ROOT / "sdk" / "python" if A3S_CODE_ROOT else None
 DEFAULT_CONDA_ENV = Path(
     os.getenv(
         "CONDA_ENV",
@@ -71,7 +72,9 @@ def target_python_tag() -> str:
     return current_python_tag()
 
 
-def current_a3s_code_version() -> str | None:
+def current_a3s_code_source_version() -> str | None:
+    if A3S_CODE_SDK_PYTHON is None:
+        return None
     pyproject = A3S_CODE_SDK_PYTHON / "pyproject.toml"
     if not pyproject.exists():
         return None
@@ -83,6 +86,25 @@ def current_a3s_code_version() -> str | None:
     if not match:
         return None
     return match.group(1).strip() or None
+
+
+def installed_a3s_code_version() -> str | None:
+    try:
+        result = run_checked(
+            [
+                str(DEFAULT_PYTHON_BIN),
+                "-c",
+                "import importlib.metadata as md; print(md.version('a3s-code'))",
+            ]
+        )
+    except subprocess.CalledProcessError:
+        return None
+    version = (result.stdout or "").strip()
+    return version or None
+
+
+def current_a3s_code_version() -> str | None:
+    return current_a3s_code_source_version() or installed_a3s_code_version()
 
 
 def find_existing_wheel(wheel_dir: Path) -> Path | None:
@@ -122,21 +144,43 @@ def ensure_a3s_code_wheel(wheel_dir: Path | None = None) -> Path:
         return existing
 
     wheel_dir.mkdir(parents=True, exist_ok=True)
-    python_bin = str(DEFAULT_PYTHON_BIN)
-    maturin_bin = str(DEFAULT_MATURIN_BIN)
-    env = {
-        "PATH": f"{DEFAULT_CONDA_ENV / 'bin'}:{Path.home() / '.cargo' / 'bin'}:{os.environ.get('PATH', '')}",
-        "CONDA_PREFIX": str(DEFAULT_CONDA_ENV),
-        "VIRTUAL_ENV": str(DEFAULT_CONDA_ENV),
-    }
-    run_checked(
-        [maturin_bin, "build", "--release", "-o", str(wheel_dir)],
-        cwd=A3S_CODE_SDK_PYTHON,
-        env=env,
-    )
+    if A3S_CODE_SDK_PYTHON is not None and (A3S_CODE_SDK_PYTHON / "pyproject.toml").exists():
+        maturin_bin = str(DEFAULT_MATURIN_BIN)
+        env = {
+            "PATH": f"{DEFAULT_CONDA_ENV / 'bin'}:{Path.home() / '.cargo' / 'bin'}:{os.environ.get('PATH', '')}",
+            "CONDA_PREFIX": str(DEFAULT_CONDA_ENV),
+            "VIRTUAL_ENV": str(DEFAULT_CONDA_ENV),
+        }
+        run_checked(
+            [maturin_bin, "build", "--release", "-o", str(wheel_dir)],
+            cwd=A3S_CODE_SDK_PYTHON,
+            env=env,
+        )
+    else:
+        version = installed_a3s_code_version()
+        package_spec = f"a3s-code=={version}" if version else "a3s-code"
+        try:
+            run_checked(
+                [
+                    str(DEFAULT_PYTHON_BIN),
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--no-deps",
+                    "--wheel-dir",
+                    str(wheel_dir),
+                    package_spec,
+                ]
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "Could not obtain an a3s-code wheel from the installed package or package index. "
+                "Set A3S_CODE_WHEEL_PATH to a prebuilt wheel, or set A3S_CODE_REPO_ROOT "
+                "to an AI45Lab/Code checkout only when rebuilding from source is intended."
+            ) from exc
     built = find_existing_wheel(wheel_dir)
     if built is None:
-        raise RuntimeError(f"maturin build completed but no wheel was produced in {wheel_dir}")
+        raise RuntimeError(f"a3s-code wheel command completed but no compatible wheel was produced in {wheel_dir}")
     return built
 
 

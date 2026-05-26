@@ -232,8 +232,11 @@ def _load_module(monkeypatch, module_name: str):
     return importlib.import_module(module_name)
 
 
-def _load_runtime_utils(monkeypatch, a3s_code_root: Path):
-    monkeypatch.setenv("A3S_CODE_REPO_ROOT", str(a3s_code_root))
+def _load_runtime_utils(monkeypatch, a3s_code_root: Path | None = None):
+    if a3s_code_root is None:
+        monkeypatch.delenv("A3S_CODE_REPO_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("A3S_CODE_REPO_ROOT", str(a3s_code_root))
     module_name = f"benchmark_runtime_utils_test_{time.time_ns()}"
     spec = importlib.util.spec_from_file_location(module_name, RUNTIME_UTILS_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -272,6 +275,55 @@ def test_find_existing_wheel_requires_current_a3s_code_version(monkeypatch, tmp_
     fresh.write_text("new", encoding="utf-8")
 
     assert module.find_existing_wheel(wheel_dir) == fresh
+
+
+def test_runtime_utils_can_use_installed_a3s_code_without_source_checkout(monkeypatch) -> None:
+    module = _load_runtime_utils(monkeypatch)
+
+    class FakeResult:
+        stdout = "3.2.1\n"
+
+    def fake_run_checked(argv, *, cwd=None, env=None):
+        assert "maturin" not in argv[0]
+        return FakeResult()
+
+    monkeypatch.setattr(module, "run_checked", fake_run_checked)
+
+    assert module.current_a3s_code_version() == "3.2.1"
+
+
+def test_ensure_a3s_code_wheel_uses_pip_without_source_checkout(monkeypatch, tmp_path: Path) -> None:
+    module = _load_runtime_utils(monkeypatch)
+    tag = module.current_python_tag()
+    calls: list[list[str]] = []
+
+    class FakeResult:
+        def __init__(self, stdout: str = ""):
+            self.stdout = stdout
+
+    def fake_run_checked(argv, *, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[1:3] == ["-m", "pip"]:
+            wheel_dir = Path(argv[argv.index("--wheel-dir") + 1])
+            wheel_dir.mkdir(parents=True, exist_ok=True)
+            (wheel_dir / f"a3s_code-3.2.1-{tag}-{tag}-manylinux_2_34_x86_64.whl").write_text(
+                "wheel",
+                encoding="utf-8",
+            )
+            return FakeResult()
+        if "-c" in argv and "importlib.metadata" in argv[-1]:
+            return FakeResult("3.2.1\n")
+        if "-c" in argv and "sys.version_info" in argv[-1]:
+            return FakeResult(f"{tag}\n")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "run_checked", fake_run_checked)
+
+    wheel = module.ensure_a3s_code_wheel(tmp_path / "wheels")
+
+    assert wheel.name.startswith("a3s_code-3.2.1-")
+    assert any(call[1:4] == ["-m", "pip", "wheel"] for call in calls)
+    assert not any("maturin" in call[0] for call in calls)
 
 
 def test_render_openai_agent_config_uses_current_acl_shape(monkeypatch, tmp_path: Path) -> None:
