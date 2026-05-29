@@ -68,6 +68,8 @@ class AgentRunner:
 
     def set_max_iterations(self, max_iterations: int) -> None:
         self._max_iterations = max(1, int(max_iterations))
+        if hasattr(self._rollout_agent, "set_max_iterations"):
+            self._rollout_agent.set_max_iterations(self._max_iterations)  # type: ignore[attr-defined]
 
     def reached_iteration_limit(self) -> bool:
         return self._model_turn_count >= self._max_iterations
@@ -82,6 +84,14 @@ class AgentRunner:
     async def run_model_turn(
         self, context_messages: List[dict[str, Any]]
     ) -> TurnResult:
+        if hasattr(self._rollout_agent, "run_model_turn"):
+            turn_result = await self._rollout_agent.run_model_turn(context_messages)  # type: ignore[attr-defined]
+            interactions = getattr(turn_result, "interactions", None) or [
+                turn_result.interaction
+            ]
+            self._model_turn_count += max(1, len(interactions))
+            return turn_result
+
         chat_completion, interaction = await self._sglang_client.generate_turn(
             messages=context_messages,
             tools=self._tool_schemas,
@@ -98,6 +108,7 @@ class AgentRunner:
             tool_call_requests=tool_call_requests,
             parse_error_recorded=parse_error_recorded,
             terminated_response=terminated,
+            interactions=[interaction],
         )
 
     def record_tool_result(self, tool_call_request: Any, raw_result: Any) -> None:
@@ -105,6 +116,28 @@ class AgentRunner:
 
     def finalize_response(self, model_response: Any) -> Any:
         return self._rollout_agent.finalize_response(model_response)
+
+    def close(self) -> None:
+        close = getattr(self._rollout_agent, "close", None)
+        if close is not None:
+            close()
+
+
+def normalize_harness_option(value: str | None) -> str:
+    normalized = (value or "camel-agent").strip().lower().replace("_", "-")
+    aliases = {
+        "camel": "camel-agent",
+        "camel-agent": "camel-agent",
+        "a3s": "a3s-code",
+        "a3s-code": "a3s-code",
+        "a3s-code-agent": "a3s-code",
+        "a3s-code-harness": "a3s-code",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unsupported harness_option: {value!r}. Expected camel-agent or a3s-code."
+        )
+    return aliases[normalized]
 
 
 def create_agent_runner(
@@ -115,8 +148,11 @@ def create_agent_runner(
     tool_schemas: List[Dict[str, Any]],
     non_think_mode: bool,
     max_total_tokens: int,
+    env_client: Any | None = None,
+    lease_id: str | None = None,
 ) -> AgentRunner:
-    if agent_type == "camel_agent":
+    harness_option = normalize_harness_option(agent_type)
+    if harness_option == "camel-agent":
         from agent.camel_agent import CamelAgent
 
         rollout_agent = CamelAgent(
@@ -125,10 +161,19 @@ def create_agent_runner(
             non_think_mode=non_think_mode,
             max_total_tokens=max_total_tokens,
         )
-    else:
-        raise ValueError(
-            f"Unsupported agent type: {agent_type!r}. Expected 'camel_agent'."
+    elif harness_option == "a3s-code":
+        from agent.a3s_code_agent import A3SCodeAgent
+
+        rollout_agent = A3SCodeAgent(
+            model_type=model_type,
+            sglang_client=sglang_client,
+            non_think_mode=non_think_mode,
+            max_total_tokens=max_total_tokens,
+            env_client=env_client,
+            lease_id=lease_id,
         )
+    else:
+        raise AssertionError(f"unreachable harness_option={harness_option!r}")
 
     return AgentRunner(
         rollout_agent=rollout_agent,

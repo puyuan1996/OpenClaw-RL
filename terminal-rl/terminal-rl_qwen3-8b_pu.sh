@@ -37,6 +37,7 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] missing cmd: 
 # had this dir on PATH; we make that explicit here so the script is self-contained.
 LIGHTRFT_PY312_BIN="${LIGHTRFT_PY312_BIN:-/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin}"
 export PATH="${LIGHTRFT_PY312_BIN}:${PATH}"
+TRAIN_PYTHON="${TRAIN_PYTHON:-python3}"
 DRY_RUN="${DRY_RUN:-0}"
 
 # ── Cleanup previous processes ───────────────────────────────────────
@@ -264,6 +265,43 @@ MAX_TURN="${MAX_TURN:-10}"
 #   N>1: save only when train_step % N == 0
 #   0: disable trajectory artifact writes even when TERMINAL_SAVE_TRAJ_DIR is set
 TRAJECTORY_SAVE_INTERVAL="${TRAJECTORY_SAVE_INTERVAL:-}"
+HARNESS_OPTION="${HARNESS_OPTION:-camel-agent}"
+HARNESS_OPTION_NORMALIZED="$(echo "${HARNESS_OPTION}" | tr '_' '-' | tr '[:upper:]' '[:lower:]')"
+case "${HARNESS_OPTION_NORMALIZED}" in
+  camel|camel-agent)
+    HARNESS_OPTION="camel-agent"
+    ;;
+  a3s|a3s-code|a3s-code-harness)
+    HARNESS_OPTION="a3s-code"
+    ;;
+  *)
+    echo "[ERROR] Unknown HARNESS_OPTION=${HARNESS_OPTION}. Use camel-agent or a3s-code."
+    exit 2
+    ;;
+esac
+export HARNESS_OPTION
+echo "[config] harness_option=${HARNESS_OPTION}"
+
+if [[ "${HARNESS_OPTION}" == "a3s-code" && "${DRY_RUN}" != "1" ]]; then
+  A3S_CODE_PIP_PACKAGE="${A3S_CODE_PIP_PACKAGE:-a3s-code==3.3.0}"
+  A3S_CODE_PYTHON="${A3S_CODE_PYTHON:-${TRAIN_PYTHON}}"
+  A3S_CODE_PY_TAG="$("${A3S_CODE_PYTHON}" - <<'PY'
+import sys
+print(f"cp{sys.version_info.major}{sys.version_info.minor}")
+PY
+)"
+  export A3S_CODE_CACHE_DIR="${A3S_CODE_CACHE_DIR:-/mnt/shared-storage-user/lixiangtian/.cache/a3s-code-${A3S_CODE_PY_TAG}}"
+  if ! "${A3S_CODE_PYTHON}" -c 'import a3s_code' >/dev/null 2>&1; then
+    log "Installing ${A3S_CODE_PIP_PACKAGE} for a3s-code harness"
+    "${A3S_CODE_PYTHON}" -m pip install \
+      --index-url "${PIP_INDEX_URL:-http://mirrors.i.h.pjlab.org.cn/pypi/simple/}" \
+      --extra-index-url "${PIP_EXTRA_INDEX_URL:-http://pypi.i.h.pjlab.org.cn/brain/dev/+simple}" \
+      --trusted-host mirrors.i.h.pjlab.org.cn \
+      --trusted-host pypi.i.h.pjlab.org.cn \
+      "${A3S_CODE_PIP_PACKAGE}"
+    "${A3S_CODE_PYTHON}" -c 'import a3s_code'
+  fi
+fi
 
 # Generate a per-run yaml that overlays MAX_TURN onto the base CUSTOM_CONFIG_PATH.
 # This is cleaner than mutating the base yaml — different concurrent runs can pick
@@ -272,12 +310,17 @@ BASE_CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH}"
 RUN_CUSTOM_CONFIG_PATH="${RUN_DIR}/config/rollout_config.yaml"
 mkdir -p "$(dirname "${RUN_CUSTOM_CONFIG_PATH}")"
 if [[ -f "${BASE_CUSTOM_CONFIG_PATH}" ]]; then
-  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" "$TRAJECTORY_SAVE_INTERVAL" <<'PY'
+  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" "$TRAJECTORY_SAVE_INTERVAL" "$HARNESS_OPTION" <<'PY'
 import sys, yaml
-src, dst, max_turn, traj_interval = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].strip()
+src = sys.argv[1]
+dst = sys.argv[2]
+max_turn = int(sys.argv[3])
+traj_interval = sys.argv[4].strip()
+harness_option = sys.argv[5].strip()
 with open(src) as f:
     cfg = yaml.safe_load(f) or {}
 cfg["max_iteration"] = max_turn
+cfg["harness_option"] = harness_option
 if traj_interval:
     cfg["trajectory_save_interval"] = int(traj_interval)
 with open(dst, "w") as f:
@@ -285,12 +328,12 @@ with open(dst, "w") as f:
 PY
   CUSTOM_CONFIG_PATH="${RUN_CUSTOM_CONFIG_PATH}"
   if [[ -n "${TRAJECTORY_SAVE_INTERVAL}" ]]; then
-    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, trajectory_save_interval=${TRAJECTORY_SAVE_INTERVAL})"
+    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, trajectory_save_interval=${TRAJECTORY_SAVE_INTERVAL}, harness_option=${HARNESS_OPTION})"
   else
-    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN})"
+    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, harness_option=${HARNESS_OPTION})"
   fi
 else
-  echo "[config] base yaml ${BASE_CUSTOM_CONFIG_PATH} not found; MAX_TURN=${MAX_TURN} will not take effect"
+  echo "[config] base yaml ${BASE_CUSTOM_CONFIG_PATH} not found; MAX_TURN=${MAX_TURN}, HARNESS_OPTION=${HARNESS_OPTION} will not take effect"
 fi
 
 # Symlinks for backward compatibility. Dry-run avoids touching stable repo links.
@@ -613,6 +656,7 @@ CHECK_WAIT_SECS="${CHECK_WAIT_SECS:-60}"
 export ROUTER_FORWARD_TIMEOUT="${ROUTER_FORWARD_TIMEOUT:-900}"
 export ROUTER_FORWARD_RETRIES="${ROUTER_FORWARD_RETRIES:-3}"
 export ROUTER_FORWARD_RETRY_BACKOFF="${ROUTER_FORWARD_RETRY_BACKOFF:-1.0}"
+export ENV_EVALUATE_MAX_RETRIES="${ENV_EVALUATE_MAX_RETRIES:-5}"
 
 # ── ClawSentry safety reward (L1-only, reward-only, linear-fusion baseline) ──
 # Gateway runs on the same host as router_server (CPU master). All decisions
@@ -879,7 +923,7 @@ TRAIN_ARGS=(
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "DRY_RUN=1: final train_async command only; router/Ray/training will not start"
   printf '[dry-run] '
-  printf '%q ' python3 -u "${SLIME_DIR}/train_async.py" "${TRAIN_ARGS[@]}"
+  printf '%q ' "${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py" "${TRAIN_ARGS[@]}"
   printf '\n'
   exit 0
 fi
@@ -1019,6 +1063,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "num_rollout": ${NUM_ROLLOUT},
   "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
   "n_samples": ${N_SAMPLES},
+  "harness_option": "${HARNESS_OPTION}",
   "rollout_max_response_len": ${ROLLOUT_MAX_RESPONSE_LEN},
   "rollout_max_context_len": ${ROLLOUT_MAX_CONTEXT_LEN},
   "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
@@ -1118,6 +1163,8 @@ RUNTIME_PYTHONPATH="${MEGATRON_DIR}:${REPO_ROOT}:${SLIME_DIR}:${SCRIPT_DIR}"
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
+    \"PATH\": \"${PATH}\",
+    \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
     \"PYTHONPATH\": \"${RUNTIME_PYTHONPATH}\",
     \"PYTHONUNBUFFERED\": \"1\",
     \"PYTHONFAULTHANDLER\": \"1\",
@@ -1145,6 +1192,11 @@ RUNTIME_ENV_JSON="{
     \"TERMINAL_SAVE_TRAJ_DIR\": \"${TERMINAL_SAVE_TRAJ_DIR}\",
     \"TRAJECTORY_SAVE_INTERVAL\": \"${TRAJECTORY_SAVE_INTERVAL}\",
     \"RUN_DIR\": \"${RUN_DIR}\",
+    \"A3S_CODE_CACHE_DIR\": \"${A3S_CODE_CACHE_DIR:-}\",
+    \"A3S_CODE_MAX_TOOL_ROUNDS\": \"${A3S_CODE_MAX_TOOL_ROUNDS:-10}\",
+    \"A3S_CODE_OUTPUT_TOKENS\": \"${A3S_CODE_OUTPUT_TOKENS:-8192}\",
+    \"A3S_CODE_TOOL_TIMEOUT_MS\": \"${A3S_CODE_TOOL_TIMEOUT_MS:-7200000}\",
+    \"A3S_CODE_PLANNING_MODE\": \"${A3S_CODE_PLANNING_MODE:-disabled}\",
     \"DATASET\": \"${DATASET}\",
     \"ALGO\": \"${ALGO}\",
     \"DAPO_OVERLONG_BUFFER_ENABLE\": \"${DAPO_OVERLONG_BUFFER_ENABLE}\",
@@ -1186,6 +1238,7 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_CDE_ACTOR_DECAY_STEPS\": \"${EXPLORE_CDE_ACTOR_DECAY_STEPS}\",
     \"EXPLORE_RETRY_ATTEMPTS\": \"${EXPLORE_RETRY_ATTEMPTS}\",
     \"EXPLORE_RETRY_TRAJ_GAMMA\": \"${EXPLORE_RETRY_TRAJ_GAMMA}\",
+    \"ENV_EVALUATE_MAX_RETRIES\": \"${ENV_EVALUATE_MAX_RETRIES}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"
   }
 }"
@@ -1197,7 +1250,7 @@ ray job submit --address="http://${MASTER_ADDR}:8265" \
   --submission-id "${RAY_JOB_SUBMISSION_ID}" \
   --no-wait \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- python3 -u "${SLIME_DIR}/train_async.py" \
+  -- "${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py" \
   "${TRAIN_ARGS[@]}"
 
 set +e

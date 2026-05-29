@@ -1431,6 +1431,7 @@ async def generate(
     cs_per_call: list[tuple[int, float]] = []
     cs_per_call_full: list[dict[str, Any]] = []
     turn_records: list[dict[str, Any]] = []
+    agent_runner: Any | None = None
 
     _log_tag = f"[task={task_spec.task_name} uid={run_ctx.uid} group_idx={run_ctx.group_index} sample_idx={run_ctx.sample_index}]"
 
@@ -1449,7 +1450,13 @@ async def generate(
         logger.info("%s Start terminal rollout", _log_tag)
 
         tool_schemas = _normalize_tool_schemas(raw_tools)
-        agent_type = str(getattr(args, "terminal_agent_type", "camel_agent"))
+        agent_type = str(
+            getattr(
+                args,
+                "harness_option",
+                getattr(args, "terminal_agent_type", "camel_agent"),
+            )
+        )
         model_type = str(getattr(args, "model_type", "slime-sglang"))
         non_think_mode = bool(getattr(args, "non_think_mode", True))
         non_think_mode_source = str(
@@ -1544,6 +1551,8 @@ async def generate(
             tool_schemas=tool_schemas,
             non_think_mode=enable_prompt_non_think,
             max_total_tokens=max_total_tokens,
+            env_client=env_client,
+            lease_id=lease_id,
         )
         agent_runner.reset(user_msg)
         agent_runner.set_max_parse_errors(terminal_max_parse_errors)
@@ -1569,9 +1578,12 @@ async def generate(
             turn_state: TurnResult = await agent_runner.run_model_turn(
                 context_result.context_messages
             )
-            interaction = turn_state.interaction
+            turn_interactions = getattr(turn_state, "interactions", None) or [
+                turn_state.interaction
+            ]
+            interaction = turn_interactions[-1]
             turn_idx = int(interaction.turn_idx)
-            interactions.append(interaction)
+            interactions.extend(turn_interactions)
 
             current_turn_record: dict[str, Any] = {
                 "turn_idx": turn_idx,
@@ -1582,8 +1594,14 @@ async def generate(
                 "n_input_tokens": len(interaction.input_ids or []),
                 "n_output_tokens": len(interaction.output_token_ids or []),
                 "parse_error_recorded": bool(turn_state.parse_error_recorded),
+                "sdk_model_turns": len(turn_interactions),
                 "tool_calls": [],
             }
+            response_info = getattr(turn_state.model_response, "info", None)
+            if isinstance(response_info, dict):
+                for call in response_info.get("tool_calls") or []:
+                    if isinstance(call, dict):
+                        current_turn_record["tool_calls"].append(call)
             turn_records.append(current_turn_record)
 
             if prm_agent is not None:
@@ -2055,6 +2073,12 @@ async def generate(
                 await cs_client.aclose()
             except Exception as exc:
                 logger.debug("ClawSentry aclose ignored: %s", exc)
+
+        if agent_runner is not None:
+            try:
+                agent_runner.close()
+            except Exception as exc:
+                logger.debug("%s Agent runner close ignored: %s", _log_tag, exc)
 
         if env_client is not None and lease_id is not None:
             try:
