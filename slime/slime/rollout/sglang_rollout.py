@@ -19,6 +19,7 @@ from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, post
+from slime.utils.metric_utils import compute_rollout_step
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import encode_image_for_rollout_engine, load_processor, load_tokenizer
 from slime.utils.types import Sample
@@ -28,6 +29,31 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
+
+
+def _train_step_start(args: Namespace, rollout_id: int) -> int:
+    try:
+        steps_per_rollout = int(getattr(args, "num_steps_per_rollout", 1) or 1)
+    except (TypeError, ValueError):
+        steps_per_rollout = 1
+    return int(rollout_id) * max(1, steps_per_rollout)
+
+
+def _annotate_rollout_sample(args: Namespace, sample: Sample, rollout_id: int, *, evaluation: bool) -> None:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    sample.metadata = dict(metadata)
+    sample.metadata["rollout_id"] = int(rollout_id)
+    sample.metadata["rollout_step"] = int(compute_rollout_step(args, rollout_id))
+    sample.metadata["train_step"] = _train_step_start(args, rollout_id)
+    sample.metadata["evaluation"] = bool(evaluation)
+
+
+def _annotate_rollout_groups(
+    args: Namespace, samples: list[list[Sample]], rollout_id: int, *, evaluation: bool
+) -> None:
+    for group in samples:
+        for sample in group:
+            _annotate_rollout_sample(args, sample, rollout_id, evaluation=evaluation)
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -364,6 +390,7 @@ async def generate_rollout_async(
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
+            _annotate_rollout_groups(args, samples, rollout_id, evaluation=False)
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
@@ -492,6 +519,7 @@ async def eval_rollout_single_dataset(
             sample.index = sample_index
             sample_index += 1
             sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
+            _annotate_rollout_sample(args, sample, rollout_id, evaluation=True)
             sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
             sampling_params = base_sampling_params
             if getattr(args, "sglang_enable_deterministic_inference", False):

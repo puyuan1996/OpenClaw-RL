@@ -20,8 +20,14 @@
 #   WORKER_MAX_CONCURRENT_CLOSES (default 32)  — pool_server --max-concurrent-closes
 #   ENV_SERVER_PORT             (default 18081)
 #   SKIP_PREFLIGHT_CLEANUP      (default 0)    — set 1 to skip orphan cleanup
+#   PROXY_ENV_FILE              (default /etc/seta_build_proxy.env)
+#   SKIP_PROXY_ENV              (default 0)    — set 1 to avoid sourcing proxy env
 #   CLAWSENTRY_NEEDED           (default 0)    — set 1 to also check CS gateway
 #   CS_GATEWAY_PORT             (default 8090) — ClawSentry gateway port
+#   DOCKER_DATA_ROOT            (default /data) — Docker data root to guard
+#   WORKER_MIN_DOCKER_FREE_GB   (default 50) — refuse start/admission below this
+#   WORKER_MAX_DOCKER_USED_PCT  (default 85) — refuse start/admission above this
+#   WORKER_MAX_DOCKER_INODE_PCT (default 80) — refuse start/admission above this
 #
 # Logs written:
 #   tmp_doc_latest/cpu_pool.log   — full stdout/stderr
@@ -44,14 +50,31 @@ WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-16}"
 WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-32}"
 ENV_SERVER_PORT="${ENV_SERVER_PORT:-18081}"
 SKIP_PREFLIGHT_CLEANUP="${SKIP_PREFLIGHT_CLEANUP:-0}"
+PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
+SKIP_PROXY_ENV="${SKIP_PROXY_ENV:-0}"
 CLAWSENTRY_NEEDED="${CLAWSENTRY_NEEDED:-0}"
 CS_GATEWAY_PORT="${CS_GATEWAY_PORT:-8090}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
+WORKER_DISK_GUARD_ENABLED="${WORKER_DISK_GUARD_ENABLED:-1}"
+WORKER_MIN_DOCKER_FREE_GB="${WORKER_MIN_DOCKER_FREE_GB:-50}"
+WORKER_MAX_DOCKER_USED_PCT="${WORKER_MAX_DOCKER_USED_PCT:-85}"
+WORKER_MAX_DOCKER_INODE_PCT="${WORKER_MAX_DOCKER_INODE_PCT:-80}"
+PREFLIGHT_DISK_CLEANUP="${PREFLIGHT_DISK_CLEANUP:-1}"
 
 log "=== pool_server_pu_v2 starting ==="
 log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TASK}"
 log "  max_concurrent_closes=${WORKER_MAX_CONCURRENT_CLOSES}"
 log "  port=${ENV_SERVER_PORT}  skip_cleanup=${SKIP_PREFLIGHT_CLEANUP}"
 log "  total_capacity=$((WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK)) slots"
+log "  docker_data_root=${DOCKER_DATA_ROOT} disk_guard=${WORKER_DISK_GUARD_ENABLED}"
+
+if [[ "${SKIP_PROXY_ENV}" != "1" && -f "${PROXY_ENV_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    set -a; . "${PROXY_ENV_FILE}"; set +a
+    log "  loaded proxy env: ${PROXY_ENV_FILE}"
+elif [[ "${SKIP_PROXY_ENV}" != "1" ]]; then
+    log "  proxy env not found at ${PROXY_ENV_FILE}; continuing without it"
+fi
 
 # ── Log paths ─────────────────────────────────────────────────────────────────
 TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
@@ -62,17 +85,86 @@ CPU_ERR_LOG="${TMP_DOC_LATEST}/cpu_err.log"
 log "  full log: ${CPU_POOL_LOG}"
 log "  err log:  ${CPU_ERR_LOG}"
 
+docker_disk_snapshot() {
+    df -P -BG "${DOCKER_DATA_ROOT}" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); gsub("G","",$4); print $5, $4}'
+}
+
+docker_inode_snapshot() {
+    df -Pi "${DOCKER_DATA_ROOT}" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}'
+}
+
+preflight_disk_guard() {
+    if [[ "${WORKER_DISK_GUARD_ENABLED}" == "0" ]]; then
+        log "  disk guard disabled (WORKER_DISK_GUARD_ENABLED=0)"
+        return 0
+    fi
+    if [[ ! -d "${DOCKER_DATA_ROOT}" ]]; then
+        log "  ❌ Docker data root does not exist: ${DOCKER_DATA_ROOT}"
+        exit 1
+    fi
+
+    local snap used_pct free_gb inode_pct
+    snap="$(docker_disk_snapshot || true)"
+    inode_pct="$(docker_inode_snapshot || true)"
+    used_pct="${snap%% *}"
+    free_gb="${snap##* }"
+    log "  ${DOCKER_DATA_ROOT}: used=${used_pct:-?}% free=${free_gb:-?}GB inode=${inode_pct:-?}%"
+    log "  thresholds: free>=${WORKER_MIN_DOCKER_FREE_GB}GB used<=${WORKER_MAX_DOCKER_USED_PCT}% inode<=${WORKER_MAX_DOCKER_INODE_PCT}%"
+
+    if [[ -z "${used_pct}" || -z "${free_gb}" || -z "${inode_pct}" ]]; then
+        log "  ❌ Failed to read Docker data-root disk stats"
+        exit 1
+    fi
+
+    if [[ "${used_pct}" -gt "${WORKER_MAX_DOCKER_USED_PCT}" \
+       || "${free_gb}" -lt "${WORKER_MIN_DOCKER_FREE_GB}" \
+       || "${inode_pct}" -gt "${WORKER_MAX_DOCKER_INODE_PCT}" ]]; then
+        log "  ⚠️  Docker data-root is above guard threshold."
+        if [[ "${PREFLIGHT_DISK_CLEANUP}" == "1" && -x "${SCRIPT_DIR}/cleanup_docker_cache.sh" ]]; then
+            log "  Running conservative cleanup before refusing start..."
+            DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT}" RUN_HEAVY_DF=0 \
+              bash "${SCRIPT_DIR}/cleanup_docker_cache.sh" || true
+            snap="$(docker_disk_snapshot || true)"
+            inode_pct="$(docker_inode_snapshot || true)"
+            used_pct="${snap%% *}"
+            free_gb="${snap##* }"
+            log "  after cleanup: used=${used_pct:-?}% free=${free_gb:-?}GB inode=${inode_pct:-?}%"
+        fi
+    fi
+
+    if [[ "${used_pct}" -gt "${WORKER_MAX_DOCKER_USED_PCT}" \
+       || "${free_gb}" -lt "${WORKER_MIN_DOCKER_FREE_GB}" \
+       || "${inode_pct}" -gt "${WORKER_MAX_DOCKER_INODE_PCT}" ]]; then
+        log "  ❌ Refusing to start pool_server under Docker disk pressure."
+        log "     Run: AGGRESSIVE=1 PRUNE_VOLUMES=1 bash terminal-rl/remote/fix_docker_overlay2_no_space.sh"
+        log "     If Docker objects are empty but /data is still full, use PURGE_DOCKER_ROOT_WHEN_EMPTY=1."
+        exit 1
+    fi
+
+    log "  ✅ Docker data-root capacity OK"
+}
+
 # ── Pre-flight: docker daemon health ─────────────────────────────────────────
-log "Pre-flight [1/5]: Docker daemon health check"
+log "Pre-flight [1/6]: Docker daemon health check"
 if ! timeout 10 docker info >/dev/null 2>&1; then
     log "  ❌ Docker daemon not responding!"
-    log "  Run: bash terminal-rl/remote/restart_docker_force.sh"
+    log "  Run repair: sudo bash terminal-rl/remote/fix_dockerd_and_proxy.sh"
+    log "  Or force restart only: sudo bash terminal-rl/remote/restart_docker_force.sh"
     exit 1
 fi
 log "  ✅ Docker daemon OK"
 
+log "Pre-flight [2/6]: Docker data-root disk/inode guard"
+preflight_disk_guard
+
+if command -v ss >/dev/null 2>&1 && ss -tln "( sport = :${ENV_SERVER_PORT} )" | grep -q ":${ENV_SERVER_PORT}"; then
+    log "  ❌ Port ${ENV_SERVER_PORT} is already in use"
+    log "     Inspect: ss -tlnp '( sport = :${ENV_SERVER_PORT} )'"
+    exit 1
+fi
+
 # ── Pre-flight: nofile ulimit check (坑4) ────────────────────────────────────
-log "Pre-flight [2/5]: nofile ulimit check (need ≥65536)"
+log "Pre-flight [3/6]: nofile ulimit check (need ≥65536)"
 NOFILE_SOFT=$(ulimit -Sn 2>/dev/null || echo 0)
 NOFILE_HARD=$(ulimit -Hn 2>/dev/null || echo 0)
 log "  current: soft=${NOFILE_SOFT} hard=${NOFILE_HARD}"
@@ -91,7 +183,7 @@ else
 fi
 
 # ── Pre-flight: docker address pool (坑3) ────────────────────────────────────
-log "Pre-flight [3/5]: Docker bridge network address pool check"
+log "Pre-flight [4/6]: Docker bridge network address pool check"
 # Count existing bridge networks (each consumes a /24)
 BRIDGE_COUNT=$(docker network ls --filter driver=bridge -q 2>/dev/null | wc -l)
 log "  existing bridge networks: ${BRIDGE_COUNT}"
@@ -122,7 +214,7 @@ else
 fi
 
 # ── Pre-flight: orphan container/network cleanup (坑5) ───────────────────────
-log "Pre-flight [4/5]: Orphan container/network cleanup (SKIP_PREFLIGHT_CLEANUP=${SKIP_PREFLIGHT_CLEANUP})"
+log "Pre-flight [5/6]: Orphan container/network cleanup (SKIP_PREFLIGHT_CLEANUP=${SKIP_PREFLIGHT_CLEANUP})"
 if [[ "${SKIP_PREFLIGHT_CLEANUP}" != "1" ]]; then
     # Count stopped containers that look like task containers (numeric prefix pattern)
     STOPPED=$(docker ps -aq --filter "status=exited" --filter "status=dead" 2>/dev/null | wc -l)
@@ -154,7 +246,7 @@ else
 fi
 
 # ── Pre-flight: ClawSentry gateway check (if needed) ─────────────────────────
-log "Pre-flight [5/5]: ClawSentry gateway check (CLAWSENTRY_NEEDED=${CLAWSENTRY_NEEDED})"
+log "Pre-flight [6/6]: ClawSentry gateway check (CLAWSENTRY_NEEDED=${CLAWSENTRY_NEEDED})"
 if [[ "${CLAWSENTRY_NEEDED}" == "1" ]]; then
     if curl -fsS --max-time 3 "http://127.0.0.1:${CS_GATEWAY_PORT}/health" >/dev/null 2>&1; then
         log "  ✅ ClawSentry gateway OK at port ${CS_GATEWAY_PORT}"
@@ -217,8 +309,14 @@ export DATASET_DIR="${DATASET_DIR:-${TERMINAL_RL}/dataset}"
 export TBENCH_OUTPUT_ROOT="${TBENCH_OUTPUT_ROOT:-${TERMINAL_RL}/build_outputs}"
 export TBENCH_DOCKER_IMAGE_SOURCE="${TBENCH_DOCKER_IMAGE_SOURCE:-build}"
 export TBENCH_DOCKER_PULL_PREFIX="${TBENCH_DOCKER_PULL_PREFIX:-}"
+export AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench}"
 export COMPOSE_OVERRIDE_PATH="${COMPOSE_OVERRIDE_PATH:-}"
 export PYTHONUNBUFFERED=1
+export DOCKER_DATA_ROOT
+export WORKER_DISK_GUARD_ENABLED
+export WORKER_MIN_DOCKER_FREE_GB
+export WORKER_MAX_DOCKER_USED_PCT
+export WORKER_MAX_DOCKER_INODE_PCT
 
 if [ -d "${REPO_ROOT}/.venv" ]; then
     source .venv/bin/activate

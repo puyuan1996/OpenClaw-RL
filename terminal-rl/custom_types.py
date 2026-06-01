@@ -18,6 +18,9 @@ class RunContext:
     group_index: int
     sample_index: int
     log_dir: Path
+    rollout_id: Optional[int] = None
+    train_step: Optional[int] = None
+    rollout_step: Optional[int] = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -25,6 +28,9 @@ class RunContext:
             "group_index": self.group_index,
             "sample_index": self.sample_index,
             "log_dir": str(self.log_dir),
+            "rollout_id": self.rollout_id,
+            "train_step": self.train_step,
+            "rollout_step": self.rollout_step,
         }
 
 

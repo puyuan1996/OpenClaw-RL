@@ -2,3 +2,4 @@ tool_call_parser: qwen25
 model_type: Qwen3
 max_iteration: 10
 non_think_mode: false
+trajectory_save_interval: 1

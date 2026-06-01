@@ -18,6 +18,7 @@ class TerminalEnvClient:
         self.evaluate_max_retries = int(os.getenv("ENV_EVALUATE_MAX_RETRIES", "1"))
         self.close_max_retries = int(os.getenv("ENV_CLOSE_MAX_RETRIES", "3"))
         self.exec_tool_max_retries = int(os.getenv("ENV_EXEC_TOOL_MAX_RETRIES", "3"))
+        self.last_evaluate_details: dict[str, Any] | None = None
 
     async def allocate(
         self,
@@ -78,14 +79,21 @@ class TerminalEnvClient:
             raise RuntimeError(f"exec_tool failed: {out}")
         return str(out.get("observation", ""))
 
-    async def evaluate(self, lease_id: str) -> float:
+    async def evaluate(
+        self, lease_id: str, trajectory: dict[str, Any] | None = None
+    ) -> float:
+        payload: dict[str, Any] = {"lease_id": lease_id}
+        if trajectory is not None:
+            payload["trajectory"] = trajectory
         out = await post(
             f"{self.base_url}/evaluate",
-            {"lease_id": lease_id},
+            payload,
             max_retries=self.evaluate_max_retries,
         )
         if not out.get("ok", False):
             raise RuntimeError(f"evaluate failed: {out}")
+        details = out.get("details")
+        self.last_evaluate_details = details if isinstance(details, dict) else None
         return float(out.get("score", 0.0))
 
     async def close(self, lease_id: str) -> None:

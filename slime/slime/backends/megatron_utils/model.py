@@ -635,7 +635,9 @@ def train(
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
+            legacy_accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
+            train_step_id = getattr(args, "_monotonic_train_step", rollout_id)
+            setattr(args, "_monotonic_train_step", train_step_id + 1)
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
             log_dict = {
@@ -649,7 +651,11 @@ def train(
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
 
-            log_dict["train/step"] = accumulated_step_id
+            log_dict["train/step"] = train_step_id
+            log_dict["train/rollout_id"] = rollout_id
+            log_dict["train/rollout_step_id"] = step_id
+            log_dict["train/num_steps_per_rollout"] = num_steps_per_rollout
+            log_dict["train/legacy_accumulated_step"] = legacy_accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and not args.ci_disable_kl_checker:
@@ -659,10 +665,10 @@ def train(
                         assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
                     else:
                         assert log_dict["train/ppo_kl"] == 0.0 and log_dict["train/pg_clipfrac"] == 0.0, f"{log_dict=}"
-                if accumulated_step_id == 0 and "train/kl_loss" in log_dict:
+                if train_step_id == 0 and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
 
-            logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+            logger.info(f"{role_tag}step {train_step_id}: {log_dict}")
 
             if args.ci_save_grad_norm is not None:
                 ci_save_grad_norm_path = args.ci_save_grad_norm.format(

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -85,6 +86,92 @@ class CapacityError(Exception):
         self.code = code
         self.message = message
         super().__init__(message)
+
+
+class ResourcePressureError(Exception):
+    def __init__(self, code: str, message: str, details: dict[str, Any]):
+        self.code = code
+        self.message = message
+        self.details = details
+        super().__init__(message)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+def docker_data_root_stats() -> dict[str, Any]:
+    path = os.getenv("DOCKER_DATA_ROOT") or os.getenv("DOCKER_ROOT") or "/data"
+    usage = shutil.disk_usage(path)
+    st = os.statvfs(path)
+    total_inodes = int(st.f_files)
+    free_inodes = int(st.f_ffree)
+    used_inodes = max(total_inodes - free_inodes, 0)
+    used_pct = (usage.used * 100.0 / usage.total) if usage.total else 0.0
+    inode_used_pct = (
+        (used_inodes * 100.0 / total_inodes) if total_inodes else 0.0
+    )
+    return {
+        "path": path,
+        "total_gb": usage.total / 1024**3,
+        "used_gb": usage.used / 1024**3,
+        "free_gb": usage.free / 1024**3,
+        "used_pct": used_pct,
+        "total_inodes": total_inodes,
+        "used_inodes": used_inodes,
+        "free_inodes": free_inodes,
+        "inode_used_pct": inode_used_pct,
+    }
+
+
+def assert_worker_has_capacity_for_docker() -> None:
+    if os.getenv("WORKER_DISK_GUARD_ENABLED", "1") == "0":
+        return
+
+    min_free_gb = _env_float("WORKER_MIN_DOCKER_FREE_GB", 50.0)
+    max_used_pct = _env_float("WORKER_MAX_DOCKER_USED_PCT", 85.0)
+    max_inode_pct = _env_float("WORKER_MAX_DOCKER_INODE_PCT", 80.0)
+
+    try:
+        stats = docker_data_root_stats()
+    except Exception as exc:
+        raise ResourcePressureError(
+            "WORKER_DISK_STATS_FAILED",
+            f"Failed to read Docker data-root stats: {exc}",
+            {"error": str(exc)},
+        ) from exc
+
+    over_capacity = (
+        stats["free_gb"] < min_free_gb
+        or stats["used_pct"] > max_used_pct
+        or stats["inode_used_pct"] > max_inode_pct
+    )
+    if not over_capacity:
+        return
+
+    raise ResourcePressureError(
+        "WORKER_DOCKER_DISK_PRESSURE",
+        (
+            "Worker Docker data-root is under disk pressure: "
+            f"path={stats['path']} free={stats['free_gb']:.1f}GB "
+            f"used={stats['used_pct']:.1f}% inode={stats['inode_used_pct']:.1f}% "
+            f"thresholds free>={min_free_gb:.1f}GB used<={max_used_pct:.1f}% "
+            f"inode<={max_inode_pct:.1f}%"
+        ),
+        {
+            **stats,
+            "min_free_gb": min_free_gb,
+            "max_used_pct": max_used_pct,
+            "max_inode_pct": max_inode_pct,
+        },
+    )
 
 
 @dataclass
@@ -291,13 +378,16 @@ class WorkerPool:
             run_slot.last_used_ts = time.time()
             return str(observation)
 
-    async def evaluate(self, run_lease_id: str) -> float:
+    async def evaluate(
+        self, run_lease_id: str, trajectory: dict[str, Any] | None = None
+    ) -> tuple[float, dict[str, Any] | None]:
         async with self._lock:
             run_slot = self._get_run_slot(run_lease_id)
         async with run_slot.lock:
-            score = await run_slot.env.evaluate()
+            score = await run_slot.env.evaluate(trajectory)
+            details = run_slot.env.last_eval_details()
             run_slot.last_used_ts = time.time()
-            return float(score)
+            return float(score), details
 
     async def close_run(self, run_lease_id: str) -> bool:
         async with self._lock:
@@ -384,8 +474,20 @@ POOL: WorkerPool | None = None
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, Any]:
-    return {"ok": True}
+async def healthz() -> JSONResponse:
+    try:
+        assert_worker_has_capacity_for_docker()
+        return JSONResponse({"ok": True})
+    except ResourcePressureError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": exc.code,
+                "error": exc.message,
+                "details": exc.details,
+            },
+            status_code=503,
+        )
 
 
 @app.get("/status")
@@ -394,7 +496,28 @@ async def status() -> JSONResponse:
         return JSONResponse(
             {"ok": False, "error": "Pool is not initialized"}, status_code=500
         )
-    return JSONResponse({"ok": True, "pool": await POOL.status()})
+    disk: dict[str, Any] | None = None
+    disk_ok = True
+    disk_error: str | None = None
+    try:
+        disk = docker_data_root_stats()
+        assert_worker_has_capacity_for_docker()
+    except ResourcePressureError as exc:
+        disk_ok = False
+        disk_error = exc.message
+        disk = exc.details
+    except Exception as exc:
+        disk_ok = False
+        disk_error = str(exc)
+    return JSONResponse(
+        {
+            "ok": True,
+            "pool": await POOL.status(),
+            "docker_data_root": disk,
+            "admission_ok": disk_ok,
+            "admission_error": disk_error,
+        }
+    )
 
 
 @app.post("/allocate")
@@ -414,8 +537,19 @@ async def allocate(request: Request) -> JSONResponse:
         )
 
     try:
+        assert_worker_has_capacity_for_docker()
         result = await POOL.allocate(task_key=str(task_key), request_id=request_id)
         return JSONResponse({"ok": True, **result})
+    except ResourcePressureError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": exc.message,
+                "code": exc.code,
+                "details": exc.details,
+            },
+            status_code=503,
+        )
     except CapacityError as exc:
         return JSONResponse(
             {"ok": False, "error": exc.message, "code": exc.code}, status_code=429
@@ -468,6 +602,7 @@ async def reset(request: Request) -> JSONResponse:
         )
 
     try:
+        assert_worker_has_capacity_for_docker()
         out = await POOL.reset(
             run_lease_id=str(lease_id),
             task_meta=task_meta,
@@ -475,6 +610,16 @@ async def reset(request: Request) -> JSONResponse:
             task_timeouts=task_timeouts,
         )
         return JSONResponse({"ok": True, **out})
+    except ResourcePressureError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": exc.message,
+                "code": exc.code,
+                "details": exc.details,
+            },
+            status_code=503,
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -530,6 +675,7 @@ async def evaluate(request: Request) -> JSONResponse:
 
     data = await json_payload(request)
     lease_id = data.get("lease_id")
+    trajectory = data.get("trajectory")
 
     if not lease_id:
         return JSONResponse(
@@ -537,8 +683,13 @@ async def evaluate(request: Request) -> JSONResponse:
         )
 
     try:
-        score = await POOL.evaluate(str(lease_id))
-        return JSONResponse({"ok": True, "score": score})
+        score, details = await POOL.evaluate(
+            str(lease_id), trajectory if isinstance(trajectory, dict) else None
+        )
+        payload: dict[str, Any] = {"ok": True, "score": score}
+        if details is not None:
+            payload["details"] = details
+        return JSONResponse(payload)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 

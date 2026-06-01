@@ -425,6 +425,12 @@ class RolloutManager:
         """
         if not samples:
             return samples
+        if self.custom_reward_post_process_func is not None:
+            # A custom reward post-process may add signal after the default
+            # group-normalization stage. Filtering by raw pre-process reward
+            # here can silently remove exactly the groups the custom hook is
+            # meant to rescue.
+            return samples
         if self.args.advantage_estimator not in ["grpo", "gspo"] or not self.args.rewards_normalization:
             return samples
 

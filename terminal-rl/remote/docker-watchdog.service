@@ -46,6 +46,13 @@ Environment=all_proxy=
 # Environment=MAX_RUNNING_CONTAINERS=80
 # Environment=POOL_PORT=18081
 # Environment=BRIDGE_NETS_WARN=200
+# Environment=DISK_WARN_PCT=80
+# Environment=DISK_EMERGENCY_PCT=92
+# Environment=DISK_MIN_FREE_GB=20
+# Environment=DISK_INODE_WARN_PCT=80
+# Environment=DISK_INODE_EMERGENCY_PCT=90
+# Environment=WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=0
+# Environment=POOL_STOP_ON_DISK_EMERGENCY=1
 
 [Install]
 WantedBy=multi-user.target

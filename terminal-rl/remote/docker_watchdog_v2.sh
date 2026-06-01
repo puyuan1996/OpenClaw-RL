@@ -41,7 +41,8 @@ MAX_CONSECUTIVE_HEALTH_FAILS="${MAX_CONSECUTIVE_HEALTH_FAILS:-3}"
 LOG_FILE="${LOG_FILE:-/tmp/docker_watchdog.log}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-209715200}"            # 200 MiB
 DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
-DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/data}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
+PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
 
 POOL_HOST="${POOL_HOST:-127.0.0.1}"
 POOL_PORT="${POOL_PORT:-18081}"
@@ -52,6 +53,19 @@ POOL_SERVER_NAME_REGEX="${POOL_SERVER_NAME_REGEX:-openclaw_pool_server}"
 TASK_CONTAINER_REGEX="${TASK_CONTAINER_REGEX:-^[0-9]+-.*[-_](client|helper)([-_][0-9]+)?$}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-600}"  # "I'm alive" line every 10 min
 
+DISK_CHECK_INTERVAL="${DISK_CHECK_INTERVAL:-60}"
+DISK_WARN_PCT="${DISK_WARN_PCT:-80}"
+DISK_EMERGENCY_PCT="${DISK_EMERGENCY_PCT:-92}"
+DISK_MIN_FREE_GB="${DISK_MIN_FREE_GB:-20}"
+DISK_INODE_WARN_PCT="${DISK_INODE_WARN_PCT:-80}"
+DISK_INODE_EMERGENCY_PCT="${DISK_INODE_EMERGENCY_PCT:-90}"
+DISK_PRUNE_COOLDOWN_S="${DISK_PRUNE_COOLDOWN_S:-300}"
+DISK_BUILD_CACHE_UNTIL="${DISK_BUILD_CACHE_UNTIL:-12h}"
+WATCHDOG_AGGRESSIVE_IMAGE_PRUNE="${WATCHDOG_AGGRESSIVE_IMAGE_PRUNE:-0}"
+WATCHDOG_PRUNE_TIMEOUT="${WATCHDOG_PRUNE_TIMEOUT:-120}"
+POOL_STOP_ON_DISK_EMERGENCY="${POOL_STOP_ON_DISK_EMERGENCY:-1}"
+POOL_STOP_COOLDOWN_S="${POOL_STOP_COOLDOWN_S:-300}"
+
 LOG_PREFIX="[docker-watchdog]"
 
 # ── 自身防 OOM ────────────────────────────────────────────────────────
@@ -60,6 +74,8 @@ echo -900 > /proc/self/oom_score_adj 2>/dev/null || true
 # ── 状态 ──────────────────────────────────────────────────────────────
 LAST_EMERGENCY_TS=0
 LAST_DEEP_PROBE_TS=0
+LAST_DISK_PRUNE_TS=0
+LAST_POOL_STOP_TS=0
 
 # ── namespace 检测 ────────────────────────────────────────────────────
 HOST_PID_NS=0
@@ -317,6 +333,28 @@ except Exception:
     return 0
 }
 
+stop_pool_server_for_disk_pressure() {
+    [ "${POOL_STOP_ON_DISK_EMERGENCY}" = "1" ] || return 0
+    local now pids
+    now=$(date +%s)
+    if [ $((now - LAST_POOL_STOP_TS)) -lt "${POOL_STOP_COOLDOWN_S}" ]; then
+        log "DISK: pool_server protective stop suppressed by cooldown"
+        return 0
+    fi
+    LAST_POOL_STOP_TS="$now"
+
+    pids=$(pgrep -f "terminal-rl.remote.pool_server|remote.pool_server" 2>/dev/null || true)
+    if [ -z "$pids" ]; then
+        log "DISK: pool_server already stopped or not found"
+        return 0
+    fi
+
+    log "DISK: protective stop of pool_server due to persistent Docker data-root pressure: pid(s) ${pids}"
+    echo "$pids" | xargs -r kill 2>/dev/null || true
+    sleep 5
+    echo "$pids" | xargs -r kill -9 2>/dev/null || true
+}
+
 # ── stopped 容器清理 ─────────────────────────────────────────────────
 cleanup_stopped() {
     local stopped
@@ -329,6 +367,97 @@ cleanup_stopped() {
     dn=$(docker network ls --filter "dangling=true" -q 2>/dev/null | wc -l)
     if [ "${dn}" -gt 0 ]; then
         timeout 20 docker network prune -f >/dev/null 2>&1 || true
+    fi
+}
+
+# ── Docker data-root 磁盘压力监控 ─────────────────────────────────────
+# 不调用 docker system df：在 image/cache 很多或 dockerd 元数据锁竞争时它会卡很久。
+# 这里只用 df 快速判断 /data 是否接近爆盘，再做带 timeout 的渐进清理。
+docker_disk_stats() {
+    local line used avail inode_line inode_used
+    line=$(df -P -BG "${DOCKER_DATA_ROOT}" 2>/dev/null | awk 'NR==2 {print $5, $4}')
+    [ -n "$line" ] || return 1
+    used="${line% *}"
+    avail="${line#* }"
+    used="${used%\%}"
+    avail="${avail%G}"
+    inode_line=$(df -Pi "${DOCKER_DATA_ROOT}" 2>/dev/null | awk 'NR==2 {print $5}')
+    inode_used="${inode_line%\%}"
+    [ -n "$used" ] && [ -n "$avail" ] && [ -n "$inode_used" ] || return 1
+    echo "${used} ${avail} ${inode_used}"
+}
+
+disk_prune_light() {
+    log "DISK: light cleanup: stopped containers + networks + build cache older than ${DISK_BUILD_CACHE_UNTIL}"
+    timeout 30 docker container prune -f --filter "until=2m" >/dev/null 2>&1 || true
+    timeout 30 docker network prune -f >/dev/null 2>&1 || true
+    timeout "${WATCHDOG_PRUNE_TIMEOUT}" docker builder prune -af --filter "until=${DISK_BUILD_CACHE_UNTIL}" >/dev/null 2>&1 || true
+    timeout 60 docker image prune -f >/dev/null 2>&1 || true
+}
+
+disk_prune_emergency() {
+    local reason="$1"
+    emergency_pressure_relief "Docker data-root disk pressure: ${reason}"
+    disk_prune_light
+    if [ "${WATCHDOG_AGGRESSIVE_IMAGE_PRUNE}" = "1" ]; then
+        log "DISK: WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=1, pruning all unused images"
+        timeout "${WATCHDOG_PRUNE_TIMEOUT}" docker image prune -af >/dev/null 2>&1 || true
+    else
+        log "DISK: aggressive unused-image prune disabled; set WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=1 to enable"
+    fi
+
+    local stats used_pct avail_gb inode_pct
+    stats=$(docker_disk_stats 2>/dev/null || true)
+    if [ -z "$stats" ]; then
+        log "DISK: cannot read stats after emergency cleanup; stopping pool_server defensively"
+        stop_pool_server_for_disk_pressure
+        return 0
+    fi
+    used_pct=$(echo "$stats" | awk '{print $1}')
+    avail_gb=$(echo "$stats" | awk '{print $2}')
+    inode_pct=$(echo "$stats" | awk '{print $3}')
+    if [ "${used_pct}" -ge "${DISK_EMERGENCY_PCT}" ] 2>/dev/null \
+       || [ "${avail_gb}" -le "${DISK_MIN_FREE_GB}" ] 2>/dev/null \
+       || [ "${inode_pct}" -ge "${DISK_INODE_EMERGENCY_PCT}" ] 2>/dev/null; then
+        log "DISK: pressure persists after cleanup (${used_pct}% used, ${avail_gb}GB free, inode ${inode_pct}%); stopping pool_server"
+        stop_pool_server_for_disk_pressure
+    fi
+}
+
+monitor_docker_disk() {
+    local stats used_pct avail_gb inode_pct now
+    stats=$(docker_disk_stats) || {
+        log "WARN: cannot read disk stats for ${DOCKER_DATA_ROOT}"
+        return 0
+    }
+    used_pct=$(echo "$stats" | awk '{print $1}')
+    avail_gb=$(echo "$stats" | awk '{print $2}')
+    inode_pct=$(echo "$stats" | awk '{print $3}')
+
+    if [ "${used_pct}" -ge "${DISK_EMERGENCY_PCT}" ] 2>/dev/null \
+       || [ "${avail_gb}" -le "${DISK_MIN_FREE_GB}" ] 2>/dev/null \
+       || [ "${inode_pct}" -ge "${DISK_INODE_EMERGENCY_PCT}" ] 2>/dev/null; then
+        now=$(date +%s)
+        if [ $((now - LAST_DISK_PRUNE_TS)) -lt "${DISK_PRUNE_COOLDOWN_S}" ]; then
+            log "DISK: emergency condition persists (${used_pct}% used, ${avail_gb}GB free, inode ${inode_pct}%), cleanup cooldown active"
+            stop_pool_server_for_disk_pressure
+            return 0
+        fi
+        LAST_DISK_PRUNE_TS="$now"
+        disk_prune_emergency "${used_pct}% used, ${avail_gb}GB free, inode ${inode_pct}%"
+        return 0
+    fi
+
+    if [ "${used_pct}" -ge "${DISK_WARN_PCT}" ] 2>/dev/null \
+       || [ "${inode_pct}" -ge "${DISK_INODE_WARN_PCT}" ] 2>/dev/null; then
+        now=$(date +%s)
+        if [ $((now - LAST_DISK_PRUNE_TS)) -lt "${DISK_PRUNE_COOLDOWN_S}" ]; then
+            log "DISK: warn ${used_pct}% used, ${avail_gb}GB free, inode ${inode_pct}%; cleanup cooldown active"
+            return 0
+        fi
+        LAST_DISK_PRUNE_TS="$now"
+        log "DISK: warn ${used_pct}% used, ${avail_gb}GB free, inode ${inode_pct}%"
+        disk_prune_light
     fi
 }
 
@@ -403,6 +532,11 @@ restart_docker() {
     fi
 
     # 4) 启动 dockerd（直接 nohup，不走 systemd）
+    if [ -f "${PROXY_ENV_FILE}" ]; then
+        # shellcheck disable=SC1090
+        set -a; . "${PROXY_ENV_FILE}"; set +a
+        log "Loaded proxy env from ${PROXY_ENV_FILE} before dockerd restart"
+    fi
     nohup dockerd --containerd=/run/containerd/containerd.sock \
         > /tmp/dockerd_watchdog_restart.log 2>&1 &
     local pid=$!
@@ -432,10 +566,13 @@ log "  MAX_RUNNING=${MAX_RUNNING_CONTAINERS}  HARD_KILL=${HARD_KILL_THRESHOLD}"
 log "  health every ${HEALTH_CHECK_INTERVAL}s; cgroup every ${CGROUP_MONITOR_INTERVAL}s"
 log "  pool every ${POOL_CHECK_INTERVAL}s; deep probe every ${DEEP_PROBE_INTERVAL}s"
 log "  heartbeat every ${HEARTBEAT_INTERVAL}s"
+log "  disk every ${DISK_CHECK_INTERVAL}s; warn=${DISK_WARN_PCT}% emerg=${DISK_EMERGENCY_PCT}% min_free=${DISK_MIN_FREE_GB}GB inode_warn=${DISK_INODE_WARN_PCT}% inode_emerg=${DISK_INODE_EMERGENCY_PCT}%"
+log "  pool_stop_on_disk_emergency=${POOL_STOP_ON_DISK_EMERGENCY}"
 log "  PIDs warn=${PIDS_WARN_PCT}% emerg=${PIDS_EMERGENCY_PCT}%"
 log "  Mem  warn=${MEM_WARN_PCT}% emerg=${MEM_EMERGENCY_PCT}%"
 log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGEX}"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
+log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_env_file=${PROXY_ENV_FILE}"
 log "  log_file=${LOG_FILE}  log_max=${LOG_MAX_BYTES}"
 
 detect_pid_namespace
@@ -453,6 +590,7 @@ log "========================================"
 LAST_CLEANUP=0
 LAST_CGROUP_CHECK=0
 LAST_POOL_CHECK=0
+LAST_DISK_CHECK=0
 LAST_HEARTBEAT_TS=0
 HEALTH_FAILS=0
 
@@ -505,7 +643,13 @@ while true; do
         LAST_CLEANUP="$NOW"
     fi
 
-    # 6) 低频心跳（默认 10 min）—— 复用上面已采集的指标，不发起新的 docker / curl
+    # 6) Docker data-root 磁盘压力监控
+    if [ $((NOW - LAST_DISK_CHECK)) -ge "${DISK_CHECK_INTERVAL}" ]; then
+        monitor_docker_disk
+        LAST_DISK_CHECK="$NOW"
+    fi
+
+    # 7) 低频心跳（默认 10 min）—— 复用上面已采集的指标，不发起新的 docker / curl
     if [ $((NOW - LAST_HEARTBEAT_TS)) -ge "${HEARTBEAT_INTERVAL}" ]; then
         log "OK: dockerd alive | pool active=${LAST_POOL_ACTIVE} pending_closes=${LAST_POOL_PENDING} | bridges=${LAST_BRIDGE_NETS} | task_containers=${LAST_RUNNING_TASKS}"
         LAST_HEARTBEAT_TS="$NOW"

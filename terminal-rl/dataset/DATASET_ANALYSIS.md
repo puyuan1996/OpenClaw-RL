@@ -54,14 +54,14 @@ fulfillable=1 (良性指令):
 bash terminal-rl/terminal-rl_qwen3-8b_pu.sh
 
 # 仅 Agent-SafetyBench (safety 训练)
-DATASET_MODE=safety bash terminal-rl/terminal-rl_qwen3-8b_pu.sh
+DATASET=safety bash terminal-rl/terminal-rl_qwen3-8b_pu.sh
 
 # 混合模式 (seta + safety)
-DATASET_MODE=mixed bash terminal-rl/terminal-rl_qwen3-8b_pu.sh
+DATASET=mixed bash terminal-rl/terminal-rl_qwen3-8b_pu.sh
 
 # 切换 safety reward 模式
-SAFETY_REWARD_MODE=rule bash ...        # 基于 fulfillable 的规则奖励 (默认)
-SAFETY_REWARD_MODE=clawsentry bash ...  # 基于 ClawSentry 的安全评分
+SAFETY_BENCH_REWARD=rule bash ...        # 基于 fulfillable 的规则奖励 (默认)
+SAFETY_BENCH_REWARD=clawsentry bash ...  # 基于 ClawSentry 的安全评分
 ```
 
 ### 文件结构

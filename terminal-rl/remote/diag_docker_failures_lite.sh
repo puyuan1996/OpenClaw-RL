@@ -14,6 +14,9 @@ mkdir -p "${LOG_DIR}"
 
 GPU_LOG="${LOG_DIR}/gpu_run.log"
 SUMMARY="${LOG_DIR}/cpu_diag_summary.txt"
+POOL_HOST="${POOL_HOST:-127.0.0.1}"
+POOL_PORT="${POOL_PORT:-18081}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
 
 echo "[$(date '+%F %T')] diag_lite starting on $(hostname)" | tee "${SUMMARY}"
 
@@ -24,8 +27,8 @@ echo "[$(date '+%F %T')] diag_lite starting on $(hostname)" | tee "${SUMMARY}"
   echo "=== docker info (5s timeout) ==="
   timeout 5 docker info 2>&1 | grep -E "Containers:|Running:|Paused:|Stopped:|Images:|Server Version" | head -10
   echo
-  echo "=== /data ==="
-  df -h /data 2>&1
+  echo "=== ${DOCKER_DATA_ROOT} ==="
+  df -h "${DOCKER_DATA_ROOT}" 2>&1
   echo
   echo "=== currently running container count ==="
   timeout 5 docker ps -q 2>&1 | wc -l
@@ -80,10 +83,10 @@ echo "[2/3] exit-17 ranking -> cpu_diag_exit17_tasks.txt" | tee -a "${SUMMARY}"
   pgrep -a -f "remote.pool_server" 2>&1
   echo
   echo "=== /healthz ==="
-  curl -fsS --max-time 5 http://127.0.0.1:18081/healthz 2>&1
+  curl -fsS --max-time 5 "http://${POOL_HOST}:${POOL_PORT}/healthz" 2>&1
   echo
   echo "=== /status (active leases) ==="
-  curl -fsS --max-time 5 http://127.0.0.1:18081/status 2>&1 | python3 -m json.tool 2>&1 | head -50
+  curl -fsS --max-time 5 "http://${POOL_HOST}:${POOL_PORT}/status" 2>&1 | python3 -m json.tool 2>&1 | head -50
 } > "${LOG_DIR}/cpu_diag_pool_health.txt"
 echo "[3/3] pool_server -> cpu_diag_pool_health.txt" | tee -a "${SUMMARY}"
 
@@ -104,7 +107,7 @@ echo "[3/3] pool_server -> cpu_diag_pool_health.txt" | tee -a "${SUMMARY}"
     | tail -1
   echo
   echo "--- docker state ---"
-  grep -E "Containers:|Running:|/data" "${LOG_DIR}/cpu_diag_dockerd_state.txt" | head -5
+  grep -E "Containers:|Running:|${DOCKER_DATA_ROOT}" "${LOG_DIR}/cpu_diag_dockerd_state.txt" | head -5
   echo
   echo "--- pool_server ---"
   grep -E '"ok"|18081' "${LOG_DIR}/cpu_diag_pool_health.txt" | head -3

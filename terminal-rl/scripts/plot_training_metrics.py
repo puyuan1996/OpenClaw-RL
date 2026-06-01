@@ -33,6 +33,7 @@ from typing import Any
 ROLLOUT_RE = re.compile(r"data\.py:\d+ - rollout (\d+): (\{.+\})")
 TRAIN_RE = re.compile(r"model\.py:\d+ - step (\d+): (\{.+\})")
 PERF_RE = re.compile(r"rollout\.py:\d+ - perf (\d+): (\{.+\})")
+TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 TRAJ_RE = re.compile(
     r"\[task=(\S+) uid=(\S+) group_idx=(\d+) sample_idx=(\d+)\] "
     r"Rollout finished: status=(\S+) turns=(\d+) parse_errors=(\d+)"
@@ -46,6 +47,7 @@ RESET500_RE = re.compile(
 def _parse_log(log_path: Path) -> dict[str, Any]:
     rollout_metrics: dict[int, dict] = {}
     train_metrics: dict[int, dict] = {}
+    train_points: list[dict[str, Any]] = []
     perf_metrics: dict[int, dict] = {}
     clawsentry_errs: Counter = Counter()
     status_counts: Counter = Counter()
@@ -55,7 +57,7 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
 
     print(f"[+] parsing {log_path}")
     with log_path.open(errors="replace") as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             m = ROLLOUT_RE.search(line)
             if m:
                 try:
@@ -66,7 +68,17 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
             m = TRAIN_RE.search(line)
             if m:
                 try:
-                    train_metrics[int(m.group(1))] = ast.literal_eval(m.group(2))
+                    step_label = int(m.group(1))
+                    payload = ast.literal_eval(m.group(2))
+                    train_metrics[step_label] = payload
+                    point = dict(payload)
+                    point["_log_index"] = len(train_points)
+                    point["_log_line"] = line_no
+                    point["_step_label"] = step_label
+                    ts = TIMESTAMP_RE.search(line)
+                    if ts:
+                        point["_timestamp"] = ts.group(1)
+                    train_points.append(point)
                 except Exception:
                     pass
                 continue
@@ -96,6 +108,7 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
     return dict(
         rollout_metrics=rollout_metrics,
         train_metrics=train_metrics,
+        train_points=train_points,
         perf_metrics=perf_metrics,
         clawsentry_errs=clawsentry_errs,
         status_counts=status_counts,
@@ -137,6 +150,79 @@ def _get_series(d: dict, ids: list[int], key: str) -> list[Any]:
     return [d[i].get(key) for i in ids]
 
 
+def _get_points_series(points: list[dict[str, Any]], key: str) -> list[Any]:
+    return [p.get(key) for p in points]
+
+
+def _train_axis(parsed: dict[str, Any]) -> tuple[list[int], list[dict[str, Any]], str]:
+    """Return a stable train metric axis.
+
+    In distributed Ray logs, the printed ``model.py - step N`` label can be
+    duplicated, delayed, or non-monotonic. Plot train metrics in log order and
+    keep the printed step label only as diagnostic metadata.
+    """
+    train_points = parsed.get("train_points") or []
+    if train_points:
+        diag = _train_step_diagnostics(parsed)
+        if diag["step_label_axis_reliable"]:
+            return [int(p["_step_label"]) for p in train_points], train_points, "train step"
+        return [int(p["_log_index"]) for p in train_points], train_points, "train log index"
+
+    train_metrics = parsed["train_metrics"]
+    t_ids = sorted(train_metrics)
+    return t_ids, [train_metrics[i] for i in t_ids], "train step label"
+
+
+def _train_step_diagnostics(parsed: dict[str, Any]) -> dict[str, Any]:
+    train_points = parsed.get("train_points") or []
+    if not train_points:
+        t_ids = sorted(parsed["train_metrics"])
+        return {
+            "n_train_logs": len(t_ids),
+            "n_unique_train_step_labels": len(t_ids),
+            "max_train_step_label": int(max(t_ids)) if t_ids else None,
+            "duplicate_train_step_labels": 0,
+            "non_monotonic_step_label_events": 0,
+            "step_label_axis_reliable": True,
+        }
+
+    labels = [int(p["_step_label"]) for p in train_points]
+    counts = Counter(labels)
+    duplicate_total = sum(v - 1 for v in counts.values() if v > 1)
+    non_monotonic = sum(
+        1 for prev, cur in zip(labels, labels[1:]) if cur <= prev
+    )
+    jump_events = sum(
+        1 for prev, cur in zip(labels, labels[1:]) if cur > prev + 1
+    )
+    top_duplicates = [
+        {"step_label": int(step), "count": int(count)}
+        for step, count in counts.most_common(10)
+        if count > 1
+    ]
+    high_sparse = {
+        "0_1999": sum(1 for s in labels if 0 <= s <= 1999),
+        "2000_2499": sum(1 for s in labels if 2000 <= s <= 2499),
+        "2500_2999": sum(1 for s in labels if 2500 <= s <= 2999),
+        "3000_3499": sum(1 for s in labels if 3000 <= s <= 3499),
+        "3500_3999": sum(1 for s in labels if 3500 <= s <= 3999),
+    }
+    axis_reliable = duplicate_total == 0 and non_monotonic == 0
+    return {
+        "n_train_logs": len(labels),
+        "n_unique_train_step_labels": len(counts),
+        "min_train_step_label": int(min(labels)) if labels else None,
+        "max_train_step_label": int(max(labels)) if labels else None,
+        "duplicate_train_step_labels": int(duplicate_total),
+        "non_monotonic_step_label_events": int(non_monotonic),
+        "forward_jump_step_label_events": int(jump_events),
+        "top_duplicate_step_labels": top_duplicates,
+        "step_label_ranges": high_sparse,
+        "step_label_axis_reliable": axis_reliable,
+        "plot_train_axis": "train_log_index" if not axis_reliable else "step_label",
+    }
+
+
 def _filter_positive(xs: list[int], ys: list[Any]) -> tuple[list[int], list[float]]:
     out_x: list[int] = []
     out_y: list[float] = []
@@ -166,13 +252,12 @@ def _plot_all(
     figs_dir.mkdir(parents=True, exist_ok=True)
 
     rollout_metrics = parsed["rollout_metrics"]
-    train_metrics = parsed["train_metrics"]
     perf_metrics = parsed["perf_metrics"]
     status_counts = parsed["status_counts"]
     turn_counts = parsed["turn_counts"]
 
     r_ids = sorted(rollout_metrics)
-    t_ids = sorted(train_metrics)
+    t_ids, train_points, train_axis_label = _train_axis(parsed)
     p_ids = sorted(perf_metrics)
 
     raw_rew = _get_series(rollout_metrics, r_ids, "rollout/raw_reward")
@@ -180,10 +265,10 @@ def _plot_all(
     trunc = _get_series(rollout_metrics, r_ids, "rollout/truncated")
     resp_len = _get_series(rollout_metrics, r_ids, "rollout/response_lengths")
 
-    pg_loss = _get_series(train_metrics, t_ids, "train/pg_loss")
-    kl_loss = _get_series(train_metrics, t_ids, "train/kl_loss")
-    ent = _get_series(train_metrics, t_ids, "train/entropy_loss")
-    gnorm = _get_series(train_metrics, t_ids, "train/grad_norm")
+    pg_loss = _get_points_series(train_points, "train/pg_loss")
+    kl_loss = _get_points_series(train_points, "train/kl_loss")
+    ent = _get_points_series(train_points, "train/entropy_loss")
+    gnorm = _get_points_series(train_points, "train/grad_norm")
 
     rl_med = _get_series(perf_metrics, p_ids, "rollout/response_len/median") if p_ids else []
     rl_max = _get_series(perf_metrics, p_ids, "rollout/response_len/max") if p_ids else []
@@ -246,7 +331,7 @@ def _plot_all(
     ax.plot(t_ids, pg_loss, ".-", label="pg_loss")
     ax.plot(t_ids, kl_loss, ".-", alpha=0.7, label="kl_loss")
     ax.axhline(0, color="gray", ls=":", lw=0.8)
-    ax.set_xlabel("train step")
+    ax.set_xlabel(train_axis_label)
     ax.set_ylabel("loss")
     ax.legend()
     ax.grid(alpha=0.3)
@@ -257,7 +342,7 @@ def _plot_all(
     print("[+] plotting grad_norm.png")
     fig, ax = plt.subplots(1, 1, figsize=(11, 4))
     ax.plot(t_ids, gnorm, ".-", label="grad_norm")
-    ax.set_xlabel("train step")
+    ax.set_xlabel(train_axis_label)
     ax.set_ylabel("grad_norm")
     ax.legend()
     ax.grid(alpha=0.3)
@@ -269,7 +354,7 @@ def _plot_all(
     fig, ax = plt.subplots(1, 1, figsize=(11, 4))
     ax.plot(t_ids, ent, ".-", label="entropy_loss")
     ax.plot(t_ids, kl_loss, ".-", alpha=0.7, label="kl_loss")
-    ax.set_xlabel("train step")
+    ax.set_xlabel(train_axis_label)
     ax.set_ylabel("value")
     ax.legend()
     ax.grid(alpha=0.3)
@@ -334,6 +419,7 @@ def _build_summary(
 ) -> dict[str, Any]:
     rollout_metrics = parsed["rollout_metrics"]
     train_metrics = parsed["train_metrics"]
+    train_diag = _train_step_diagnostics(parsed)
     clawsentry_errs = parsed["clawsentry_errs"]
     status_counts = parsed["status_counts"]
     turn_counts = parsed["turn_counts"]
@@ -341,17 +427,17 @@ def _build_summary(
     reset500_per_min = parsed["reset500_per_min"]
 
     r_ids = sorted(rollout_metrics)
-    t_ids = sorted(train_metrics)
+    t_ids, train_points, train_axis_label = _train_axis(parsed)
 
     raw_rew = _get_series(rollout_metrics, r_ids, "rollout/raw_reward")
     rew = _get_series(rollout_metrics, r_ids, "rollout/rewards")
     trunc = _get_series(rollout_metrics, r_ids, "rollout/truncated")
     resp_len = _get_series(rollout_metrics, r_ids, "rollout/response_lengths")
-    pg_loss = _get_series(train_metrics, t_ids, "train/pg_loss")
-    kl_loss = _get_series(train_metrics, t_ids, "train/kl_loss")
-    ent = _get_series(train_metrics, t_ids, "train/entropy_loss")
-    gnorm = _get_series(train_metrics, t_ids, "train/grad_norm")
-    lr = _get_series(train_metrics, t_ids, "train/lr-pg_0")
+    pg_loss = _get_points_series(train_points, "train/pg_loss")
+    kl_loss = _get_points_series(train_points, "train/kl_loss")
+    ent = _get_points_series(train_points, "train/entropy_loss")
+    gnorm = _get_points_series(train_points, "train/grad_norm")
+    lr = _get_points_series(train_points, "train/lr-pg_0")
 
     trunc_nums = [t for t in trunc if isinstance(t, (int, float))]
     trunc_mean = sum(trunc_nums) / len(trunc_nums) if trunc_nums else None
@@ -370,6 +456,9 @@ def _build_summary(
         "max_rollout_id": int(max(r_ids)) if r_ids else None,
         "n_train_steps": len(t_ids),
         "max_train_step": int(max(t_ids)) if t_ids else None,
+        "train_axis": train_axis_label,
+        "max_train_step_label": train_diag["max_train_step_label"],
+        "train_step_diagnostics": train_diag,
         "collapse_rollout": collapse,
         "trajectories_logged": sum(status_counts.values()),
         "status_counts": dict(status_counts),
@@ -423,6 +512,7 @@ def plot_run(
     parsed = _parse_log(log_file)
     rollout_metrics = parsed["rollout_metrics"]
     train_metrics = parsed["train_metrics"]
+    train_diag = _train_step_diagnostics(parsed)
 
     if not rollout_metrics and not train_metrics:
         print("[!] no rollouts or train steps parsed — empty log?")
@@ -433,9 +523,15 @@ def plot_run(
         f"(max id: {max(rollout_metrics) if rollout_metrics else 'n/a'})"
     )
     print(
-        f"  train steps: {len(train_metrics)} "
-        f"(max id: {max(train_metrics) if train_metrics else 'n/a'})"
+        f"  train logs: {train_diag['n_train_logs']} "
+        f"(unique step labels: {train_diag['n_unique_train_step_labels']}, "
+        f"max label: {train_diag['max_train_step_label']})"
     )
+    if not train_diag["step_label_axis_reliable"]:
+        print(
+            "  [!] step labels are non-monotonic/duplicated; "
+            "plotting train curves by log order"
+        )
     print(f"  trajectories logged: {sum(parsed['status_counts'].values())}")
     print(f"  status: {dict(parsed['status_counts'])}")
     print(f"  ClawSentry errors: {sum(parsed['clawsentry_errs'].values())}")
