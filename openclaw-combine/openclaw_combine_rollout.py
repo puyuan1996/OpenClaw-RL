@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import os
 import queue
 import threading
 import time
@@ -138,6 +139,17 @@ def generate_rollout_openclaw_combine(args, rollout_id, data_buffer, evaluation=
     worker.resume_submission()
     completed_samples = run(_drain_output_queue(args, worker))
     worker.pause_submission()
+
+    train_epochs = int(os.getenv("TRAIN_EPOCHS", "1"))
+    if train_epochs > 1:
+        original = list(completed_samples)
+        for _ in range(train_epochs - 1):
+            completed_samples.extend(original)
+        print(
+            f"[OpenClawCombineWorker] duplicated {len(original)} groups x{train_epochs} "
+            f"= {len(completed_samples)} groups for training",
+            flush=True,
+        )
 
     extra_metrics = None
     eval_scores = worker._server.drain_eval_scores()

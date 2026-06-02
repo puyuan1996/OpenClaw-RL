@@ -17,11 +17,24 @@ export PYTHONFAULTHANDLER=1
 NUM_GPUS=${NUM_GPUS:-8}
 ACTOR_GPUS=${ACTOR_GPUS:-4}
 ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
-PRM_GPUS=${PRM_GPUS:-2}
 
-if (( ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS > NUM_GPUS )); then
-    echo "ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS must be <= NUM_GPUS"
-    echo "ACTOR_GPUS=${ACTOR_GPUS}, ROLLOUT_GPUS=${ROLLOUT_GPUS}, PRM_GPUS=${PRM_GPUS}, NUM_GPUS=${NUM_GPUS}"
+# OPD teacher source decides GPU layout for PRM:
+#   megatron  (default): 1 GPU PRM SGLang + 1 GPU Megatron teacher = "1+1"
+#   inference:           2 GPU PRM SGLang + 0 GPU Megatron teacher
+OPD_SRC="${OPENCLAW_COMBINE_OPD_TEACHER_SOURCE:-megatron}"
+if [ "${OPD_SRC}" = "inference" ]; then
+    PRM_GPUS=${PRM_GPUS:-2}
+    PRM_NUM_GPUS_PER_ENGINE=${PRM_NUM_GPUS_PER_ENGINE:-2}
+    PRM_TEACHER_GPUS=${PRM_TEACHER_GPUS:-0}
+else
+    PRM_GPUS=${PRM_GPUS:-1}
+    PRM_NUM_GPUS_PER_ENGINE=${PRM_NUM_GPUS_PER_ENGINE:-1}
+    PRM_TEACHER_GPUS=${PRM_TEACHER_GPUS:-1}
+fi
+
+if (( ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS + PRM_TEACHER_GPUS > NUM_GPUS )); then
+    echo "ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS + PRM_TEACHER_GPUS must be <= NUM_GPUS"
+    echo "ACTOR_GPUS=${ACTOR_GPUS}, ROLLOUT_GPUS=${ROLLOUT_GPUS}, PRM_GPUS=${PRM_GPUS}, PRM_TEACHER_GPUS=${PRM_TEACHER_GPUS}, NUM_GPUS=${NUM_GPUS}"
     exit 1
 fi
 
@@ -31,13 +44,15 @@ export RAY_health_check_timeout_ms=30000
 export RAY_num_heartbeats_timeout=60
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-SLIME_ROOT="$(cd -- "${SCRIPT_DIR}/../slime" &>/dev/null && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+SLIME_ROOT="${REPO_ROOT}/slime"
 source "${SLIME_ROOT}/scripts/models/qwen3-4B.sh"
 
 HF_CKPT=${HF_CKPT:-/data_storage/wyj/systems/huggingface/hub/Qwen3-4B-Thinking-2507}
 REF_LOAD=${REF_LOAD:-${HF_CKPT}}
 SAVE_CKPT=${SAVE_CKPT:-/data_storage/wyj/OpenClaw-RL/ckpt/qwen3-4b-openclaw-combine}
 PRM_MODEL_PATH=${PRM_MODEL_PATH:-/data_storage/wyj/systems/huggingface/hub/Qwen3-4B-Thinking-2507}
+PRM_TEACHER_LOAD=${PRM_TEACHER_LOAD:-${PRM_MODEL_PATH}}
 
 export SGLANG_API_KEY="${SGLANG_API_KEY}"
 export SERVED_MODEL_NAME="qwen3-4b"
@@ -54,6 +69,13 @@ export PRM_M="${PRM_M:-1}"
 export OPENCLAW_OPD_TEACHER_LP_MAX_CONCURRENCY="${OPENCLAW_OPD_TEACHER_LP_MAX_CONCURRENCY:-1}"
 export OPENCLAW_COMBINE_W_RL="${OPENCLAW_COMBINE_W_RL:-1.0}"
 export OPENCLAW_COMBINE_W_OPD="${OPENCLAW_COMBINE_W_OPD:-1.0}"
+export TRAIN_EPOCHS="${TRAIN_EPOCHS:-1}"
+
+# OPD teacher source (driven by OPD_SRC set above from GPU layout logic):
+#   megatron (default) = PRM teacher log-probs computed by Megatron via --prm-teacher-load.
+#                        Same code path as student, no numerical mismatch.
+#   inference          = teacher_log_probs from PRM SGLang inference engine.
+export OPENCLAW_COMBINE_OPD_TEACHER_SOURCE="${OPD_SRC}"
 
 CKPT_ARGS=(
    --megatron-to-hf-mode bridge
@@ -63,6 +85,12 @@ CKPT_ARGS=(
    --save-interval 100
    --rotary-base 5000000
 )
+if [ "${PRM_TEACHER_GPUS}" -gt 0 ]; then
+    CKPT_ARGS+=(
+        --prm-teacher-load "${PRM_TEACHER_LOAD}"
+        --prm-teacher-num-gpus "${PRM_TEACHER_GPUS}"
+    )
+fi
 
 ROLLOUT_ARGS=(
    --disable-rollout-global-dataset
@@ -134,7 +162,7 @@ SGLANG_ARGS=(
 PRM_ARGS=(
    --prm-enable
    --prm-num-gpus "${PRM_GPUS}"
-   --prm-num-gpus-per-engine 2
+   --prm-num-gpus-per-engine "${PRM_NUM_GPUS_PER_ENGINE}"
    --prm-model-path "${PRM_MODEL_PATH}"
    --prm-m "${PRM_M}"
    --prm-temperature "${PRM_TEMPERATURE:-0.6}"
@@ -176,11 +204,13 @@ ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --d
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/data_storage/wyj/OpenClaw-RL/Megatron-LM/:${SCRIPT_DIR}:${SCRIPT_DIR}/../openclaw-opd:${SLIME_ROOT}\",
+    \"PYTHONPATH\": \"${REPO_ROOT}/Megatron-LM:${SCRIPT_DIR}:${REPO_ROOT}/openclaw-opd:${SLIME_ROOT}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"OPENCLAW_EVAL_MODE\": \"${OPENCLAW_EVAL_MODE}\",
     \"OPENCLAW_COMBINE_W_RL\": \"${OPENCLAW_COMBINE_W_RL}\",
-    \"OPENCLAW_COMBINE_W_OPD\": \"${OPENCLAW_COMBINE_W_OPD}\"
+    \"OPENCLAW_COMBINE_W_OPD\": \"${OPENCLAW_COMBINE_W_OPD}\",
+    \"OPENCLAW_COMBINE_OPD_TEACHER_SOURCE\": \"${OPENCLAW_COMBINE_OPD_TEACHER_SOURCE}\",
+    \"TRAIN_EPOCHS\": \"${TRAIN_EPOCHS}\"
   }
 }"
 

@@ -104,9 +104,9 @@ mkdir -p "${GUI_RESULT_DIR}"
 # Secrets (AK/SK) should be exported in shell before running this script.
 # ---------------------------
 export VOLCENGINE_REGION=${VOLCENGINE_REGION:-"cn-beijing"}
-export VOLCENGINE_IMAGE_ID=${VOLCENGINE_IMAGE_ID:-"image-ye7p6rwcel9q7e1x1evg"}
-export VOLCENGINE_SUBNET_ID=${VOLCENGINE_SUBNET_ID:-"subnet-mjddx72qnklc5smt1b752ytw"}
-export VOLCENGINE_SECURITY_GROUP_ID=${VOLCENGINE_SECURITY_GROUP_ID:-"sg-3hirj05a13v9c3nkipjb1mhm5"}
+export VOLCENGINE_IMAGE_ID=${VOLCENGINE_IMAGE_ID:-"image-id"}
+export VOLCENGINE_SUBNET_ID=${VOLCENGINE_SUBNET_ID:-"subnet-id"}
+export VOLCENGINE_SECURITY_GROUP_ID=${VOLCENGINE_SECURITY_GROUP_ID:-"sg-id"}
 export VOLCENGINE_ZONE_ID=${VOLCENGINE_ZONE_ID:-"cn-beijing-a"}
 export VOLCENGINE_DEFAULT_PASSWORD=${VOLCENGINE_DEFAULT_PASSWORD:-"WWbbb180314"}
 # Lower interval speeds up create/delete under moderate throttling.

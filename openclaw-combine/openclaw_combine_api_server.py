@@ -64,6 +64,12 @@ class OpenClawCombineAPIServer(OpenClawOPDAPIServer):
         sample.rollout_log_probs = turn_data["response_logprobs"]
         sample.teacher_log_probs = torch.tensor(teacher_log_probs, dtype=torch.float32)
 
+        teacher_tokens = opd_result.get("teacher_tokens")
+        if teacher_tokens is not None:
+            sample.teacher_tokens = teacher_tokens
+        else:
+            sample.teacher_tokens = prompt_ids + response_ids
+
         if self._use_topk_distillation:
             K = self.distill_topk
             topk_lp = opd_result.get("teacher_topk_log_probs") or []
@@ -122,6 +128,7 @@ class OpenClawCombineAPIServer(OpenClawOPDAPIServer):
         sample.loss_mask = [1] * len(response_ids)
         sample.rollout_log_probs = response_logprobs
         sample.teacher_log_probs = torch.tensor(response_logprobs, dtype=torch.float32)
+        sample.teacher_tokens = prompt_ids + response_ids
         sample.status = Sample.Status.COMPLETED
         sample.index = next(self._index_counter)
         sample.group_index = next(self._group_counter)

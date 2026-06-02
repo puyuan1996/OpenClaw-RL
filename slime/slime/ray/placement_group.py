@@ -81,6 +81,9 @@ def create_placement_groups(args):
 
     num_gpus = 0
     prm_offset = None
+    prm_teacher_offset = None
+    use_prm_teacher = getattr(args, "prm_teacher_load", None) is not None and getattr(args, "prm_teacher_num_gpus", 0) > 0
+
     if args.debug_train_only:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
         rollout_offset = 0
@@ -106,6 +109,9 @@ def create_placement_groups(args):
         if args.prm_enable and args.prm_num_gpus > 0:
             prm_offset = rollout_offset + args.rollout_num_gpus
             num_gpus += args.prm_num_gpus
+        if use_prm_teacher:
+            prm_teacher_offset = num_gpus
+            num_gpus += args.prm_teacher_num_gpus
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
@@ -117,6 +123,9 @@ def create_placement_groups(args):
         prm_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[prm_offset : prm_offset + args.prm_num_gpus]
         rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:prm_offset]
         rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:prm_offset]
+    if prm_teacher_offset is not None:
+        prm_teacher_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[prm_teacher_offset : prm_teacher_offset + args.prm_teacher_num_gpus]
+        prm_teacher_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[prm_teacher_offset : prm_teacher_offset + args.prm_teacher_num_gpus]
     if args.use_critic:
         critic_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[critic_offset:]
         critic_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[critic_offset:]
@@ -126,6 +135,7 @@ def create_placement_groups(args):
         "critic": (pg, critic_pg_reordered_bundle_indices, critic_pg_reordered_gpu_ids) if args.use_critic else None,
         "rollout": (pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
         "prm": (pg, prm_pg_reordered_bundle_indices, prm_pg_reordered_gpu_ids) if prm_offset is not None else None,
+        "prm_teacher": (pg, prm_teacher_pg_reordered_bundle_indices, prm_teacher_pg_reordered_gpu_ids) if prm_teacher_offset is not None else None,
     }
 
 
@@ -157,6 +167,17 @@ def create_training_models(args, pgs, rollout_manager):
     else:
         critic_model = None
 
+    prm_teacher_model = None
+    prm_teacher_init_handle = None
+    if pgs.get("prm_teacher") is not None:
+        prm_teacher_model = allocate_train_group(
+            args=args,
+            num_nodes=1,
+            num_gpus_per_node=getattr(args, "prm_teacher_num_gpus", 1),
+            pg=pgs["prm_teacher"],
+        )
+        prm_teacher_init_handle = prm_teacher_model.async_init(args, role="prm_teacher", with_ref=False)
+
     start_rollout_ids = ray.get(
         actor_model.async_init(args, role="actor", with_ref=args.kl_coef != 0 or args.use_kl_loss)
     )
@@ -169,11 +190,14 @@ def create_training_models(args, pgs, rollout_manager):
         ray.get(critic_init_handle)
         actor_model.connect(critic_model)
 
+    if prm_teacher_init_handle is not None:
+        ray.get(prm_teacher_init_handle)
+
     actor_model.set_rollout_manager(rollout_manager)
     if args.rollout_global_dataset:
         ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
-    return actor_model, critic_model
+    return actor_model, critic_model, prm_teacher_model
 
 
 def create_rollout_manager(args, pg, prm_pg=None):
