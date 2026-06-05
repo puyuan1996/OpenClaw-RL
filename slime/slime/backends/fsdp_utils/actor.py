@@ -721,10 +721,16 @@ class FSDPTrainRayActor(TrainRayActor):
             reported_accum.setdefault(k, []).append(v)
 
         if (mbs_id + 1) in grad_accum:
-            # TODO: check if the grad norm is global grad norm.
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
-            # the grad norm used to be of DTensor
-            grad_norm = float(grad_norm)
+            clip_grad = getattr(self.args, "clip_grad", 1.0)
+            if clip_grad is not None and clip_grad > 0:
+                # TODO: check if the grad norm is global grad norm.
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_grad)
+                # the grad norm used to be of DTensor
+                grad_norm = float(grad_norm)
+            else:
+                # LoRA/FSDP smoke runs can set --clip-grad 0 to skip grad norm
+                # clipping while keeping the training/logging path intact.
+                grad_norm = 0.0
 
             self.optimizer.step()
             # Update learning rate
@@ -744,6 +750,8 @@ class FSDPTrainRayActor(TrainRayActor):
                     f"train/{k}": (val.item() if torch.is_tensor(val) else val) for k, val in aggregated.items()
                 }
                 log_dict["train/grad_norm"] = grad_norm
+                if clip_grad is None or clip_grad <= 0:
+                    log_dict["train/clip_grad_enabled"] = 0.0
 
                 # Log learning rate per parameter group; use scheduler's last computed LRs
                 lr_values = self.lr_scheduler.get_last_lr()
