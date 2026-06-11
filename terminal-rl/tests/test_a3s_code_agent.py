@@ -253,7 +253,13 @@ def test_a3s_code_agent_external_tasks_route_to_terminal_env(monkeypatch):
     )
 
     assert env_client.heartbeats == ["lease-1"]
-    assert env_client.calls == [("lease-1", "shell_exec", {"command": "pwd"})]
+    assert env_client.calls == [
+        (
+            "lease-1",
+            "shell_exec",
+            {"command": "pwd", "id": "task-1", "block": True, "timeout": 20},
+        )
+    ]
     assert FakeAgent.last_session.completed_payloads == [
         ("task-1", True, {"output": "tool output", "exit_code": 0}, None)
     ]
@@ -262,7 +268,7 @@ def test_a3s_code_agent_external_tasks_route_to_terminal_env(monkeypatch):
             "tool_call_id": "task-1",
             "tool_name": "shell_exec",
             "sdk_tool_name": "bash",
-            "args": {"command": "pwd"},
+            "args": {"command": "pwd", "id": "task-1", "block": True, "timeout": 20},
             "sdk_args": {"command": "pwd"},
             "result": "tool output",
             "source": "a3s-code-sdk",
@@ -333,8 +339,17 @@ def test_a3s_code_tool_timeout_is_capped_below_turn_timeout(monkeypatch):
 
 def test_a3s_code_tool_mapping_helpers():
     assert a3s_agent_module.A3SCodeAgent._map_tool_call(
-        "bash", {"command": "pwd"}
-    ) == ("shell_exec", {"command": "pwd"})
+        "bash", {"command": "pwd"}, task_id="call-1"
+    ) == (
+        "shell_exec",
+        {"command": "pwd", "id": "call-1", "block": True, "timeout": 20},
+    )
+    assert a3s_agent_module.A3SCodeAgent._map_tool_call(
+        "execute", {"cmd": "pwd"}, task_id="call-2"
+    ) == (
+        "shell_exec",
+        {"command": "pwd", "id": "call-2", "block": True, "timeout": 20},
+    )
     assert a3s_agent_module.A3SCodeAgent._map_tool_call(
         "write", {"path": "x.txt", "content": "hi"}
     ) == ("shell_write_content_to_file", {"file_path": "x.txt", "content": "hi"})

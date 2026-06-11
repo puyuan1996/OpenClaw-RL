@@ -843,7 +843,9 @@ class A3SCodeAgent:
             mapped_args: dict[str, Any] = dict(args)
 
             try:
-                mapped_name, mapped_args = self._map_tool_call(tool_name, args)
+                mapped_name, mapped_args = self._map_tool_call(
+                    tool_name, args, task_id=task_id
+                )
                 output = self._exec_terminal_tool_on_loop(loop, mapped_name, mapped_args)
                 self._complete_external_task(
                     task_id,
@@ -970,7 +972,24 @@ class A3SCodeAgent:
         return await self._env_client.exec_tool(self._lease_id, tool_name, args)
 
     @staticmethod
-    def _map_tool_call(tool_name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _shell_exec_args(
+        command: str,
+        *,
+        task_id: str | None = None,
+        base: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        mapped_args = dict(base or {})
+        mapped_args.pop("cmd", None)
+        mapped_args["command"] = A3SCodeAgent._guard_shell_command(command)
+        mapped_args.setdefault("id", task_id or "a3s-code-tool")
+        mapped_args.setdefault("block", True)
+        mapped_args.setdefault("timeout", 20)
+        return mapped_args
+
+    @staticmethod
+    def _map_tool_call(
+        tool_name: str, args: dict[str, Any], *, task_id: str | None = None
+    ) -> tuple[str, dict[str, Any]]:
         if tool_name in {
             "shell_exec",
             "shell_view",
@@ -978,16 +997,17 @@ class A3SCodeAgent:
             "shell_write_content_to_file",
         }:
             if tool_name == "shell_exec":
-                mapped_args = dict(args)
-                command = str(mapped_args.get("command") or mapped_args.get("cmd") or "")
-                mapped_args["command"] = A3SCodeAgent._guard_shell_command(command)
-                return tool_name, mapped_args
+                command = str(args.get("command") or args.get("cmd") or "")
+                return tool_name, A3SCodeAgent._shell_exec_args(
+                    command, task_id=task_id, base=args
+                )
             return tool_name, args
 
         if tool_name in {"bash", "execute"}:
             command = str(args.get("command") or args.get("cmd") or "")
-            command = A3SCodeAgent._guard_shell_command(command)
-            return "shell_exec", {"command": command}
+            return "shell_exec", A3SCodeAgent._shell_exec_args(
+                command, task_id=task_id
+            )
 
         if tool_name == "read":
             path = str(args.get("path") or args.get("file_path") or "")
@@ -997,11 +1017,15 @@ class A3SCodeAgent:
                 f"sed -n '{max(1, offset)},{max(1, offset) + max(1, limit) - 1}p' "
                 f"{shlex.quote(path)}"
             )
-            return "shell_exec", {"command": command}
+            return "shell_exec", A3SCodeAgent._shell_exec_args(
+                command, task_id=task_id
+            )
 
         if tool_name == "ls":
             path = str(args.get("path") or ".")
-            return "shell_exec", {"command": f"ls -la {shlex.quote(path)}"}
+            return "shell_exec", A3SCodeAgent._shell_exec_args(
+                f"ls -la {shlex.quote(path)}", task_id=task_id
+            )
 
         if tool_name == "grep":
             pattern = str(args.get("pattern") or args.get("query") or "")
@@ -1009,7 +1033,9 @@ class A3SCodeAgent:
             command = (
                 f"grep -RIn -- {shlex.quote(pattern)} {shlex.quote(path)} | head -200"
             )
-            return "shell_exec", {"command": command}
+            return "shell_exec", A3SCodeAgent._shell_exec_args(
+                command, task_id=task_id
+            )
 
         if tool_name == "glob":
             pattern = str(args.get("pattern") or args.get("glob") or "*")
@@ -1019,7 +1045,9 @@ class A3SCodeAgent:
                 f"for p in glob.glob({json.dumps(pattern)}, recursive=True)[:200]: print(p)\n"
                 "PY"
             )
-            return "shell_exec", {"command": command}
+            return "shell_exec", A3SCodeAgent._shell_exec_args(
+                command, task_id=task_id
+            )
 
         if tool_name == "write":
             path = str(args.get("path") or args.get("file_path") or "")
@@ -1042,11 +1070,14 @@ class A3SCodeAgent:
                 "path.write_text(text.replace(old, new, 1))\n"
                 "PY"
             )
-            return "shell_exec", {"command": command}
+            return "shell_exec", A3SCodeAgent._shell_exec_args(
+                command, task_id=task_id
+            )
 
-        return "shell_exec", {
-            "command": f"echo unsupported a3s-code tool: {shlex.quote(tool_name)}"
-        }
+        return "shell_exec", A3SCodeAgent._shell_exec_args(
+            f"echo unsupported a3s-code tool: {shlex.quote(tool_name)}",
+            task_id=task_id,
+        )
 
     def _response_from_result(self, result: Any) -> A3SCodeResponse:
         text = str(getattr(result, "text", "") or "")
