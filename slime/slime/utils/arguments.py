@@ -499,7 +499,61 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Path to the buffer filter function. "
                     "It should be able to select the samples in the buffer. "
-                    "The function should take list[list[Sample]] and return list[list[Sample]]."
+                    "The function should take list[list[Sample]] and return list[list[Sample]]. "
+                    "DEPRECATED: Use --buffer-sampling-strategy instead for better control."
+                ),
+            )
+            parser.add_argument(
+                "--buffer-sampling-strategy",
+                type=str,
+                choices=[
+                    "lifo_staleness",
+                    "fifo_staleness",
+                    "priority",
+                    "hybrid",
+                    "random",
+                    "reservoir",
+                    "custom",
+                    "per",
+                    "prioritized_replay",
+                ],
+                default="lifo_staleness",
+                help="Replay buffer sampling strategy for off-policy training.",
+            )
+            parser.add_argument(
+                "--buffer-hybrid-lifo-ratio",
+                type=float,
+                default=0.8,
+                help="Ratio of LIFO samples in hybrid replay sampling.",
+            )
+            parser.add_argument(
+                "--buffer-hybrid-priority-ratio",
+                type=float,
+                default=0.2,
+                help="Ratio of priority samples in hybrid replay sampling.",
+            )
+            parser.add_argument(
+                "--buffer-sampling-custom-path",
+                type=str,
+                default=None,
+                help="Path to custom replay sampling strategy when --buffer-sampling-strategy=custom.",
+            )
+            parser.add_argument(
+                "--buffer-remove-on-sample",
+                type=lambda x: x.lower() in ["true", "1", "yes"],
+                default=True,
+                help=(
+                    "Whether to remove samples from replay buffer after sampling. "
+                    "Set to false to allow sample reuse controlled by --buffer-reuse-samples."
+                ),
+            )
+            parser.add_argument(
+                "--buffer-reuse-samples",
+                type=int,
+                default=1,
+                help=(
+                    "Maximum reuse count for each replay sample when --buffer-remove-on-sample=false. "
+                    "Use 0 for unlimited reuse."
                 ),
             )
             # update weight
@@ -920,10 +974,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "decoupled_policy_loss", "value_loss", "sft_loss", "custom_loss"],
                 default="policy_loss",
                 help=(
-                    "Choose loss type, currently support ppo policy_loss or sft_loss, "
+                    "Choose loss type, currently support ppo policy_loss, off-policy decoupled_policy_loss, value_loss, or sft_loss, "
                     "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
                 ),
             )
@@ -1075,6 +1129,121 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Path to a custom reducer function for pg_loss only. When set, pg_loss will use this custom reducer while other metrics (pg_clipfrac, ppo_kl, entropy_loss, etc.) still use the default sum_of_sample_mean. (e.g., examples/Dr.GRPO/custom_reducer.py:get_pg_loss_reducer).",
             )
+            parser.add_argument(
+                "--max-staleness",
+                type=int,
+                default=-1,
+                help="Maximum allowed sample staleness for off-policy replay. -1 disables filtering.",
+            )
+            parser.add_argument(
+                "--importance-weight-clip-min",
+                type=float,
+                default=None,
+                help="Minimum clip for decoupled off-policy importance weights pi_prox/pi_behav.",
+            )
+            parser.add_argument(
+                "--importance-weight-clip-max",
+                type=float,
+                default=None,
+                help="Maximum clip for decoupled off-policy importance weights pi_prox/pi_behav.",
+            )
+            parser.add_argument(
+                "--behav-imp-weight-cap",
+                type=float,
+                default=None,
+                help="Drop tokens whose behavior importance weight exceeds this cap.",
+            )
+            parser.add_argument(
+                "--buffer-mode",
+                type=str,
+                choices=["in_process", "http", "none"],
+                default="in_process",
+                help="Replay buffer backend mode. The current integrated slime path uses in_process by default.",
+            )
+            parser.add_argument(
+                "--use-buffer",
+                type=lambda x: x.lower() in ["true", "1", "yes"],
+                default=None,
+                help="Explicitly enable/disable in-process replay buffer. Auto-enabled for decoupled_policy_loss.",
+            )
+            parser.add_argument(
+                "--buffer-max-size",
+                type=int,
+                default=1000,
+                help="Maximum replay buffer capacity in sample groups.",
+            )
+            parser.add_argument(
+                "--enable-proximal-policy-storage",
+                action="store_true",
+                default=False,
+                help="Enable proximal policy storage/recompute path for decoupled off-policy loss.",
+            )
+            parser.add_argument(
+                "--prox-logp-method",
+                type=str,
+                choices=["recompute", "loglinear", "linear", "metrics"],
+                default="recompute",
+                help="How to compute proximal policy log-probabilities for decoupled_policy_loss.",
+            )
+            parser.add_argument(
+                "--enable-m2po-filtering",
+                action="store_true",
+                default=False,
+                help="Enable M2PO token filtering for off-policy replay.",
+            )
+            parser.add_argument("--m2po-threshold", type=float, default=0.1, help="M2PO filtering threshold.")
+            parser.add_argument("--per-alpha", type=float, default=0.6, help="PER priority exponent.")
+            parser.add_argument("--per-beta-start", type=float, default=0.4, help="PER IS beta at training start.")
+            parser.add_argument("--per-beta-end", type=float, default=1.0, help="PER IS beta after annealing.")
+            parser.add_argument("--per-beta-anneal-steps", type=int, default=1000, help="PER beta anneal steps.")
+            parser.add_argument(
+                "--per-priority-source",
+                type=str,
+                default="reward_dev",
+                choices=["advantage", "reward", "reward_dev"],
+                help="Signal used to compute PER priority. reward_dev is the safe default because it is available before training-time advantage computation.",
+            )
+            parser.add_argument("--per-priority-eps", type=float, default=1e-3, help="PER priority epsilon.")
+            parser.add_argument("--per-min-priority", type=float, default=1e-6, help="PER priority floor.")
+            parser.add_argument("--per-max-priority", type=float, default=1e3, help="PER priority ceiling.")
+            parser.add_argument(
+                "--enable-dynamic-sampling",
+                action="store_true",
+                default=False,
+                help="Enable DAPO-style group-quality admission gate before replay buffer insertion.",
+            )
+            parser.add_argument("--dynamic-sample-min-std", type=float, default=1e-4, help="Minimum reward std for replay admission.")
+            parser.add_argument("--dynamic-sample-min-correct-lo", type=int, default=None, help="Optional lower bound on correct samples per group.")
+            parser.add_argument("--dynamic-sample-min-correct-hi", type=int, default=None, help="Optional upper bound on correct samples per group.")
+            parser.add_argument("--use-topr", action="store_true", default=False, help="Use TOPR sequence-level off-policy importance weighting.")
+            parser.add_argument("--topr-logw-cap", type=float, default=2.0, help="Clamp absolute TOPR sequence log-weight.")
+            parser.add_argument("--topr-w-min", type=float, default=0.0, help="Lower clip for TOPR sequence weight.")
+            parser.add_argument("--topr-w-max", type=float, default=5.0, help="Upper clip for TOPR sequence weight.")
+            parser.add_argument("--topr-blend", type=float, default=1.0, help="Blend between token IS and TOPR sequence IS.")
+            parser.add_argument(
+                "--log-proximal-approximation-metrics",
+                action="store_true",
+                default=False,
+                help="Log proximal logprob approximation metrics.",
+            )
+            parser.add_argument(
+                "--log-version-staleness-stats",
+                action="store_true",
+                default=False,
+                help="Log sample policy version and staleness statistics.",
+            )
+            parser.add_argument(
+                "--train-iters-per-rollout",
+                type=int,
+                default=1,
+                help="Number of train iterations to run per rollout when replay buffer is enabled.",
+            )
+            parser.add_argument(
+                "--update-policy-version-every-train-iter",
+                action="store_true",
+                default=False,
+                help="Increment replay policy version after every train iteration instead of every rollout.",
+            )
 
             parser.add_argument(
                 "--use-routing-replay",
@@ -1099,6 +1268,54 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=1e-4,
                 help="The threshold for Off-Policy Sequence Masking (OPSM).",
+            )
+            parser.add_argument(
+                "--enable-trajectory-replay",
+                action="store_true",
+                default=False,
+                help="Enable SPEAR self-imitation trajectory replay.",
+            )
+            parser.add_argument(
+                "--trajectory-buffer-size",
+                type=int,
+                default=2048,
+                help="SPEAR SIL trajectory buffer size.",
+            )
+            parser.add_argument(
+                "--baseline-buffer-size",
+                type=int,
+                default=10240,
+                help="SPEAR SIL baseline buffer size metadata.",
+            )
+            parser.add_argument(
+                "--trajectory-score-threshold",
+                type=float,
+                default=1.0,
+                help="Minimum reward for SPEAR SIL buffer admission.",
+            )
+            parser.add_argument(
+                "--weight-decay-trajectory-replay",
+                type=float,
+                default=-1.0,
+                help="SPEAR SIL advantage re-estimation mode.",
+            )
+            parser.add_argument(
+                "--replay-loss-coef",
+                type=float,
+                default=0.001,
+                help="Final SIL auxiliary loss coefficient.",
+            )
+            parser.add_argument(
+                "--max-replay-loss-steps",
+                type=int,
+                default=200,
+                help="Warmup steps for SPEAR SIL replay loss coefficient.",
+            )
+            parser.add_argument(
+                "--enable-trajectory-posadv",
+                action="store_true",
+                default=False,
+                help="Require positive advantage for SPEAR SIL admission.",
             )
             return parser
 
@@ -1196,7 +1413,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Log statistics of the category of reward, such as why the reward function considers it as failed. "
-                    "Specify the key in the reward dict using this argument.",
+                    "Specify the key in the reward dict using this argument."
                 ),
             )
             parser.add_argument(

@@ -174,13 +174,45 @@ def train(args):
         if rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
-        if args.use_critic:
-            critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
-            if rollout_id >= args.num_critic_only_steps:
-                _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref)))
-            _relay_pending_metrics(ray.get(critic_train_handle))
-        else:
-            _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref)))
+        train_iters_per_rollout = max(1, int(getattr(args, "train_iters_per_rollout", 1) or 1))
+        if train_iters_per_rollout > 1 and getattr(args, "loss_type", "policy_loss") != "decoupled_policy_loss":
+            logger.warning(
+                "train_iters_per_rollout=%s requires decoupled_policy_loss; falling back to 1",
+                train_iters_per_rollout,
+            )
+            train_iters_per_rollout = 1
+
+        for train_iter in range(train_iters_per_rollout):
+            if train_iter == 0:
+                current_rollout_data_ref = rollout_data_curr_ref
+            else:
+                sample_result = ray.get(rollout_manager.sample_training_data.remote(rollout_id, train_iter))
+                if sample_result is None:
+                    logger.warning(
+                        "Replay buffer exhausted at rollout_id=%s train_iter=%s; stopping extra train iterations",
+                        rollout_id,
+                        train_iter,
+                    )
+                    break
+                if isinstance(sample_result, tuple):
+                    current_rollout_data_ref, pending = sample_result
+                    _relay_pending_metrics(pending)
+                else:
+                    current_rollout_data_ref = sample_result
+
+            if args.use_critic:
+                critic_train_handle = critic_model.async_train(rollout_id, current_rollout_data_ref)
+                if rollout_id >= args.num_critic_only_steps:
+                    _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, current_rollout_data_ref)))
+                _relay_pending_metrics(ray.get(critic_train_handle))
+            else:
+                _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, current_rollout_data_ref)))
+
+            if getattr(args, "update_policy_version_every_train_iter", False):
+                ray.get(rollout_manager.on_policy_update.remote())
+
+        if not getattr(args, "update_policy_version_every_train_iter", False):
+            ray.get(rollout_manager.on_policy_update.remote())
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             actor_model.save_model(
