@@ -267,6 +267,11 @@ def test_a3s_code_agent_external_tasks_route_to_terminal_env(monkeypatch):
     assert FakeAgent.last_session.completed_payloads == [
         ("task-1", True, {"output": "tool output", "exit_code": 0}, None)
     ]
+    assert FakeAgent.last_opts.tool_timeout_ms == 300000
+    assert FakeAgent.last_opts.queue_config.handlers == [
+        ("query", "external", 302000),
+        ("execute", "external", 302000),
+    ]
     assert result.model_response.tool_calls == [
         {
             "tool_call_id": "task-1",
@@ -333,22 +338,24 @@ def test_a3s_code_tool_timeout_is_capped_below_turn_timeout(monkeypatch):
         )
     )
 
-    assert agent._tool_timeout_ms == 9000
-    assert FakeAgent.last_opts.tool_timeout_ms == 9000
+    assert agent._tool_timeout_ms == 7000
+    assert agent._external_tool_wait_timeout_ms == 8000
+    assert agent._external_queue_timeout_ms == 9000
+    assert FakeAgent.last_opts.tool_timeout_ms == 7000
     assert FakeAgent.last_opts.queue_config.handlers == [
         ("query", "external", 9000),
         ("execute", "external", 9000),
     ]
-    # The remote per-call timeout must follow the (capped) tool timeout, not a
-    # hardcoded constant, otherwise long-running Docker commands are killed while
-    # the local future keeps waiting. _drain_external_tasks forwards
-    # self._tool_timeout_ms / 1000.0 as tool_timeout_sec; verify the plumbing.
+    # The remote per-call timeout must be the shortest deadline; the local bridge
+    # waits a little longer, and the SDK external queue waits longer still. This
+    # lets terminal-rl complete timed-out Docker calls as tool results before
+    # a3s-code's queue can fall back to direct local execution.
     _name, _args = agent._map_tool_call(
         "bash", {"command": "ls"}, task_id="t1",
         tool_timeout_sec=agent._tool_timeout_ms / 1000.0,
     )
     assert _name == "shell_exec"
-    assert _args["timeout"] == 9
+    assert _args["timeout"] == 7
 
 
 def test_a3s_code_tool_mapping_helpers():

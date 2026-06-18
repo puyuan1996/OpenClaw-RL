@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -24,6 +25,9 @@ from inference_client import SGLangTurnClient
 logger = logging.getLogger(__name__)
 
 DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS = 300_000
+DEFAULT_A3S_CODE_EXTERNAL_TOOL_WAIT_GRACE_MS = 1_000
+DEFAULT_A3S_CODE_EXTERNAL_QUEUE_GRACE_MS = 1_000
+DEFAULT_A3S_CODE_TURN_TIMEOUT_RESERVE_MS = 1_000
 
 _INTERACTIVE_SHELL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
@@ -99,7 +103,12 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _resolve_tool_timeout_ms(raw: Any, turn_timeout_sec: float) -> int:
+def _resolve_tool_timeout_ms(
+    raw: Any,
+    turn_timeout_sec: float,
+    *,
+    extra_turn_reserve_ms: int = 0,
+) -> int:
     if raw is None or raw == "":
         value = DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS
     else:
@@ -123,17 +132,33 @@ def _resolve_tool_timeout_ms(raw: Any, turn_timeout_sec: float) -> int:
 
     if turn_timeout_sec > 0:
         turn_timeout_ms = max(1_000, int(turn_timeout_sec * 1000))
-        if value >= turn_timeout_ms:
-            capped = max(1_000, turn_timeout_ms - 1_000)
+        reserve_ms = max(1_000, int(extra_turn_reserve_ms or 0))
+        if value + reserve_ms >= turn_timeout_ms:
+            capped = max(1_000, turn_timeout_ms - reserve_ms)
             logger.warning(
-                "A3S_CODE_TOOL_TIMEOUT_MS=%d is not below turn timeout %.0fs; using %d",
+                "A3S_CODE_TOOL_TIMEOUT_MS=%d leaves less than %dms before "
+                "turn timeout %.0fs; using %d",
                 value,
+                reserve_ms,
                 turn_timeout_sec,
                 capped,
             )
             value = capped
 
     return value
+
+
+def _cap_timeout_below_turn(
+    value_ms: int,
+    turn_timeout_sec: float,
+    *,
+    reserve_ms: int,
+) -> int:
+    value_ms = max(1, int(value_ms))
+    if turn_timeout_sec <= 0:
+        return value_ms
+    turn_timeout_ms = max(1_000, int(turn_timeout_sec * 1000))
+    return max(1, min(value_ms, turn_timeout_ms - max(1, int(reserve_ms))))
 
 
 def _terminal_rl_prompt_extra(max_tool_rounds: int) -> str:
@@ -523,11 +548,47 @@ class A3SCodeAgent:
         self._task_meta = task_meta or {}
         self._max_tool_rounds = max(1, _env_int("A3S_CODE_MAX_TOOL_ROUNDS", 10))
         self._turn_timeout_sec = _env_float("A3S_CODE_TURN_TIMEOUT_SEC", 900.0)
+        self._external_tool_wait_grace_ms = max(
+            0,
+            _env_int(
+                "A3S_CODE_EXTERNAL_TOOL_WAIT_GRACE_MS",
+                DEFAULT_A3S_CODE_EXTERNAL_TOOL_WAIT_GRACE_MS,
+            ),
+        )
+        self._external_queue_grace_ms = max(
+            0,
+            _env_int(
+                "A3S_CODE_EXTERNAL_QUEUE_GRACE_MS",
+                DEFAULT_A3S_CODE_EXTERNAL_QUEUE_GRACE_MS,
+            ),
+        )
+        self._turn_timeout_reserve_ms = max(
+            1,
+            _env_int(
+                "A3S_CODE_TURN_TIMEOUT_RESERVE_MS",
+                DEFAULT_A3S_CODE_TURN_TIMEOUT_RESERVE_MS,
+            ),
+        )
         self._tool_timeout_ms = _resolve_tool_timeout_ms(
             tool_timeout_ms
             if tool_timeout_ms is not None
             else os.getenv("A3S_CODE_TOOL_TIMEOUT_MS"),
             self._turn_timeout_sec,
+            extra_turn_reserve_ms=(
+                self._external_tool_wait_grace_ms
+                + self._external_queue_grace_ms
+                + self._turn_timeout_reserve_ms
+            ),
+        )
+        self._external_tool_wait_timeout_ms = _cap_timeout_below_turn(
+            self._tool_timeout_ms + self._external_tool_wait_grace_ms,
+            self._turn_timeout_sec,
+            reserve_ms=self._external_queue_grace_ms + self._turn_timeout_reserve_ms,
+        )
+        self._external_queue_timeout_ms = _cap_timeout_below_turn(
+            self._external_tool_wait_timeout_ms + self._external_queue_grace_ms,
+            self._turn_timeout_sec,
+            reserve_ms=self._turn_timeout_reserve_ms,
         )
         self.max_parse_errors = max(1, int(max_parse_errors or 3))
         self.parse_error_count = 0
@@ -744,8 +805,8 @@ class A3SCodeAgent:
         opts.permission_policy = PermissionPolicy(default_decision="allow")
 
         queue = SessionQueueConfig()
-        queue.set_lane_handler("query", "external", self._tool_timeout_ms)
-        queue.set_lane_handler("execute", "external", self._tool_timeout_ms)
+        queue.set_lane_handler("query", "external", self._external_queue_timeout_ms)
+        queue.set_lane_handler("execute", "external", self._external_queue_timeout_ms)
         opts.queue_config = queue
 
         self._agent = Agent.create(str(config_path))
@@ -921,12 +982,14 @@ class A3SCodeAgent:
             loop,
         )
         try:
-            return future.result(timeout=max(1.0, self._tool_timeout_ms / 1000.0))
+            return future.result(
+                timeout=max(1.0, self._external_tool_wait_timeout_ms / 1000.0)
+            )
         except concurrent.futures.TimeoutError:
             future.cancel()
             raise TimeoutError(
                 f"a3s-code terminal tool {tool_name!r} timed out after "
-                f"{self._tool_timeout_ms}ms"
+                f"{self._external_tool_wait_timeout_ms}ms"
             )
 
     @staticmethod
@@ -994,7 +1057,7 @@ class A3SCodeAgent:
         # otherwise long-running commands (pip/npm install, test suites) are
         # silently killed by the Docker-backed TerminalToolkit while the local
         # future keeps waiting.
-        mapped_args.setdefault("timeout", max(1, int(tool_timeout_sec)))
+        mapped_args.setdefault("timeout", max(1, math.ceil(tool_timeout_sec)))
         return mapped_args
 
     @staticmethod
