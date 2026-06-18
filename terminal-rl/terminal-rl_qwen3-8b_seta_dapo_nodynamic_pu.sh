@@ -34,8 +34,8 @@ case "${HARNESS_OPTION}" in
     ;;
 esac
 
-if ! [[ "${ROLLOUT_BATCH_SIZE}" =~ ^[0-9]+$ && "${N_SAMPLES}" =~ ^[0-9]+$ ]]; then
-  echo "[ERROR] ROLLOUT_BATCH_SIZE and N_SAMPLES must be positive integers." >&2
+if ! [[ "${ROLLOUT_BATCH_SIZE}" =~ ^[1-9][0-9]*$ && "${N_SAMPLES}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] ROLLOUT_BATCH_SIZE and N_SAMPLES must be positive integers (>=1)." >&2
   exit 2
 fi
 if (( ROLLOUT_BATCH_SIZE < 8 || N_SAMPLES < 8 )); then

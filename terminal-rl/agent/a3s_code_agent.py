@@ -844,7 +844,10 @@ class A3SCodeAgent:
 
             try:
                 mapped_name, mapped_args = self._map_tool_call(
-                    tool_name, args, task_id=task_id
+                    tool_name,
+                    args,
+                    task_id=task_id,
+                    tool_timeout_sec=self._tool_timeout_ms / 1000.0,
                 )
                 output = self._exec_terminal_tool_on_loop(loop, mapped_name, mapped_args)
                 self._complete_external_task(
@@ -977,18 +980,30 @@ class A3SCodeAgent:
         *,
         task_id: str | None = None,
         base: dict[str, Any] | None = None,
+        tool_timeout_sec: float = DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS / 1000.0,
     ) -> dict[str, Any]:
         mapped_args = dict(base or {})
         mapped_args.pop("cmd", None)
         mapped_args["command"] = A3SCodeAgent._guard_shell_command(command)
-        mapped_args.setdefault("id", task_id or "a3s-code-tool")
+        # Force-assign the task id so a model-supplied "id" in the tool-call
+        # args cannot desync the remote session from local task tracking.
+        mapped_args["id"] = task_id or "a3s-code-tool"
         mapped_args.setdefault("block", True)
-        mapped_args.setdefault("timeout", 20)
+        # Derive the remote per-call timeout from the configured tool timeout
+        # (already capped below the turn timeout) instead of a hardcoded 20s,
+        # otherwise long-running commands (pip/npm install, test suites) are
+        # silently killed by the Docker-backed TerminalToolkit while the local
+        # future keeps waiting.
+        mapped_args.setdefault("timeout", max(1, int(tool_timeout_sec)))
         return mapped_args
 
     @staticmethod
     def _map_tool_call(
-        tool_name: str, args: dict[str, Any], *, task_id: str | None = None
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        task_id: str | None = None,
+        tool_timeout_sec: float = DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS / 1000.0,
     ) -> tuple[str, dict[str, Any]]:
         if tool_name in {
             "shell_exec",
@@ -999,14 +1014,15 @@ class A3SCodeAgent:
             if tool_name == "shell_exec":
                 command = str(args.get("command") or args.get("cmd") or "")
                 return tool_name, A3SCodeAgent._shell_exec_args(
-                    command, task_id=task_id, base=args
+                    command, task_id=task_id, base=args,
+                    tool_timeout_sec=tool_timeout_sec,
                 )
             return tool_name, args
 
         if tool_name in {"bash", "execute"}:
             command = str(args.get("command") or args.get("cmd") or "")
             return "shell_exec", A3SCodeAgent._shell_exec_args(
-                command, task_id=task_id
+                command, task_id=task_id, tool_timeout_sec=tool_timeout_sec,
             )
 
         if tool_name == "read":
@@ -1018,13 +1034,14 @@ class A3SCodeAgent:
                 f"{shlex.quote(path)}"
             )
             return "shell_exec", A3SCodeAgent._shell_exec_args(
-                command, task_id=task_id
+                command, task_id=task_id, tool_timeout_sec=tool_timeout_sec,
             )
 
         if tool_name == "ls":
             path = str(args.get("path") or ".")
             return "shell_exec", A3SCodeAgent._shell_exec_args(
-                f"ls -la {shlex.quote(path)}", task_id=task_id
+                f"ls -la {shlex.quote(path)}", task_id=task_id,
+                tool_timeout_sec=tool_timeout_sec,
             )
 
         if tool_name == "grep":
@@ -1034,7 +1051,7 @@ class A3SCodeAgent:
                 f"grep -RIn -- {shlex.quote(pattern)} {shlex.quote(path)} | head -200"
             )
             return "shell_exec", A3SCodeAgent._shell_exec_args(
-                command, task_id=task_id
+                command, task_id=task_id, tool_timeout_sec=tool_timeout_sec,
             )
 
         if tool_name == "glob":
@@ -1046,7 +1063,7 @@ class A3SCodeAgent:
                 "PY"
             )
             return "shell_exec", A3SCodeAgent._shell_exec_args(
-                command, task_id=task_id
+                command, task_id=task_id, tool_timeout_sec=tool_timeout_sec,
             )
 
         if tool_name == "write":
@@ -1071,12 +1088,13 @@ class A3SCodeAgent:
                 "PY"
             )
             return "shell_exec", A3SCodeAgent._shell_exec_args(
-                command, task_id=task_id
+                command, task_id=task_id, tool_timeout_sec=tool_timeout_sec,
             )
 
         return "shell_exec", A3SCodeAgent._shell_exec_args(
             f"echo unsupported a3s-code tool: {shlex.quote(tool_name)}",
             task_id=task_id,
+            tool_timeout_sec=tool_timeout_sec,
         )
 
     def _response_from_result(self, result: Any) -> A3SCodeResponse:

@@ -223,6 +223,10 @@ def test_a3s_code_agent_run_model_turn_with_mock_sdk(monkeypatch):
 def test_a3s_code_agent_external_tasks_route_to_terminal_env(monkeypatch):
     _patch_sdk(monkeypatch)
     monkeypatch.setenv("A3S_CODE_WORKSPACE_ROOT", "/tmp/openclaw_a3s_test_workspaces")
+    # Pin turn/tool timeouts so the expected remote per-call timeout is
+    # deterministic and does not leak from the ambient environment.
+    monkeypatch.setenv("A3S_CODE_TURN_TIMEOUT_SEC", "900")
+    monkeypatch.setenv("A3S_CODE_TOOL_TIMEOUT_MS", "300000")
     FakeAgent.next_session = FakeSession(
         external_task={
             "task_id": "task-1",
@@ -257,7 +261,7 @@ def test_a3s_code_agent_external_tasks_route_to_terminal_env(monkeypatch):
         (
             "lease-1",
             "shell_exec",
-            {"command": "pwd", "id": "task-1", "block": True, "timeout": 20},
+            {"command": "pwd", "id": "task-1", "block": True, "timeout": 300},
         )
     ]
     assert FakeAgent.last_session.completed_payloads == [
@@ -268,7 +272,7 @@ def test_a3s_code_agent_external_tasks_route_to_terminal_env(monkeypatch):
             "tool_call_id": "task-1",
             "tool_name": "shell_exec",
             "sdk_tool_name": "bash",
-            "args": {"command": "pwd", "id": "task-1", "block": True, "timeout": 20},
+            "args": {"command": "pwd", "id": "task-1", "block": True, "timeout": 300},
             "sdk_args": {"command": "pwd"},
             "result": "tool output",
             "source": "a3s-code-sdk",
@@ -335,6 +339,16 @@ def test_a3s_code_tool_timeout_is_capped_below_turn_timeout(monkeypatch):
         ("query", "external", 9000),
         ("execute", "external", 9000),
     ]
+    # The remote per-call timeout must follow the (capped) tool timeout, not a
+    # hardcoded constant, otherwise long-running Docker commands are killed while
+    # the local future keeps waiting. _drain_external_tasks forwards
+    # self._tool_timeout_ms / 1000.0 as tool_timeout_sec; verify the plumbing.
+    _name, _args = agent._map_tool_call(
+        "bash", {"command": "ls"}, task_id="t1",
+        tool_timeout_sec=agent._tool_timeout_ms / 1000.0,
+    )
+    assert _name == "shell_exec"
+    assert _args["timeout"] == 9
 
 
 def test_a3s_code_tool_mapping_helpers():
@@ -342,13 +356,13 @@ def test_a3s_code_tool_mapping_helpers():
         "bash", {"command": "pwd"}, task_id="call-1"
     ) == (
         "shell_exec",
-        {"command": "pwd", "id": "call-1", "block": True, "timeout": 20},
+        {"command": "pwd", "id": "call-1", "block": True, "timeout": 300},
     )
     assert a3s_agent_module.A3SCodeAgent._map_tool_call(
         "execute", {"cmd": "pwd"}, task_id="call-2"
     ) == (
         "shell_exec",
-        {"command": "pwd", "id": "call-2", "block": True, "timeout": 20},
+        {"command": "pwd", "id": "call-2", "block": True, "timeout": 300},
     )
     assert a3s_agent_module.A3SCodeAgent._map_tool_call(
         "write", {"path": "x.txt", "content": "hi"}
