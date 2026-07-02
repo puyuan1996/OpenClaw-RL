@@ -499,8 +499,39 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="ref_",
                         )
                     )
+
+                if (
+                    self.args.loss_type == "decoupled_policy_loss"
+                    and getattr(self.args, "prox_logp_method", "recompute") == "recompute"
+                ):
+                    if "proximal" not in self.weights_backuper.backup_tags:
+                        if is_megatron_main_rank():
+                            logger.info(
+                                "Initializing proximal policy from current actor at rollout_id %s",
+                                rollout_id,
+                            )
+                        self.weights_backuper.backup("proximal")
+                    self._switch_model("proximal")
+                    rollout_data.update(
+                        self.compute_log_prob(
+                            data_iterator,
+                            num_microbatches,
+                            store_prefix="proximal_",
+                        )
+                    )
+                elif self.args.loss_type == "decoupled_policy_loss":
+                    rollout_data["use_proximal_logp_approximation"] = [True] * len(rollout_data["tokens"])
+
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                needs_old_actor_log_probs = (
+                    not self.args.use_rollout_logprobs
+                    or self.args.get_mismatch_metrics
+                    or (
+                        self.args.loss_type == "decoupled_policy_loss"
+                        and getattr(self.args, "prox_logp_method", "recompute") != "recompute"
+                    )
+                )
+                if needs_old_actor_log_probs:
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -528,6 +559,38 @@ class MegatronTrainRayActor(TrainRayActor):
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
+                if self.args.loss_type == "decoupled_policy_loss" and "current_policy_version" not in rollout_data:
+                    raise ValueError(
+                        "decoupled_policy_loss requires rollout_data['current_policy_version']; "
+                        "RolloutManager._convert_samples_to_train_data() should populate it."
+                    )
+
+                if getattr(self.args, "enable_trajectory_replay", False) and rollout_data.get("sil_sample_flags"):
+                    try:
+                        sil_flags = rollout_data["sil_sample_flags"]
+                        sil_precomputed_advantages = rollout_data.get("sil_precomputed_advantages", [])
+                        advantages = rollout_data.get("advantages", [])
+                        num_overridden = 0
+                        for idx, flag in enumerate(sil_flags):
+                            if (
+                                flag == 1
+                                and idx < len(sil_precomputed_advantages)
+                                and sil_precomputed_advantages[idx] is not None
+                                and idx < len(advantages)
+                            ):
+                                sil_advantage = sil_precomputed_advantages[idx]
+                                if hasattr(sil_advantage, "to") and hasattr(advantages[idx], "device"):
+                                    sil_advantage = sil_advantage.to(
+                                        device=advantages[idx].device,
+                                        dtype=advantages[idx].dtype,
+                                    )
+                                advantages[idx] = sil_advantage
+                                num_overridden += 1
+                        if num_overridden > 0 and is_megatron_main_rank():
+                            logger.info("Overrode advantages for %d SIL samples", num_overridden)
+                    except Exception as exc:
+                        if is_megatron_main_rank():
+                            logger.warning("SIL advantage override failed; continuing without override: %s", exc)
 
             # Move all computed per-sample GPU tensors (log_probs, ref_log_probs,
             # advantages, returns, entropy, values, etc.) back to CPU.
@@ -567,6 +630,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # update the cpu actor weight to the latest model
         self.weights_backuper.backup("actor")
+        if self.args.loss_type == "decoupled_policy_loss":
+            self.weights_backuper.backup("proximal")
 
         # Update ref model if needed
         if (

@@ -1,5 +1,6 @@
 import itertools
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -117,6 +118,7 @@ class RolloutManager:
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
+        self.current_policy_version = 0
 
         self._metric_checker = MetricChecker.maybe_create(args)
         self._health_monitor = None
@@ -174,6 +176,8 @@ class RolloutManager:
     def generate(self, rollout_id):
         start_time = time.time()
         self.rollout_id = rollout_id
+        if hasattr(self.data_source, "update_policy_version"):
+            self.data_source.update_policy_version(self.current_policy_version)
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
@@ -211,6 +215,67 @@ class RolloutManager:
         if pending:
             return rollout_data_refs, pending
         return rollout_data_refs
+
+    def sample_training_data(self, rollout_id: int, train_iter: int):
+        """Sample replay-buffer data for an extra training iteration.
+
+        Args:
+            rollout_id: Current rollout id used for logging and policy-version
+                bookkeeping.
+            train_iter: Extra train iteration index within the rollout.
+
+        Returns:
+            A Ray object-ref list containing DP-sharded training data. When
+            secondary-process metrics were queued, returns
+            ``(rollout_data_refs, pending_metrics)``. Returns ``None`` when the
+            replay buffer has no eligible groups, which tells the train loop to
+            stop only the remaining extra replay iterations.
+
+        Raises:
+            RuntimeError: If replay-buffer sampling is requested while the
+                data source buffer is disabled.
+
+        Side effects:
+            Updates ``self.rollout_id`` and may set
+            ``self._dynamic_global_batch_size`` for short replay batches.
+        """
+        if not bool(getattr(self.data_source, "buffer_enabled", False)):
+            raise RuntimeError("sample_training_data() requires replay buffer to be enabled.")
+        self.rollout_id = rollout_id
+        target_groups = max(1, math.ceil(self.args.global_batch_size / max(self.args.n_samples_per_prompt, 1)))
+        training_groups = self.data_source.get_training_samples(target_groups)
+        if not training_groups:
+            logger.warning("Replay buffer exhausted at rollout_id=%s train_iter=%s", rollout_id, train_iter)
+            return None
+        samples = list(itertools.chain.from_iterable(training_groups))
+        if len(samples) > self.args.global_batch_size:
+            logger.info(
+                "Replay train iter produced %d samples; trimming to global_batch_size=%d",
+                len(samples),
+                self.args.global_batch_size,
+            )
+            samples = samples[: self.args.global_batch_size]
+        elif len(samples) < self.args.global_batch_size:
+            self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(samples))
+            logger.info(
+                "Replay train iter produced %d samples; using dynamic_global_batch_size=%d",
+                len(samples),
+                self._dynamic_global_batch_size,
+            )
+        elif hasattr(self, "_dynamic_global_batch_size"):
+            delattr(self, "_dynamic_global_batch_size")
+        data = self._convert_samples_to_train_data(samples)
+        rollout_data_refs = self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+        pending = logging_utils.flush_pending_metrics()
+        if pending:
+            return rollout_data_refs, pending
+        return rollout_data_refs
+
+    def on_policy_update(self):
+        self.current_policy_version += 1
+        if hasattr(self.data_source, "update_policy_version"):
+            self.data_source.update_policy_version(self.current_policy_version)
+        return self.current_policy_version
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -308,11 +373,54 @@ class RolloutManager:
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             metrics = data.metrics
             data = data.samples
+            buffer_enabled = bool(getattr(self.data_source, "buffer_enabled", False))
+            trajectory_replay_enabled = bool(
+                getattr(self.args, "enable_trajectory_replay", False)
+                and getattr(self.data_source, "sil_buffer", None) is not None
+            )
+            if buffer_enabled or trajectory_replay_enabled:
+                generated_groups = data
+                self.data_source.add_samples(generated_groups)
+            if buffer_enabled:
+                target_groups = max(1, math.ceil(self.args.global_batch_size / max(self.args.n_samples_per_prompt, 1)))
+                if hasattr(self.data_source, "get_training_samples"):
+                    training_groups = self.data_source.get_training_samples(target_groups)
+                else:
+                    training_groups = (
+                        generated_groups
+                        if generated_groups and isinstance(generated_groups[0], list)
+                        else self._group_flat_samples_for_replay(generated_groups)
+                    )
+                if not training_groups:
+                    logger.warning("Replay buffer is empty after generation; falling back to current rollout samples")
+                    training_groups = (
+                        generated_groups
+                        if generated_groups and isinstance(generated_groups[0], list)
+                        else self._group_flat_samples_for_replay(generated_groups)
+                    )
+                data = training_groups
             # flatten the data if it is a list of lists
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
 
-            if not self.args.disable_rollout_trim_samples:
+            if buffer_enabled and len(data) > self.args.global_batch_size:
+                logger.info(
+                    "Replay buffer produced %d samples; trimming to global_batch_size=%d",
+                    len(data),
+                    self.args.global_batch_size,
+                )
+                data = data[: self.args.global_batch_size]
+            elif buffer_enabled and len(data) < self.args.global_batch_size:
+                self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(data))
+                logger.info(
+                    "Replay buffer produced %d samples; using dynamic_global_batch_size=%d",
+                    len(data),
+                    self._dynamic_global_batch_size,
+                )
+            elif buffer_enabled and hasattr(self, "_dynamic_global_batch_size"):
+                delattr(self, "_dynamic_global_batch_size")
+
+            if not buffer_enabled and not self.args.disable_rollout_trim_samples:
                 global_batch_size = self.args.global_batch_size
                 target_steps_per_rollout = getattr(self.args, "num_steps_per_rollout", None)
                 # dynamic_history can expand one rollout into many step-wise samples.
@@ -337,6 +445,11 @@ class RolloutManager:
                     data = data[:trim_len]
                     logger.info(f"trim number of samples from {origin_data_length} to {trim_len}")
                 logger.info(f"Final collected {len(data)} samples from rollout to train")
+
+        for sample in data:
+            policy_version = getattr(sample, "policy_version", None)
+            if policy_version is None or not isinstance(policy_version, int) or policy_version < 0:
+                sample.policy_version = self.current_policy_version
 
         return data, metrics
 
@@ -372,6 +485,15 @@ class RolloutManager:
             )
 
         return dynamic_gbs
+
+    def _group_flat_samples_for_replay(self, samples: list[Sample]) -> list[list[Sample]]:
+        groups = []
+        group_size = max(1, self.args.n_samples_per_prompt)
+        for start in range(0, len(samples), group_size):
+            group = samples[start : start + group_size]
+            if len(group) == group_size:
+                groups.append(group)
+        return groups
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
@@ -735,6 +857,10 @@ class RolloutManager:
                 sample.loss_mask = [0] * sample.response_length
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
+        train_data["per_is_weights"] = [
+            float((sample.metadata or {}).get("per_is_weight", 1.0))
+            for sample in samples
+        ]
 
         # overwriting the raw reward
         if samples[0].metadata and "raw_reward" in samples[0].metadata:
@@ -753,6 +879,93 @@ class RolloutManager:
 
         if samples[0].train_metadata is not None:
             train_data["metadata"] = [sample.train_metadata for sample in samples]
+
+        is_offpolicy_mode = getattr(self.args, "loss_type", None) == "decoupled_policy_loss"
+        policy_versions = []
+        missing_policy_version_count = 0
+        for sample in samples:
+            policy_version = getattr(sample, "policy_version", None)
+            if policy_version is None:
+                missing_policy_version_count += 1
+                policy_version = 0
+            policy_versions.append(policy_version)
+        if is_offpolicy_mode:
+            train_data["policy_versions"] = policy_versions
+            train_data["current_policy_version"] = [self.current_policy_version] * len(samples)
+            if missing_policy_version_count > 0:
+                logger.warning(
+                    "%d/%d samples had no policy_version; using 0 as fallback",
+                    missing_policy_version_count,
+                    len(samples),
+                )
+        elif getattr(samples[0], "policy_version", None) is not None:
+            train_data["policy_versions"] = policy_versions
+
+        if (
+            getattr(self.args, "enable_trajectory_replay", False)
+            and getattr(self.data_source, "sil_buffer", None) is not None
+            and len(self.data_source.sil_buffer) > 0
+        ):
+            try:
+                import statistics
+
+                sil_buffer = self.data_source.sil_buffer
+                sil_count = 0 if len(samples) == 0 else min(max(1, len(samples) // 4), len(sil_buffer))
+                main_rewards = list(train_data.get("rewards", []))
+                baseline = float(statistics.median(main_rewards)) if main_rewards else 0.0
+                max_steps = float(getattr(self.args, "max_replay_loss_steps", 200))
+                final_coef = float(getattr(self.args, "replay_loss_coef", 0.001))
+                coef = min(self.rollout_id / max(max_steps, 1.0), 1.0) * final_coef
+                sil_entries = sil_buffer.sample(sil_count, self.rollout_id, baseline) if sil_count > 0 else []
+
+                if sil_entries:
+                    from slime.utils.sil_buffer import normalize_sil_loss_mask
+
+                    num_main = len(samples)
+                    sil_flags = [0] * num_main
+                    sil_precomputed_advantages = [None] * num_main
+                    replace_start = num_main - len(sil_entries)
+                    for offset, entry in enumerate(sil_entries):
+                        dst = replace_start + offset
+                        response_length = int(entry["response_length"])
+                        advantage_value = float(entry["advantage"])
+                        scaled_advantage_value = advantage_value * coef
+                        sil_precomputed_advantages[dst] = torch.full(
+                            (response_length,), scaled_advantage_value, dtype=torch.float32
+                        )
+                        sil_flags[dst] = 1
+                        train_data["tokens"][dst] = entry["tokens"]
+                        train_data["response_lengths"][dst] = response_length
+                        train_data["loss_masks"][dst] = normalize_sil_loss_mask(
+                            entry.get("loss_mask"), response_length
+                        )
+                        train_data["rewards"][dst] = float(entry["reward"])
+                        train_data["raw_reward"][dst] = float(entry["reward"])
+                        train_data["per_is_weights"][dst] = 1.0
+                        train_data["truncated"][dst] = 0
+                        train_data["sample_indices"][dst] = -1
+                        if "rollout_log_probs" in train_data:
+                            train_data["rollout_log_probs"][dst] = entry.get("rollout_log_probs")
+                        if "policy_versions" in train_data:
+                            try:
+                                entry_policy_version = int(entry.get("policy_version", 0))
+                            except (TypeError, ValueError):
+                                entry_policy_version = 0
+                            train_data["policy_versions"][dst] = max(entry_policy_version, 0)
+                        if "group_indices" in train_data:
+                            train_data["group_indices"][dst] = -1_000_000 - offset
+
+                    train_data["sil_sample_flags"] = sil_flags
+                    train_data["sil_precomputed_advantages"] = sil_precomputed_advantages
+                    train_data["sil_reward_baseline"] = baseline
+                    logger.info(
+                        "Mixed %d SIL samples into train batch (coef=%s, baseline=%s)",
+                        len(sil_entries),
+                        coef,
+                        baseline,
+                    )
+            except Exception as exc:
+                logger.warning("SIL mixing failed; continuing without SIL samples: %s", exc)
 
         has_any_mm = any(s.multimodal_train_inputs is not None for s in samples)
         if has_any_mm:
@@ -827,6 +1040,11 @@ class RolloutManager:
                 "sample_indices",
                 "rollout_log_probs",
                 "rollout_routed_experts",
+                "policy_versions",
+                "current_policy_version",
+                "per_is_weights",
+                "sil_sample_flags",
+                "sil_precomputed_advantages",
                 "prompt",
                 "teacher_log_probs",
                 "teacher_topk_log_probs",
@@ -844,6 +1062,7 @@ class RolloutManager:
             for key in [
                 "raw_reward",
                 "total_lengths",
+                "sil_reward_baseline",
             ]:
                 if key not in data:
                     continue
