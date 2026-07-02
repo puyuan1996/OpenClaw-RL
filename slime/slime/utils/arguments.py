@@ -937,6 +937,63 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--world-model-enable",
+                action="store_true",
+                help=(
+                    "Enable optional text latent world-model metadata/loss wiring. "
+                    "The default is off and does not change the policy loss path."
+                ),
+            )
+            parser.add_argument(
+                "--world-model-loss-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Auxiliary world-model loss coefficient. A value of 0 keeps the "
+                    "world-model hook as metadata/shadow logging only."
+                ),
+            )
+            parser.add_argument(
+                "--world-model-mode",
+                type=str,
+                choices=["offline", "shadow", "auxiliary"],
+                default="offline",
+                help="World-model integration mode. The v1 implementation keeps online behavior shadow/offline unless loss coef is set.",
+            )
+            parser.add_argument(
+                "--world-model-hidden-source",
+                type=str,
+                default="none",
+                help="Source of online hidden states for future adapters. The v1 training hook expects precomputed latents.",
+            )
+            parser.add_argument(
+                "--world-model-hidden-layer",
+                type=int,
+                default=None,
+                help="Optional hidden layer index for future hidden extraction adapters.",
+            )
+            parser.add_argument(
+                "--world-model-pool",
+                type=str,
+                default="mean",
+                help="Pooling strategy name for future hidden extraction adapters.",
+            )
+            parser.add_argument(
+                "--world-model-loss-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional custom hook path for online world-model auxiliary loss. "
+                    "If unset, the default hook only consumes precomputed wm_pred_latents/wm_target_latents."
+                ),
+            )
+            parser.add_argument(
+                "--world-model-metadata-max-chars",
+                type=int,
+                default=4096,
+                help="Maximum text characters stored per world-model metadata field.",
+            )
+            parser.add_argument(
                 "--kl-loss-type",
                 type=str,
                 choices=["k1", "k2", "k3", "low_var_kl"],

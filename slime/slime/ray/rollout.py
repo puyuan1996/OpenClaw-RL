@@ -736,6 +736,34 @@ class RolloutManager:
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
 
+        if getattr(self.args, "world_model_enable", False):
+            wm_metadata = []
+            optional_wm_fields = {
+                "wm_state_latents": ("state_latent", "state_hidden"),
+                "wm_action_latents": ("action_latent", "action_hidden"),
+                "wm_target_latents": ("target_latent", "target_hidden"),
+                "wm_pred_latents": ("pred_latent", "prediction_latent"),
+                "wm_rewards": ("reward", "reward_score"),
+            }
+            optional_values: dict[str, list[Any]] = {key: [] for key in optional_wm_fields}
+            for sample in samples:
+                sample_train_metadata = sample.train_metadata if isinstance(sample.train_metadata, dict) else {}
+                sample_metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+                wm = sample_train_metadata.get("world_model") or sample_metadata.get("world_model") or {}
+                wm_metadata.append(wm if isinstance(wm, dict) else {"raw": wm})
+                for output_key, candidate_keys in optional_wm_fields.items():
+                    value = getattr(sample, output_key, None)
+                    if value is None and isinstance(wm, dict):
+                        for candidate_key in candidate_keys:
+                            if candidate_key in wm:
+                                value = wm[candidate_key]
+                                break
+                    optional_values[output_key].append(value)
+            train_data["wm_metadata"] = wm_metadata
+            for output_key, values in optional_values.items():
+                if values and all(value is not None for value in values):
+                    train_data[output_key] = values
+
         # overwriting the raw reward
         if samples[0].metadata and "raw_reward" in samples[0].metadata:
             train_data["raw_reward"] = [sample.metadata["raw_reward"] for sample in samples]
@@ -835,6 +863,12 @@ class RolloutManager:
                 "step_wise_step_token_spans",
                 "step_wise_step_indices",
                 "group_indices",
+                "wm_metadata",
+                "wm_state_latents",
+                "wm_action_latents",
+                "wm_target_latents",
+                "wm_pred_latents",
+                "wm_rewards",
             ]:
                 if key not in data:
                     continue

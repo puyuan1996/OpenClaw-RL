@@ -356,26 +356,38 @@ def train_one_step(
         """
 
         # Get the batch.
+        batch_keys = [
+            "tokens",
+            "multimodal_train_inputs",
+            "packed_seq_params",
+            "total_lengths",
+            "response_lengths",
+            "loss_masks",
+            "log_probs",
+            "ref_log_probs",
+            "values",
+            "advantages",
+            "returns",
+            "rollout_log_probs",
+            "max_seq_lens",
+            "teacher_log_probs",
+            "teacher_topk_log_probs",
+            "teacher_topk_indices",
+        ]
+        if getattr(args, "world_model_enable", False):
+            batch_keys.extend(
+                [
+                    "wm_metadata",
+                    "wm_state_latents",
+                    "wm_action_latents",
+                    "wm_target_latents",
+                    "wm_pred_latents",
+                    "wm_rewards",
+                ]
+            )
         batch = get_batch(
             data_iterator,
-            [
-                "tokens",
-                "multimodal_train_inputs",
-                "packed_seq_params",
-                "total_lengths",
-                "response_lengths",
-                "loss_masks",
-                "log_probs",
-                "ref_log_probs",
-                "values",
-                "advantages",
-                "returns",
-                "rollout_log_probs",
-                "max_seq_lens",
-                "teacher_log_probs",
-                "teacher_topk_log_probs",
-                "teacher_topk_indices",
-            ],
+            batch_keys,
             args.data_pad_size_multiplier,
             args.qkv_format,
         )
