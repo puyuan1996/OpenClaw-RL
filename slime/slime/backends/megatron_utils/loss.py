@@ -1335,9 +1335,8 @@ def loss_function(
         loss, log = func(args, batch, logits, sum_of_sample_mean)
 
     # Megatron's pipeline schedule accumulates this value into an integer
-    # `total_num_tokens` tensor.  The masks are floating-point tensors because
-    # they also weight the loss, so use an integer nonzero count for the
-    # Megatron normalizer while keeping the loss reducer above unchanged.
+    # `total_num_tokens` tensor.  Count nonzero mask entries here and keep any
+    # continuous weighting local to the loss reducer above.
     num_tokens = torch.zeros((), dtype=torch.int, device=logits.device)
     for loss_mask in batch["loss_masks"]:
         valid_tokens = torch.count_nonzero(loss_mask).to(device=logits.device, dtype=torch.int)

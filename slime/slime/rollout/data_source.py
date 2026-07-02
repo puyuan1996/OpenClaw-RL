@@ -295,23 +295,33 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             return
         try:
             entries = []
-            for group in samples:
-                for sample in group:
-                    if sample.response_length == 0 or sample.tokens is None:
-                        continue
-                    if sample.rollout_log_probs is None or len(sample.rollout_log_probs) != sample.response_length:
-                        continue
-                    reward_value = float(sample.get_reward_value(self.args)) if sample.reward is not None else 0.0
-                    entries.append(
-                        {
-                            "tokens": sample.tokens,
-                            "response_length": sample.response_length,
-                            "loss_mask": sample.loss_mask if sample.loss_mask is not None else [1] * sample.response_length,
-                            "rollout_log_probs": sample.rollout_log_probs,
-                            "reward": reward_value,
-                            "advantage": reward_value,
-                        }
-                    )
+            for sample in _iter_sample_leaves(samples):
+                if sample.response_length == 0 or sample.tokens is None:
+                    continue
+                if sample.rollout_log_probs is None or len(sample.rollout_log_probs) != sample.response_length:
+                    continue
+                loss_mask = sample.loss_mask if sample.loss_mask is not None else [1] * sample.response_length
+                if len(loss_mask) != sample.response_length:
+                    continue
+                reward_value = float(sample.get_reward_value(self.args)) if sample.reward is not None else 0.0
+                policy_version = getattr(sample, "policy_version", None)
+                try:
+                    policy_version = int(policy_version)
+                except (TypeError, ValueError):
+                    policy_version = self.current_policy_version
+                if policy_version < 0:
+                    policy_version = self.current_policy_version
+                entries.append(
+                    {
+                        "tokens": sample.tokens,
+                        "response_length": sample.response_length,
+                        "loss_mask": loss_mask,
+                        "rollout_log_probs": sample.rollout_log_probs,
+                        "policy_version": policy_version,
+                        "reward": reward_value,
+                        "advantage": reward_value,
+                    }
+                )
             if entries:
                 self.sil_buffer.push(entries, current_step=self.total_added)
         except Exception as exc:
@@ -348,3 +358,13 @@ def _group_flat_samples_for_replay(samples: list[Sample], group_size: int) -> li
         if len(group) == group_size:
             groups.append(group)
     return groups
+
+
+def _iter_sample_leaves(samples):
+    """Yield Sample leaves from possibly nested rollout sample containers."""
+    if isinstance(samples, Sample):
+        yield samples
+        return
+    if isinstance(samples, (list, tuple)):
+        for item in samples:
+            yield from _iter_sample_leaves(item)

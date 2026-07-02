@@ -234,7 +234,7 @@ class MegatronTrainRayActor(TrainRayActor):
             torch.tensor(t, dtype=torch.long) for t in rollout_data["tokens"]
         ]
         rollout_data["loss_masks"] = [
-            torch.tensor(t, dtype=torch.float32) for t in rollout_data["loss_masks"]
+            torch.tensor(t, dtype=torch.int) for t in rollout_data["loss_masks"]
         ]
         # multimodal_train_inputs: kept on CPU as-is (no .to(cuda))
 
@@ -560,7 +560,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
                 if self.args.loss_type == "decoupled_policy_loss" and "current_policy_version" not in rollout_data:
-                    rollout_data["current_policy_version"] = [rollout_id] * len(rollout_data["tokens"])
+                    raise ValueError(
+                        "decoupled_policy_loss requires rollout_data['current_policy_version']; "
+                        "RolloutManager._convert_samples_to_train_data() should populate it."
+                    )
 
                 if getattr(self.args, "enable_trajectory_replay", False) and rollout_data.get("sil_sample_flags"):
                     try:

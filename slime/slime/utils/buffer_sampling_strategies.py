@@ -15,11 +15,14 @@ Usage:
     sampled_groups = strategy.sample(buffer, num_samples)
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import List, Optional
 import numpy as np
 
 from slime.utils.types import Sample
+
+logger = logging.getLogger(__name__)
 
 
 class BaseSamplingStrategy(ABC):
@@ -255,14 +258,20 @@ class FIFOWithStalenessStrategy(BaseSamplingStrategy):
 
         # Remove stale groups
         if stale_groups:
-            print(f"[Buffer Sampling] Removing {len(stale_groups)} stale groups "
-                  f"(staleness > {self.max_staleness})")
+            logger.info(
+                "Removing %d stale groups (staleness > %s)",
+                len(stale_groups),
+                self.max_staleness,
+            )
             self.remove_from_buffer(buffer, stale_groups)
 
         # Remove exhausted groups immediately to free up space
         if exhausted_groups:
-            print(f"[Buffer Sampling] Removing {len(exhausted_groups)} exhausted groups "
-                  f"(reuse_count >= {self.max_reuse_count}) to free up space")
+            logger.info(
+                "Removing %d exhausted groups (reuse_count >= %s) to free up space",
+                len(exhausted_groups),
+                self.max_reuse_count,
+            )
             self.remove_from_buffer(buffer, exhausted_groups)
 
         self.total_sampled += len(sampled)
@@ -358,8 +367,12 @@ class FIFOWithStalenessStrategy(BaseSamplingStrategy):
             version_counts = {}
             for v in sampled_versions:
                 version_counts[v] = version_counts.get(v, 0) + 1
-            print(f"[Buffer Sampling] Stratified sample: {dict(sorted(version_counts.items()))} "
-                  f"(total={len(sampled)} groups from {len(version_counts)} versions)")
+            logger.info(
+                "Stratified replay sample: %s (total=%d groups from %d versions)",
+                dict(sorted(version_counts.items())),
+                len(sampled),
+                len(version_counts),
+            )
 
         return sampled[:num_samples]
 
@@ -442,14 +455,20 @@ class LIFOWithStalenessStrategy(BaseSamplingStrategy):
 
         # Always remove stale groups
         if stale_groups:
-            print(f"[Buffer Sampling] Removing {len(stale_groups)} stale groups "
-                  f"(staleness > {self.max_staleness})")
+            logger.info(
+                "Removing %d stale groups (staleness > %s)",
+                len(stale_groups),
+                self.max_staleness,
+            )
             self.remove_from_buffer(buffer, stale_groups)
 
         # Remove exhausted groups immediately
         if exhausted_groups:
-            print(f"[Buffer Sampling] Removing {len(exhausted_groups)} exhausted groups "
-                  f"(reuse_count >= {self.max_reuse_count})")
+            logger.info(
+                "Removing %d exhausted groups (reuse_count >= %s)",
+                len(exhausted_groups),
+                self.max_reuse_count,
+            )
             self.remove_from_buffer(buffer, exhausted_groups)
 
         self.total_sampled += len(sampled)
@@ -462,8 +481,12 @@ class LIFOWithStalenessStrategy(BaseSamplingStrategy):
                 for v in versions:
                     version_counts[v] = version_counts.get(v, 0) + 1
                 version_range = f"[{min(versions)}, {max(versions)}]"
-                print(f"[Buffer Sampling] LIFO sample: {dict(sorted(version_counts.items()))} "
-                      f"(total={len(sampled)} groups, version_range={version_range}, newest-first)")
+                logger.info(
+                    "LIFO replay sample: %s (total=%d groups, version_range=%s, newest-first)",
+                    dict(sorted(version_counts.items())),
+                    len(sampled),
+                    version_range,
+                )
 
         return sampled
 
@@ -703,7 +726,7 @@ class PrioritySamplingStrategy(BaseSamplingStrategy):
                 scored_groups.append((group, score))
                 breakdowns.append(breakdown)
             except Exception as e:
-                print(f"[Warning] Failed to compute priority for group: {e}")
+                logger.warning("Failed to compute priority for replay group: %s", e)
                 # Assign default score
                 scored_groups.append((group, 0.0))
                 breakdowns.append({'final_score': 0.0, 'base_score_raw': 0.0})
@@ -748,14 +771,20 @@ class PrioritySamplingStrategy(BaseSamplingStrategy):
 
         # Always remove stale groups
         if stale_groups:
-            print(f"[Buffer Sampling] Removing {len(stale_groups)} stale groups "
-                  f"(staleness > {self.max_staleness})")
+            logger.info(
+                "Removing %d stale groups (staleness > %s)",
+                len(stale_groups),
+                self.max_staleness,
+            )
             self.remove_from_buffer(buffer, stale_groups)
 
         # Remove exhausted groups immediately
         if exhausted_groups:
-            print(f"[Buffer Sampling] Removing {len(exhausted_groups)} exhausted groups "
-                  f"(reuse_count >= {self.max_reuse_count})")
+            logger.info(
+                "Removing %d exhausted groups (reuse_count >= %s)",
+                len(exhausted_groups),
+                self.max_reuse_count,
+            )
             self.remove_from_buffer(buffer, exhausted_groups)
 
         self.total_sampled += len(sampled)
@@ -880,14 +909,20 @@ class RandomSamplingStrategy(BaseSamplingStrategy):
 
         # Always remove stale groups
         if stale_groups:
-            print(f"[Buffer Sampling] Removing {len(stale_groups)} stale groups "
-                  f"(staleness > {self.max_staleness})")
+            logger.info(
+                "Removing %d stale groups (staleness > %s)",
+                len(stale_groups),
+                self.max_staleness,
+            )
             self.remove_from_buffer(buffer, stale_groups)
 
         # Remove exhausted groups immediately
         if exhausted_groups:
-            print(f"[Buffer Sampling] Removing {len(exhausted_groups)} exhausted groups "
-                  f"(reuse_count >= {self.max_reuse_count})")
+            logger.info(
+                "Removing %d exhausted groups (reuse_count >= %s)",
+                len(exhausted_groups),
+                self.max_reuse_count,
+            )
             self.remove_from_buffer(buffer, exhausted_groups)
 
         self.total_sampled += len(sampled)
@@ -1046,8 +1081,11 @@ class HybridSamplingStrategy(BaseSamplingStrategy):
         valid_groups = self.filter_by_reuse_count(valid_groups)
 
         if len(valid_groups) == 0:
-            print(f"[Hybrid Sampling] No valid groups after filtering (buffer_size={len(buffer)}, "
-                  f"stale={len(stale_groups)})")
+            logger.info(
+                "Hybrid replay found no valid groups after filtering (buffer_size=%d, stale=%d)",
+                len(buffer),
+                len(stale_groups),
+            )
             # Remove stale groups
             if stale_groups:
                 self.remove_from_buffer(buffer, stale_groups)
@@ -1090,8 +1128,11 @@ class HybridSamplingStrategy(BaseSamplingStrategy):
         sampled = lifo_sampled + priority_sampled
 
         if len(sampled) == 0:
-            print(f"[Hybrid Sampling] No samples selected (lifo={len(lifo_sampled)}, "
-                  f"priority={len(priority_sampled)})")
+            logger.info(
+                "Hybrid replay selected no samples (lifo=%d, priority=%d)",
+                len(lifo_sampled),
+                len(priority_sampled),
+            )
             return []
 
         # === Step 6: Update buffer ===
@@ -1109,10 +1150,15 @@ class HybridSamplingStrategy(BaseSamplingStrategy):
         self.total_sampled += len(sampled)
 
         # === Step 7: Log sampling breakdown ===
-        print(f"[Hybrid Sampling] Sampled {len(sampled)} groups: "
-              f"{len(lifo_sampled)} LIFO ({self.lifo_ratio:.1%}) + "
-              f"{len(priority_sampled)} Priority ({self.priority_ratio:.1%}) "
-              f"from {len(valid_groups)} valid groups")
+        logger.info(
+            "Hybrid replay sampled %d groups: %d LIFO (%.1f%%) + %d Priority (%.1f%%) from %d valid groups",
+            len(sampled),
+            len(lifo_sampled),
+            self.lifo_ratio * 100.0,
+            len(priority_sampled),
+            self.priority_ratio * 100.0,
+            len(valid_groups),
+        )
 
         return sampled
 

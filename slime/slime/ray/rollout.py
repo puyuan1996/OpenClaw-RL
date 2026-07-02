@@ -217,6 +217,28 @@ class RolloutManager:
         return rollout_data_refs
 
     def sample_training_data(self, rollout_id: int, train_iter: int):
+        """Sample replay-buffer data for an extra training iteration.
+
+        Args:
+            rollout_id: Current rollout id used for logging and policy-version
+                bookkeeping.
+            train_iter: Extra train iteration index within the rollout.
+
+        Returns:
+            A Ray object-ref list containing DP-sharded training data. When
+            secondary-process metrics were queued, returns
+            ``(rollout_data_refs, pending_metrics)``. Returns ``None`` when the
+            replay buffer has no eligible groups, which tells the train loop to
+            stop only the remaining extra replay iterations.
+
+        Raises:
+            RuntimeError: If replay-buffer sampling is requested while the
+                data source buffer is disabled.
+
+        Side effects:
+            Updates ``self.rollout_id`` and may set
+            ``self._dynamic_global_batch_size`` for short replay batches.
+        """
         if not bool(getattr(self.data_source, "buffer_enabled", False)):
             raise RuntimeError("sample_training_data() requires replay buffer to be enabled.")
         self.rollout_id = rollout_id
@@ -888,15 +910,17 @@ class RolloutManager:
                 import statistics
 
                 sil_buffer = self.data_source.sil_buffer
-                sil_count = max(1, min(len(samples) // 4, len(sil_buffer)))
+                sil_count = 0 if len(samples) == 0 else min(max(1, len(samples) // 4), len(sil_buffer))
                 main_rewards = list(train_data.get("rewards", []))
                 baseline = float(statistics.median(main_rewards)) if main_rewards else 0.0
                 max_steps = float(getattr(self.args, "max_replay_loss_steps", 200))
                 final_coef = float(getattr(self.args, "replay_loss_coef", 0.001))
                 coef = min(self.rollout_id / max(max_steps, 1.0), 1.0) * final_coef
-                sil_entries = sil_buffer.sample(sil_count, self.rollout_id, baseline)
+                sil_entries = sil_buffer.sample(sil_count, self.rollout_id, baseline) if sil_count > 0 else []
 
                 if sil_entries:
+                    from slime.utils.sil_buffer import normalize_sil_loss_mask
+
                     num_main = len(samples)
                     sil_flags = [0] * num_main
                     sil_precomputed_advantages = [None] * num_main
@@ -910,10 +934,11 @@ class RolloutManager:
                             (response_length,), scaled_advantage_value, dtype=torch.float32
                         )
                         sil_flags[dst] = 1
-                        raw_mask = entry.get("loss_mask", [1] * response_length)
                         train_data["tokens"][dst] = entry["tokens"]
                         train_data["response_lengths"][dst] = response_length
-                        train_data["loss_masks"][dst] = [float(mask) for mask in raw_mask]
+                        train_data["loss_masks"][dst] = normalize_sil_loss_mask(
+                            entry.get("loss_mask"), response_length
+                        )
                         train_data["rewards"][dst] = float(entry["reward"])
                         train_data["raw_reward"][dst] = float(entry["reward"])
                         train_data["per_is_weights"][dst] = 1.0
@@ -922,7 +947,11 @@ class RolloutManager:
                         if "rollout_log_probs" in train_data:
                             train_data["rollout_log_probs"][dst] = entry.get("rollout_log_probs")
                         if "policy_versions" in train_data:
-                            train_data["policy_versions"][dst] = 0
+                            try:
+                                entry_policy_version = int(entry.get("policy_version", 0))
+                            except (TypeError, ValueError):
+                                entry_policy_version = 0
+                            train_data["policy_versions"][dst] = max(entry_policy_version, 0)
                         if "group_indices" in train_data:
                             train_data["group_indices"][dst] = -1_000_000 - offset
 

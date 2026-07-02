@@ -14,10 +14,11 @@ Design notes:
 - Uses an O(N) re-derivation each call instead of a persistent SumTree:
   buffer cap is typically <=4096 for 7B-20B runs, far cheaper than rollout.
 - IS weights are attached to `sample.metadata['per_is_weight']` of every
-  sample inside the sampled group; downstream readers (loss.py / data builders)
-  scale loss_masks by that scalar.
-- Priority is cached in `group[0].metadata['per_priority']` on first encounter
-  and refreshed whenever a fresh advantage estimate is available.
+  sample inside the sampled group; `rollout.py` carries them as
+  `per_is_weights`, and `loss.py` expands them to per-token loss weights.
+- Priority is cached in `group[0].metadata['per_priority']` on first encounter;
+  call `update_per_priorities_from_advantages()` explicitly if a caller wants to
+  refresh priorities after fresh advantage estimates are available.
 
 All behavior is gated by --buffer-sampling-strategy=per (no impact when off).
 """

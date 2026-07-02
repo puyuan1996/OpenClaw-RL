@@ -20,7 +20,23 @@ import random
 from collections import deque
 from typing import Any, Dict, List, Optional
 
-__all__ = ["SILBuffer"]
+__all__ = ["SILBuffer", "normalize_sil_loss_mask"]
+
+
+def normalize_sil_loss_mask(raw_mask: Any, response_length: int) -> List[int]:
+    """Return a binary response mask cropped/padded to ``response_length``."""
+    response_length = max(int(response_length), 0)
+    if raw_mask is None:
+        mask = [1] * response_length
+    else:
+        try:
+            mask = list(raw_mask)
+        except TypeError:
+            mask = [raw_mask]
+    mask = mask[:response_length]
+    if len(mask) < response_length:
+        mask.extend([1] * (response_length - len(mask)))
+    return [1 if float(v.item() if hasattr(v, "item") else v) != 0.0 else 0 for v in mask]
 
 
 class SILBuffer:
@@ -33,6 +49,7 @@ class SILBuffer:
         reward          float                  scalar reward
         advantage       float                  advantage at collection time
         rollout_log_probs  Optional[tensor]    behavior policy log probs
+        policy_version  int                    behavior policy version
         step_collected  int                    global step at admission
     """
 

@@ -48,12 +48,14 @@ def _per_sample_log_ratio_mean(
     if not proximal_log_probs_list:
         return torch.zeros(0)
 
-    device = proximal_log_probs_list[0].device
     dtype = torch.float32
     means = []
     for p, b, m in zip(proximal_log_probs_list, behavior_log_probs_list, loss_masks_list):
+        device = p.device
+        p = p.to(device=device, dtype=dtype)
+        b = b.to(device=device, dtype=dtype)
         mask = m.to(dtype=dtype, device=device)
-        diff = (p.to(dtype) - b.to(dtype)) * mask
+        diff = (p - b) * mask
         denom = mask.sum().clamp_min(1.0)
         means.append(diff.sum() / denom)
     return torch.stack(means)
@@ -86,17 +88,15 @@ def compute_topr_seq_weights(
     if w_max is not None:
         w_seq = torch.clamp(w_seq, max=float(w_max))
 
-    # broadcast to token layout
-    pieces = []
-    for w, m in zip(w_seq, loss_masks_list):
-        pieces.append(torch.full_like(m, fill_value=float(w.detach().item()), dtype=w.dtype))
-    w_seq_token = torch.cat(pieces, dim=0) if pieces else torch.zeros(0, dtype=w_seq.dtype, device=w_seq.device)
-    # actually return a non-detached version so gradient can flow through w_seq
-    # (this matters only when blending; pure replacement detaches anyway)
+    # Broadcast each sequence scalar to the concatenated token layout.
     token_pieces = []
     for w, m in zip(w_seq, loss_masks_list):
-        token_pieces.append(w.expand(m.shape[0]))
-    w_seq_token = torch.cat(token_pieces, dim=0)
+        token_pieces.append(w.expand(int(m.numel())))
+    w_seq_token = (
+        torch.cat(token_pieces, dim=0)
+        if token_pieces
+        else torch.zeros(0, dtype=w_seq.dtype, device=w_seq.device)
+    )
     return w_seq, w_seq_token
 
 
