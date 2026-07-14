@@ -21,7 +21,7 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Ten
 
 
 class SIGReg(nn.Module):
-    """Sketch Isotropic Gaussian Regularizer adapted from local le-wm/module.py."""
+    """Sketch Isotropic Gaussian Regularizer adapted for the text-latent probe."""
 
     def __init__(self, knots: int = 17, num_proj: int = 1024) -> None:
         super().__init__()
@@ -124,7 +124,7 @@ class TextLatentWorldModel(nn.Module):
 
     The module treats policy/frozen-encoder hidden states as raw material only.
     All branches pass through explicit projectors before entering the shared
-    latent space, matching the hidden-to-belief-latent design in the survey.
+    latent space, matching the controlled hidden-to-belief-latent design.
     """
 
     def __init__(self, config: TextLatentWorldModelConfig) -> None:
@@ -209,22 +209,22 @@ class TextLatentWorldModel(nn.Module):
         )
         pred = out["pred_latent"]
         target = out["target_latent"]
-        pred_target = target.detach() if self.config.stop_grad_target else target
+        loss_target = target.detach() if self.config.stop_grad_target else target
         if pred_loss_type == "cosine":
-            pred_loss = mean_cosine_distance(pred, pred_target)
+            pred_loss = mean_cosine_distance(pred, loss_target)
         elif pred_loss_type == "smooth_l1":
-            pred_loss = F.smooth_l1_loss(pred, pred_target)
+            pred_loss = F.smooth_l1_loss(pred, loss_target)
         else:
-            pred_loss = F.mse_loss(pred, pred_target)
+            pred_loss = F.mse_loss(pred, loss_target)
 
-        sigreg_loss = self.sigreg(torch.stack([out["state_latent"], target], dim=0))
+        sigreg_loss = self.sigreg(torch.stack([out["state_latent"], loss_target], dim=0))
         contrast_loss = pred_loss * 0.0
         delta = pred_loss * 0.0
         if action_hidden.size(0) > 1 and action_contrast_coef != 0.0:
             shuffled_action = torch.roll(out["action_latent"], shifts=1, dims=0)
             shuffled_pred = self.predictor(out["state_latent"], shuffled_action)
-            pos_dist = (pred - target).pow(2).mean(dim=-1)
-            neg_dist = (shuffled_pred - target).pow(2).mean(dim=-1)
+            pos_dist = (pred - loss_target).pow(2).mean(dim=-1)
+            neg_dist = (shuffled_pred - loss_target).pow(2).mean(dim=-1)
             margin = float(self.config.action_contrast_margin)
             contrast_loss = F.relu(margin + pos_dist - neg_dist).mean()
             delta = action_delta(pred, shuffled_pred)

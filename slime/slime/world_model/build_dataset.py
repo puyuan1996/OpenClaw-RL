@@ -11,6 +11,8 @@ import torch
 
 from slime.utils.types import Sample
 
+from .metadata import canonicalize_context_identity
+
 
 def _iter_sample_dicts(path: Path) -> Iterable[dict[str, Any]]:
     if path.suffix in {".pt", ".pth"}:
@@ -145,6 +147,8 @@ def _observation_source(record: dict[str, Any]) -> str:
         if isinstance(payload, dict) and (
             "status" in payload or "score" in payload or "raw_score" in payload or "eval_reason" in payload
         ):
+            if payload.get("status") == "no_tool_result":
+                return "no_tool_result"
             return "eval_summary"
     return "unknown"
 
@@ -157,7 +161,7 @@ def _record_matches(
     require_tool_result: bool,
 ) -> bool:
     if statuses:
-        status = str(record.get("status", "")).lower()
+        status = str(record.get("trajectory_status", record.get("status", ""))).lower()
         if status not in statuses:
             return False
     if exclude_eval_reasons:
@@ -196,12 +200,14 @@ def extract_world_model_records(
         if wm is None and isinstance(metadata, dict):
             wm = metadata.get("world_model")
         if isinstance(wm, dict):
-            record = _enrich_legacy_record(
-                wm,
-                item,
-                context_max_chars=context_max_chars,
-                context_source=context_source,
-                context_truncation=context_truncation,
+            record = canonicalize_context_identity(
+                _enrich_legacy_record(
+                    wm,
+                    item,
+                    context_max_chars=context_max_chars,
+                    context_source=context_source,
+                    context_truncation=context_truncation,
+                )
             )
             if _record_matches(
                 record,

@@ -19,7 +19,11 @@ WM_LR="${WM_LR:-1e-3}"
 WM_SIGREG_COEF="${WM_SIGREG_COEF:-0.0}"
 WM_ACTION_CONTRAST_COEF="${WM_ACTION_CONTRAST_COEF:-0.0}"
 WM_VALUE_COEF="${WM_VALUE_COEF:-0.0}"
+WM_RANK_SCORE_MODE="${WM_RANK_SCORE_MODE:-pred_error}"
+WM_SPLIT_GROUP_KEY="${WM_SPLIT_GROUP_KEY:-context_hash}"
 WM_HF_MODEL="${WM_HF_MODEL:-}"
+WM_HF_LOCAL_FILES_ONLY="${WM_HF_LOCAL_FILES_ONLY:-1}"
+WM_HF_TRUST_REMOTE_CODE="${WM_HF_TRUST_REMOTE_CODE:-0}"
 WM_HF_MAX_LENGTH="${WM_HF_MAX_LENGTH:-2048}"
 WM_HF_POOLING="${WM_HF_POOLING:-mean}"
 
@@ -51,11 +55,19 @@ else
     echo "[wm-offline-probe] HF encoder is fail-closed. Set WM_ALLOW_HF=1 and WM_HF_MODEL=/local/path." >&2
     exit 1
   fi
-  if [[ -z "${WM_HF_MODEL}" || ! -d "${WM_HF_MODEL}" ]]; then
+  if [[ -z "${WM_HF_MODEL}" || ( "${WM_HF_LOCAL_FILES_ONLY}" == "1" && ! -d "${WM_HF_MODEL}" ) ]]; then
     echo "[wm-offline-probe] missing local WM_HF_MODEL: ${WM_HF_MODEL}" >&2
     exit 1
   fi
   CACHE_ARGS+=(--hf-model "${WM_HF_MODEL}" --max-length "${WM_HF_MAX_LENGTH}" --pooling "${WM_HF_POOLING}")
+  if [[ "${WM_HF_LOCAL_FILES_ONLY}" == "1" ]]; then
+    CACHE_ARGS+=(--hf-local-files-only)
+  else
+    CACHE_ARGS+=(--hf-allow-downloads)
+  fi
+  if [[ "${WM_HF_TRUST_REMOTE_CODE}" == "1" ]]; then
+    CACHE_ARGS+=(--hf-trust-remote-code)
+  fi
 fi
 
 PYTHONPATH="${REPO_ROOT}/slime:${REPO_ROOT}/terminal-rl" "${PYTHON_BIN}" "${CACHE_ARGS[@]}"
@@ -69,11 +81,18 @@ PYTHONPATH="${REPO_ROOT}/slime:${REPO_ROOT}/terminal-rl" "${PYTHON_BIN}" -m slim
   --lr "${WM_LR}" \
   --sigreg-coef "${WM_SIGREG_COEF}" \
   --action-contrast-coef "${WM_ACTION_CONTRAST_COEF}" \
-  --value-coef "${WM_VALUE_COEF}"
+  --value-coef "${WM_VALUE_COEF}" \
+  --split-group-key "${WM_SPLIT_GROUP_KEY}"
+
+RANK_OUTPUT="${WM_OUT_DIR}/rankings.jsonl"
+if [[ "${WM_RANK_SCORE_MODE}" == "pred_error" ]]; then
+  RANK_OUTPUT="${WM_OUT_DIR}/oracle_pred_error_diagnostic.jsonl"
+fi
 
 PYTHONPATH="${REPO_ROOT}/slime:${REPO_ROOT}/terminal-rl" "${PYTHON_BIN}" -m slime.world_model.rank_candidates \
   --checkpoint "${WM_OUT_DIR}/probe.pt" \
   --input "${WM_OUT_DIR}/cached_hidden.pt" \
-  --output "${WM_OUT_DIR}/rankings.jsonl"
+  --output "${RANK_OUTPUT}" \
+  --score-mode "${WM_RANK_SCORE_MODE}"
 
 echo "[wm-offline-probe] done. Outputs: ${WM_OUT_DIR}"

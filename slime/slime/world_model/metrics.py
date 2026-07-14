@@ -4,6 +4,12 @@ import torch
 import torch.nn.functional as F
 
 
+def require_finite_tensor(value: torch.Tensor, *, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor) or not bool(torch.isfinite(value).all().item()):
+        raise ValueError(f"{name} contains NaN or Inf")
+    return value
+
+
 def effective_rank(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """Entropy-based effective rank for collapse diagnostics."""
     if x.numel() == 0:

@@ -66,6 +66,18 @@ def _record_threshold(bucket: str, args: argparse.Namespace) -> int:
     return int(args.min_records)
 
 
+def _ranking_artifact_status(path: Path) -> tuple[int, bool]:
+    rows = [json.loads(line) for line in path.open("r", encoding="utf-8") if line.strip()]
+    eligible = bool(rows) and all(
+        row.get("score_source") == "value"
+        and row.get("oracle_only") is False
+        and row.get("requires_target") is False
+        and row.get("reward_label_verified_execution_outcome") is True
+        for row in rows
+    )
+    return len(rows), eligible
+
+
 def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict[str, Any]:
     bucket_dir = root / bucket
     paths = {
@@ -78,7 +90,12 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
         "config": bucket_dir / "stage_a_config.json",
         "log": bucket_dir / "logs" / "stage_a.log",
     }
-    missing = [name for name, path in paths.items() if not path.exists() or path.stat().st_size == 0]
+    optional_artifacts = {"rankings"}
+    missing = [
+        name
+        for name, path in paths.items()
+        if name not in optional_artifacts and (not path.exists() or path.stat().st_size == 0)
+    ]
 
     records_summary = _read_json(paths["records_summary"]) if paths["records_summary"].exists() else {}
     eval_summary = _read_json(paths["eval_summary"]) if paths["eval_summary"].exists() else {}
@@ -88,8 +105,9 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
 
     tensor_stats = _load_tensor_stats(paths["cache"]) if paths["cache"].exists() else {"available": False, "reason": "missing_cache"}
     rankings_count = None
+    rankings_execution_eligible = False
     if paths["rankings"].exists():
-        rankings_count = sum(1 for line in paths["rankings"].open("r", encoding="utf-8") if line.strip())
+        rankings_count, rankings_execution_eligible = _ranking_artifact_status(paths["rankings"])
 
     record_count = int(records_summary.get("record_count") or eval_summary.get("record_count") or 0)
     min_records = _record_threshold(bucket, args)
@@ -107,9 +125,12 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
     value_coef = _float((config or {}).get("value_coef"))
     value_spearman = _float(_nested(metrics, ["value_reward", "spearman"]))
     uncertainty_spearman = _float(_nested(metrics, ["uncertainty_error", "spearman_uncertainty_vs_pred_mse"]))
+    evaluation_scope = _nested(eval_summary, ["evaluation_split", "scope"])
 
     checks = {
         "artifacts_ok": not missing,
+        "group_heldout_ok": bool(getattr(args, "allow_non_group_heldout", False))
+        or evaluation_scope == "group_heldout",
         "record_count_ok": record_count >= min_records,
         "context_unique_ok": context_unique >= min(int(args.min_context_unique), max(2, record_count)),
         "context_not_fully_truncated": context_truncated_ratio is None or context_truncated_ratio < float(args.max_context_truncated_ratio),
@@ -119,7 +140,10 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
         "shuffle_gap_ok": shuffle_gap is not None and shuffle_gap > float(args.min_shuffle_gap),
         "zero_action_gap_ok": zero_gap is not None and zero_gap > float(args.min_zero_action_gap),
         "action_delta_ok": action_delta is not None and action_delta > float(args.min_action_delta),
-        "rankings_ok": rankings_count == record_count if rankings_count is not None else False,
+        "rankings_ok": (
+            not args.require_execution_rankings
+            or (rankings_count == record_count and rankings_execution_eligible)
+        ),
     }
     failed = [name for name, ok in checks.items() if not ok]
 
@@ -130,8 +154,10 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
         "record_count": record_count,
         "min_records": min_records,
         "rankings": rankings_count,
+        "rankings_execution_eligible": rankings_execution_eligible,
         "context_text_unique_count": context_unique,
         "context_truncated_ratio": context_truncated_ratio,
+        "evaluation_scope": evaluation_scope,
         "state_hidden_pairwise_l2_mean": state_hidden_pairwise,
         "state_hidden_feature_var_mean": _float(_nested(tensor_stats, ["state_hidden", "feature_var_mean"])),
         "state_latent_effective_rank": state_latent_rank,
@@ -156,7 +182,7 @@ def summarize_stage_a(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     rows = [_summarize_bucket(root, bucket, args) for bucket in buckets]
     failed = [row for row in rows if not row["passed"]]
     return {
-        "schema_version": "openclaw_text_jepa_stage_a_gate_summary_v1",
+        "schema_version": "openclaw_text_jepa_stage_a_gate_summary_v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "input": str(root),
         "passed": not failed,
@@ -182,6 +208,16 @@ def main() -> None:
     parser.add_argument("--min-shuffle-gap", type=float, default=0.0)
     parser.add_argument("--min-zero-action-gap", type=float, default=0.0)
     parser.add_argument("--min-action-delta", type=float, default=0.0)
+    parser.add_argument(
+        "--require-execution-rankings",
+        action="store_true",
+        help="Require a complete value-only ranking artifact; oracle diagnostics never satisfy this gate.",
+    )
+    parser.add_argument(
+        "--allow-non-group-heldout",
+        action="store_true",
+        help="Allow diagnostic in-sample/record-heldout inputs to pass the gate (disabled by default).",
+    )
     parser.add_argument("--no-fail", action="store_true", help="Always exit 0 after writing the report.")
     args = parser.parse_args()
 

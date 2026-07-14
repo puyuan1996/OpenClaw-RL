@@ -2,7 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from typing import Any
+
+
+_SECRET_NAME = (
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|passwd|secret|"
+    r"openai_api_key|github_token|gh_token|hf_token|aws_access_key_id|aws_secret_access_key|"
+    r"[a-z0-9_]*(?:_token|_secret|_password|_api_key))"
+)
+_QUOTED_SECRET_RE = re.compile(rf"([\"']{_SECRET_NAME}[\"']\s*:\s*[\"'])(.*?)([\"'])", re.IGNORECASE)
+_QUOTED_ASSIGNMENT_RE = re.compile(rf"(\b{_SECRET_NAME}\b\s*=\s*[\"'])(.*?)([\"'])", re.IGNORECASE)
+_BARE_SECRET_RE = re.compile(rf"(\b{_SECRET_NAME}\b\s*[:=]\s*)([^\s,;}}\"']+)", re.IGNORECASE)
+_BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[a-z0-9._~+/=-]{8,}")
+_URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://[^:/\s]+:)[^@\s]+@")
+_TOKEN_LITERAL_RE = re.compile(
+    r"(?i)\b(?:sk-[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9]{20,}|AKIA[A-Z0-9]{16})\b"
+)
 
 
 def is_world_model_enabled(args: Any) -> bool:
@@ -25,6 +42,46 @@ def _jsonable(value: Any) -> Any:
 def stable_hash(value: Any, *, digest_size: int = 16) -> str:
     payload = json.dumps(_jsonable(value), ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=digest_size).hexdigest()
+
+
+def canonicalize_context_identity(record: dict[str, Any]) -> dict[str, Any]:
+    """Derive split identity from the exact context text consumed by the encoder."""
+    normalized = dict(record)
+    context_text = normalized.get("context_text")
+    if context_text is not None and not isinstance(context_text, str):
+        context_text = json.dumps(context_text, ensure_ascii=False, sort_keys=True, default=str)
+        normalized["context_text"] = context_text
+    previous_hash = normalized.get("context_hash")
+    if not context_text:
+        if previous_hash:
+            normalized["source_context_hash"] = previous_hash
+        normalized["context_hash"] = None
+        normalized["context_hash_schema"] = "missing_context_text"
+        return normalized
+    canonical_hash = stable_hash(context_text)
+    if previous_hash and previous_hash != canonical_hash:
+        normalized["source_context_hash"] = previous_hash
+    normalized["context_hash"] = canonical_hash
+    normalized["context_hash_schema"] = "canonical_context_text_v1"
+    return normalized
+
+
+def redact_sensitive_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
+    text = _URL_CREDENTIAL_RE.sub(r"\1[REDACTED]@", text)
+    text = _QUOTED_SECRET_RE.sub(r"\1[REDACTED]\3", text)
+    text = _QUOTED_ASSIGNMENT_RE.sub(r"\1[REDACTED]\3", text)
+    text = _BARE_SECRET_RE.sub(r"\1[REDACTED]", text)
+    return _TOKEN_LITERAL_RE.sub("[REDACTED]", text)
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _truncate(text: Any, max_chars: int, *, strategy: str = "head") -> str:
@@ -52,14 +109,14 @@ def _tool_action_text(call: dict[str, Any], max_chars: int) -> str:
     if args is None:
         args = call.get("arguments")
     args_text = json.dumps(_jsonable(args), ensure_ascii=False, sort_keys=True, default=str)
-    return _truncate(f"{name}({args_text})", max_chars, strategy="head_tail")
+    return _truncate(redact_sensitive_text(f"{name}({args_text})"), max_chars, strategy="head_tail")
 
 
 def _extract_action_text(turn: dict[str, Any], max_chars: int) -> str:
     parts: list[str] = []
     assistant = str(turn.get("assistant_output") or "").strip()
     if assistant:
-        parts.append(assistant)
+        parts.append(redact_sensitive_text(assistant))
     for call in turn.get("tool_calls") or []:
         if isinstance(call, dict):
             parts.append(_tool_action_text(call, max_chars))
@@ -76,7 +133,7 @@ def _extract_context_text(turn: dict[str, Any], *, task_meta: dict[str, Any], ma
         "context_messages": context_messages,
     }
     return _truncate(
-        json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, default=str),
+        redact_sensitive_text(json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, default=str)),
         max_chars,
         strategy="head_tail",
     )
@@ -90,29 +147,33 @@ def _extract_observation_text(
     eval_details: dict[str, Any] | None,
     eval_error: str | None,
     max_chars: int,
+    is_terminal: bool,
 ) -> str:
     observations: list[str] = []
     for call in turn.get("tool_calls") or []:
         if isinstance(call, dict) and call.get("result") is not None:
-            observations.append(str(call.get("result")))
+            observations.append(redact_sensitive_text(call.get("result")))
     if not observations:
-        reason = None
-        if isinstance(eval_details, dict):
-            reason = eval_details.get("reason") or eval_details.get("message")
-        observations.append(
-            json.dumps(
-                {
-                    "status": getattr(status, "value", str(status)),
-                    "score": reward.get("score"),
-                    "raw_score": reward.get("raw_score"),
-                    "eval_reason": reason,
-                    "eval_error": eval_error,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
+        if is_terminal:
+            reason = None
+            if isinstance(eval_details, dict):
+                reason = eval_details.get("reason") or eval_details.get("message")
+            observations.append(
+                json.dumps(
+                    {
+                        "status": getattr(status, "value", str(status)),
+                        "score": _finite_number(reward.get("score")),
+                        "raw_score": _finite_number(reward.get("raw_score")),
+                        "eval_reason": redact_sensitive_text(reason) if reason else None,
+                        "eval_error": redact_sensitive_text(eval_error) if eval_error else None,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
             )
-        )
+        else:
+            observations.append('{"status": "no_tool_result"}')
     return _truncate("\n".join(observations), max_chars, strategy="head_tail")
 
 
@@ -126,8 +187,16 @@ def build_terminal_world_model_record(
     eval_details: dict[str, Any] | None,
     eval_error: str | None,
     max_chars: int,
+    is_last_turn: bool | None = None,
 ) -> dict[str, Any]:
     reward = sample.reward if isinstance(getattr(sample, "reward", None), dict) else {}
+    sample_metadata = getattr(sample, "metadata", {}) if isinstance(getattr(sample, "metadata", {}), dict) else {}
+    turn_idx = int(turn.get("turn_idx", sample_metadata.get("turn_idx", 0) or 0))
+    num_turns = sample_metadata.get("num_turns")
+    if num_turns is not None:
+        final_turn = turn_idx >= int(num_turns) - 1
+    else:
+        final_turn = bool(is_last_turn)
     context_text = _extract_context_text(turn, task_meta=task_meta, max_chars=max_chars)
     action_text = _extract_action_text(turn, max_chars)
     next_observation_text = _extract_observation_text(
@@ -137,18 +206,15 @@ def build_terminal_world_model_record(
         eval_details=eval_details,
         eval_error=eval_error,
         max_chars=max_chars,
+        is_terminal=final_turn,
     )
     context_messages = turn.get("context_messages") or []
     response_length = int(getattr(sample, "response_length", 0) or 0)
     token_count = len(getattr(sample, "tokens", []) or [])
-    sample_metadata = getattr(sample, "metadata", {}) if isinstance(getattr(sample, "metadata", {}), dict) else {}
-    turn_idx = int(turn.get("turn_idx", sample_metadata.get("turn_idx", 0) or 0))
-    num_turns = sample_metadata.get("num_turns")
-    status_value = getattr(status, "value", str(status))
-    abnormal_done = status_value in {"truncated", "aborted", "failed"}
-    final_turn = num_turns is not None and turn_idx >= int(num_turns) - 1
+    terminal_status = getattr(status, "value", str(status))
+    status_value = terminal_status if final_turn else "in_progress"
     return {
-        "schema": "openclaw_text_jepa_world_model_v1",
+        "schema": "openclaw_text_jepa_world_model_v2",
         "hidden_source": "cached_or_frozen_encoder",
         "task_name": task_meta.get("task_name"),
         "task_path": task_meta.get("task_path"),
@@ -161,8 +227,9 @@ def build_terminal_world_model_record(
         "turn_idx": turn_idx,
         "num_turns": num_turns,
         "status": status_value,
-        "done": bool(final_turn or abnormal_done),
-        "context_hash": stable_hash(context_messages),
+        "trajectory_status": terminal_status,
+        "done": bool(final_turn),
+        "context_hash": stable_hash(context_text),
         "action_hash": stable_hash(action_text),
         "next_observation_hash": stable_hash(next_observation_text),
         "context_token_len": max(0, token_count - response_length),
@@ -172,9 +239,14 @@ def build_terminal_world_model_record(
         "context_text_truncation": "head_tail",
         "action_text": action_text,
         "next_observation_text": next_observation_text,
-        "reward_score": reward.get("score"),
-        "reward_base_score": reward.get("base_score"),
-        "reward_raw_score": reward.get("raw_score"),
+        "reward_score": _finite_number(reward.get("score")),
+        "reward_base_score": _finite_number(reward.get("base_score")),
+        "reward_raw_score": _finite_number(reward.get("raw_score")),
+        "reward_label_scope": "turn_return_or_step_score",
+        "reward_label_source": "sample.reward.score",
+        "reward_label_semantics": "training_reward_unspecified",
+        "reward_label_is_execution_outcome": None,
+        "reward_label_terminal": bool(final_turn),
         "has_tool_result": any(
             isinstance(call, dict) and bool(call.get("result"))
             for call in (turn.get("tool_calls") or [])
@@ -197,6 +269,7 @@ def attach_terminal_world_model_metadata(
         return
     max_chars = int(getattr(args, "world_model_metadata_max_chars", 4096) or 4096)
     turn_by_idx = {int(turn.get("turn_idx", i)): turn for i, turn in enumerate(turn_records or [])}
+    last_turn_idx = max(turn_by_idx, default=None)
     for sample in samples:
         metadata = sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}
         sample.metadata = metadata
@@ -213,6 +286,7 @@ def attach_terminal_world_model_metadata(
             eval_details=eval_details,
             eval_error=eval_error,
             max_chars=max_chars,
+            is_last_turn=last_turn_idx is not None and turn_idx == last_turn_idx,
         )
         sample.metadata["world_model"] = record
         train_metadata = dict(sample.train_metadata or {})

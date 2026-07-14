@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -10,7 +11,11 @@ from typing import Any
 
 import torch
 
-from .evaluate_probe import _spearman
+from .cache_text_hidden import validate_hidden_cache_integrity
+from .checkpoint import select_evaluation_indices, trained_value_head_status
+from .evaluate_probe import _spearman, _subset_payload
+from .metrics import require_finite_tensor
+from .metadata import canonicalize_context_identity
 from .modules import TextLatentWorldModel, TextLatentWorldModelConfig
 
 
@@ -20,8 +25,16 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         for line in fh:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                rows.append(canonicalize_context_identity(json.loads(line)))
     return rows
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _float(value: Any) -> float | None:
@@ -63,18 +76,15 @@ def _load_cache(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise TypeError(f"Expected dict cache payload in {path}, got {type(payload).__name__}")
-    for key in ["state_hidden", "action_hidden", "target_hidden"]:
+    validate_hidden_cache_integrity(payload)
+    for key in ["state_hidden", "action_hidden"]:
         if key not in payload:
             raise KeyError(f"Missing {key} in {path}")
     count = int(payload["state_hidden"].shape[0])
-    for key in ["action_hidden", "target_hidden"]:
+    for key in ["action_hidden"]:
         if int(payload[key].shape[0]) != count:
             raise ValueError(f"Inconsistent {key} length: expected {count}, got {int(payload[key].shape[0])}")
     return payload
-
-
-def _rankdata(values: list[float]) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.float32)
 
 
 def _group_records(
@@ -112,6 +122,44 @@ def _group_records(
     return groups
 
 
+def _require_candidate_groups(groups: list[list[int]]) -> None:
+    if not groups:
+        raise ValueError(
+            "no eligible candidate groups remain after split/group/reward filters; "
+            "check group_key, min_candidates, and reward variation"
+        )
+
+
+def _validate_candidate_group_scope(group_key: str, evaluation_split: dict[str, Any]) -> None:
+    if evaluation_split.get("scope") != "group_heldout":
+        return
+    split_group_key = evaluation_split.get("split_group_key")
+    if split_group_key != group_key:
+        raise ValueError(
+            "group-heldout candidate evaluation requires group_key to match the checkpoint split_group_key: "
+            f"group_key={group_key!r} split_group_key={split_group_key!r}"
+        )
+
+
+def _reward_label_contract(records: list[dict[str, Any]]) -> dict[str, Any]:
+    fields = [
+        "reward_label_scope",
+        "reward_label_source",
+        "reward_label_semantics",
+        "reward_label_is_execution_outcome",
+    ]
+    contracts: dict[str, dict[str, Any]] = {}
+    for row in records:
+        contract = {field: row.get(field) for field in fields}
+        key = json.dumps(contract, ensure_ascii=False, sort_keys=True, default=str)
+        contracts[key] = contract
+    if len(contracts) > 1:
+        raise ValueError("candidate-set records contain inconsistent reward label contracts")
+    contract = next(iter(contracts.values())) if contracts else {field: None for field in fields}
+    contract["verified_execution_outcome"] = contract.get("reward_label_is_execution_outcome") is True
+    return contract
+
+
 def evaluate_candidate_sets(
     *,
     checkpoint: Path,
@@ -125,6 +173,7 @@ def evaluate_candidate_sets(
     require_reward_variation: bool = True,
     device_name: str = "auto",
     uncertainty_coef: float = 0.0,
+    split: str = "auto",
 ) -> dict[str, Any]:
     if device_name == "auto":
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -135,6 +184,28 @@ def evaluate_candidate_sets(
     count = int(payload["state_hidden"].shape[0])
     if len(records) != count:
         raise ValueError(f"records/cache length mismatch: records={len(records)} cache={count}")
+    cache_metadata = payload.get("metadata")
+    cache_metadata = cache_metadata if isinstance(cache_metadata, dict) else {}
+    expected_records_digest = cache_metadata.get("input_records_sha256")
+    if not expected_records_digest:
+        raise ValueError(
+            "cache metadata does not contain input_records_sha256; rebuild the cache before candidate eval"
+        )
+    actual_records_digest = _file_sha256(records_path)
+    if actual_records_digest != expected_records_digest:
+        raise ValueError("records/cache provenance mismatch: input_records_sha256 differs")
+
+    model, checkpoint_metadata = _load_checkpoint(checkpoint, device)
+    source_record_indices, evaluation_split = select_evaluation_indices(
+        checkpoint_metadata,
+        cache_metadata,
+        count=count,
+        requested_split=split,
+    )
+    _validate_candidate_group_scope(group_key, evaluation_split)
+    records = [records[index] for index in source_record_indices]
+    payload = _subset_payload(payload, source_record_indices)
+    reward_label_contract = _reward_label_contract(records)
 
     groups = _group_records(
         records,
@@ -143,20 +214,25 @@ def evaluate_candidate_sets(
         max_candidates=max_candidates,
         require_reward_variation=require_reward_variation,
     )
+    _require_candidate_groups(groups)
 
-    model, checkpoint_metadata = _load_checkpoint(checkpoint, device)
+    value_trained, value_reason = trained_value_head_status(checkpoint_metadata)
+    if not value_trained:
+        raise ValueError(f"candidate-set eval requires a reward-supervised value head: {value_reason}")
+    if uncertainty_coef != 0.0:
+        raise ValueError(
+            "uncertainty_coef must be 0.0 for v1 checkpoints because the uncertainty head has no dedicated loss"
+        )
     tensors = {
         "state_hidden": payload["state_hidden"].float().to(device),
         "action_hidden": payload["action_hidden"].float().to(device),
-        "target_hidden": payload["target_hidden"].float().to(device),
     }
     with torch.no_grad():
         out = model(**tensors)
         if out["value"] is None:
             raise ValueError("candidate-set eval requires a checkpoint with value_head enabled")
-        value = out["value"].detach().float().cpu()
-        uncertainty = out["uncertainty"].detach().float().cpu() if out["uncertainty"] is not None else torch.zeros_like(value)
-        score = value - float(uncertainty_coef) * uncertainty
+        value = require_finite_tensor(out["value"].detach().float().cpu(), name="candidate value scores")
+        score = value
 
     group_rows: list[dict[str, Any]] = []
     top1_rewards: list[float] = []
@@ -170,7 +246,6 @@ def evaluate_candidate_sets(
         rewards = torch.tensor([float(records[idx].get("reward_score")) for idx in indices], dtype=torch.float32)
         scores = score[indices]
         values = value[indices]
-        uncertainties = uncertainty[indices]
         order = torch.argsort(scores, descending=True)
         best_idx = int(order[0].item())
         oracle_idx = int(torch.argmax(rewards).item())
@@ -196,10 +271,10 @@ def evaluate_candidate_sets(
                 "task_name": first_record.get("task_name"),
                 "task_path": first_record.get("task_path"),
                 "selected_local_index": best_idx,
-                "selected_record_index": indices[best_idx],
+                "selected_record_index": source_record_indices[indices[best_idx]],
                 "selected_reward": top_reward,
                 "oracle_local_index": oracle_idx,
-                "oracle_record_index": indices[oracle_idx],
+                "oracle_record_index": source_record_indices[indices[oracle_idx]],
                 "oracle_reward": oracle_reward,
                 "random_expected_reward": random_reward,
                 "oracle_regret": regret,
@@ -208,11 +283,11 @@ def evaluate_candidate_sets(
                 "spearman_reason": corr_reason,
                 "candidates": [
                     {
-                        "record_index": int(idx),
+                        "record_index": int(source_record_indices[idx]),
+                        "subset_record_index": int(idx),
                         "rank": int((order == local_idx).nonzero(as_tuple=False)[0].item()),
                         "score": float(scores[local_idx].item()),
                         "value": float(values[local_idx].item()),
-                        "uncertainty": float(uncertainties[local_idx].item()),
                         "reward": float(rewards[local_idx].item()),
                         "uid": records[idx].get("uid"),
                         "sample_index": records[idx].get("sample_index"),
@@ -231,7 +306,7 @@ def evaluate_candidate_sets(
 
     candidate_count_hist = Counter(len(group) for group in groups)
     summary = {
-        "schema_version": "openclaw_text_jepa_u2_candidate_set_eval_v1",
+        "schema_version": "openclaw_text_jepa_u2_candidate_set_eval_v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "cache": str(cache),
@@ -243,6 +318,12 @@ def evaluate_candidate_sets(
         "max_candidates": int(max_candidates),
         "require_reward_variation": bool(require_reward_variation),
         "uncertainty_coef": float(uncertainty_coef),
+        "uncertainty": {
+            "available": False,
+            "reason": "uncertainty_head_has_no_dedicated_training_objective",
+        },
+        "evaluation_split": evaluation_split,
+        "reward_label_contract": reward_label_contract,
         "record_count": len(records),
         "candidate_group_count": len(groups),
         "candidate_record_count": sum(len(group) for group in groups),
@@ -266,8 +347,9 @@ def evaluate_candidate_sets(
         "cache_metadata": payload.get("metadata", {}),
         "notes": [
             "This is an offline candidate-set evaluation over already executed candidates.",
-            "Ranking scores use only state/action features via the value head; target_hidden is used only as observed-label context in the trained checkpoint/cache, not as the selection score.",
-            "For production U2, candidate actions must be generated before execution and evaluated against real execution labels.",
+            "Ranking uses only state/action features via the value head; target_hidden is not passed to the model.",
+            "reward_score is a replay training-reward label unless reward_label_contract explicitly verifies an execution outcome.",
+            "Production U2 must generate candidates before execution and evaluate them against real labels.",
         ],
     }
     summary = _json_sanitize(summary)
@@ -299,6 +381,7 @@ def main() -> None:
     parser.add_argument("--allow-constant-reward-groups", action="store_true")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--uncertainty-coef", type=float, default=0.0)
+    parser.add_argument("--split", choices=["auto", "all", "train", "val"], default="auto")
     args = parser.parse_args()
 
     summary = evaluate_candidate_sets(
@@ -313,6 +396,7 @@ def main() -> None:
         require_reward_variation=not args.allow_constant_reward_groups,
         device_name=args.device,
         uncertainty_coef=args.uncertainty_coef,
+        split=args.split,
     )
     metrics = summary["metrics"]
     print(

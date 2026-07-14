@@ -49,3 +49,29 @@ def test_text_latent_world_model_value_loss_honors_reward_mask():
 
     assert torch.allclose(metrics["wm/value_loss"], torch.tensor(0.0))
     assert torch.allclose(metrics["wm/value_mask_count"], torch.tensor(0.0))
+
+
+def test_stop_grad_target_freezes_target_projector_for_all_losses():
+    torch.manual_seed(0)
+    model = TextLatentWorldModel(
+        TextLatentWorldModelConfig(
+            state_hidden_dim=4,
+            action_hidden_dim=4,
+            target_hidden_dim=4,
+            latent_dim=3,
+            sigreg_num_proj=4,
+            stop_grad_target=True,
+        )
+    )
+
+    loss, _ = model.compute_loss(
+        state_hidden=torch.randn(4, 4),
+        action_hidden=torch.randn(4, 4),
+        target_hidden=torch.randn(4, 4),
+        sigreg_coef=0.1,
+        action_contrast_coef=0.1,
+    )
+    loss.backward()
+
+    assert all(parameter.grad is None for parameter in model.target_projector.parameters())
+    assert any(parameter.grad is not None for parameter in model.predictor.parameters())

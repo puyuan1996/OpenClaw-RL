@@ -11,6 +11,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .cache_text_hidden import validate_hidden_cache_integrity
+from .checkpoint import select_evaluation_indices, value_head_training_status
 from .metrics import action_delta, effective_rank
 from .modules import TextLatentWorldModel, TextLatentWorldModelConfig
 
@@ -30,6 +32,7 @@ def _load_cache(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise TypeError(f"Expected dict payload in {path}, got {type(payload).__name__}")
+    validate_hidden_cache_integrity(payload)
     required = ["state_hidden", "action_hidden", "target_hidden"]
     missing = [key for key in required if key not in payload]
     if missing:
@@ -51,6 +54,21 @@ def _to_device(payload: dict[str, Any], device: torch.device) -> dict[str, torch
         "action_hidden": payload["action_hidden"].float().to(device),
         "target_hidden": payload["target_hidden"].float().to(device),
     }
+
+
+def _subset_payload(payload: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+    count = int(payload["state_hidden"].shape[0])
+    index_tensor = torch.tensor(indices, dtype=torch.long)
+    subset: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.shape[0]) == count:
+            subset[key] = value[index_tensor]
+        elif key == "record_metadata" and isinstance(value, list) and len(value) == count:
+            subset[key] = [value[index] for index in indices]
+        else:
+            subset[key] = value
+    subset["record_count"] = len(indices)
+    return subset
 
 
 def _float(value: torch.Tensor | float | int | None) -> float | None:
@@ -212,12 +230,20 @@ def evaluate_probe(
     device_name: str = "auto",
     seed: int = 42,
     bootstrap_samples: int = 500,
+    split: str = "auto",
 ) -> dict[str, Any]:
     if device_name == "auto":
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
     model, checkpoint_metadata = _load_checkpoint(checkpoint, device)
     payload = _load_cache(cache)
+    indices, evaluation_split = select_evaluation_indices(
+        checkpoint_metadata,
+        payload.get("metadata"),
+        count=int(payload["state_hidden"].shape[0]),
+        requested_split=split,
+    )
+    payload = _subset_payload(payload, indices)
     tensors = _to_device(payload, device)
     count = int(tensors["state_hidden"].shape[0])
 
@@ -265,9 +291,20 @@ def evaluate_probe(
         reward, reward_mask = _masked_reward(payload, device)
         value = out["value"]
         value_reward: dict[str, Any]
-        if reward is None or value is None:
+        value_training_status, value_reason = value_head_training_status(checkpoint_metadata)
+        if value_training_status == "verified_untrained":
             value_reward = {
                 "available": False,
+                "gate_eligible": False,
+                "training_status": value_training_status,
+                "reason": f"value_head_not_trained: {value_reason}",
+                "reward_mask_count": 0 if reward_mask is None else int(reward_mask.sum().item()),
+            }
+        elif reward is None or value is None:
+            value_reward = {
+                "available": False,
+                "gate_eligible": False,
+                "training_status": value_training_status,
                 "reason": "missing_reward_or_value_head",
                 "reward_mask_count": 0,
             }
@@ -279,9 +316,16 @@ def evaluate_probe(
                 corr, corr_reason = None, "fewer_than_two_masked_rewards"
             else:
                 corr, corr_reason = _spearman(valid_value, valid_reward)
+            metric_reason = corr_reason
+            if value_training_status == "unknown_legacy":
+                metric_reason = f"gate_ineligible_unknown_legacy: {value_reason}"
+                if corr_reason is not None:
+                    metric_reason += f"; metric_reason={corr_reason}"
             value_reward = {
                 "available": valid_reward.numel() >= 2 and corr is not None,
-                "reason": corr_reason,
+                "gate_eligible": value_training_status == "verified_trained" and corr is not None,
+                "training_status": value_training_status,
+                "reason": metric_reason,
                 "reward_mask_count": int(mask.sum().item()),
                 "spearman": corr,
                 "mse": _float(_mse_per_sample(valid_value, valid_reward).mean()) if valid_reward.numel() else None,
@@ -290,17 +334,12 @@ def evaluate_probe(
                 "value_mean": _float(valid_value.mean()) if valid_value.numel() else None,
             }
 
-        uncertainty = out["uncertainty"]
-        if uncertainty is None:
-            uncertainty_error = {"available": False, "reason": "missing_uncertainty_head"}
-        else:
-            unc_corr, unc_reason = _spearman(uncertainty, real_mse_per)
-            uncertainty_error = {
-                "available": unc_corr is not None,
-                "reason": unc_reason,
-                "spearman_uncertainty_vs_pred_mse": unc_corr,
-                "uncertainty_mean": _float(uncertainty.mean()),
-            }
+        uncertainty_error = {
+            "available": False,
+            "reason": "uncertainty_head_has_no_dedicated_training_objective",
+            "spearman_uncertainty_vs_pred_mse": None,
+            "uncertainty_mean": None,
+        }
 
     metrics: dict[str, Any] = {
         "pred_mse_real": _float(real_mse_per.mean()),
@@ -346,12 +385,13 @@ def evaluate_probe(
     }
 
     summary = {
-        "schema_version": "openclaw_text_jepa_probe_eval_v1",
+        "schema_version": "openclaw_text_jepa_probe_eval_v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "input": str(cache),
         "device": str(device),
         "seed": int(seed),
+        "evaluation_split": evaluation_split,
         "record_count": count,
         "counts": {
             "n_total": count,
@@ -386,6 +426,7 @@ def main() -> None:
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bootstrap-samples", type=int, default=500)
+    parser.add_argument("--split", choices=["auto", "all", "train", "val"], default="auto")
     args = parser.parse_args()
 
     summary = evaluate_probe(
@@ -395,6 +436,7 @@ def main() -> None:
         device_name=args.device,
         seed=args.seed,
         bootstrap_samples=args.bootstrap_samples,
+        split=args.split,
     )
     metrics = summary["metrics"]
     pred_mse = metrics["pred_mse_real"]

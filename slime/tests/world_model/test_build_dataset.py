@@ -2,7 +2,18 @@ import json
 
 import torch
 
-from slime.world_model.build_dataset import extract_world_model_records, summarize_world_model_records
+from slime.world_model.build_dataset import (
+    _observation_source,
+    extract_world_model_records,
+    summarize_world_model_records,
+)
+from slime.world_model.metadata import stable_hash
+
+
+def test_no_tool_placeholder_is_not_terminal_eval_summary():
+    record = {"next_observation_text": '{"status": "no_tool_result"}', "has_tool_result": False}
+
+    assert _observation_source(record) == "no_tool_result"
 
 
 def test_extract_world_model_records_backfills_legacy_context_text(tmp_path):
@@ -31,6 +42,8 @@ def test_extract_world_model_records_backfills_legacy_context_text(tmp_path):
     assert len(records) == 1
     assert json.loads(records[0]["context_text"])[0]["content"] == "state text"
     assert records[0]["context_text_source"] == "sample.prompt"
+    assert records[0]["context_hash"] == stable_hash(records[0]["context_text"])
+    assert records[0]["source_context_hash"] == "abc"
 
 
 def test_extract_world_model_records_can_repair_prefix_truncated_context(tmp_path):
@@ -63,6 +76,41 @@ def test_extract_world_model_records_can_repair_prefix_truncated_context(tmp_pat
     assert "task-specific state" in records[0]["context_text"]
     assert "shared system prompt" not in records[0]["context_text"]
     assert records[0]["context_text_source"] == "sample.prompt"
+
+
+def test_extract_world_model_records_unifies_legacy_and_v2_context_hashes(tmp_path):
+    context_text = '[{"content":"same state","role":"user"}]'
+    payload = {
+        "samples": [
+            {
+                "status": "completed",
+                "metadata": {
+                    "world_model": {
+                        "schema": "openclaw_text_jepa_world_model_v1",
+                        "context_hash": "legacy-hash",
+                        "context_text": context_text,
+                    }
+                },
+            },
+            {
+                "status": "completed",
+                "metadata": {
+                    "world_model": {
+                        "schema": "openclaw_text_jepa_world_model_v2",
+                        "context_hash": "different-source-hash",
+                        "context_text": context_text,
+                    }
+                },
+            },
+        ]
+    }
+    path = tmp_path / "mixed.pt"
+    torch.save(payload, path)
+
+    records = extract_world_model_records(path)
+
+    assert [record["context_hash"] for record in records] == [stable_hash(context_text)] * 2
+    assert all(record["context_hash_schema"] == "canonical_context_text_v1" for record in records)
 
 
 def test_extract_world_model_records_filters_and_summary(tmp_path):

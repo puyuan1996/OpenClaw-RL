@@ -17,6 +17,7 @@ WM_P2_MIN_CANDIDATES="${WM_P2_MIN_CANDIDATES:-2}"
 WM_P2_MAX_CANDIDATES="${WM_P2_MAX_CANDIDATES:-8}"
 WM_P2_DEVICE="${WM_P2_DEVICE:-auto}"
 WM_P2_UNCERTAINTY_COEF="${WM_P2_UNCERTAINTY_COEF:-0.0}"
+WM_P2_EVAL_SPLIT="${WM_P2_EVAL_SPLIT:-auto}"
 
 mkdir -p "${WM_P2_OUT_DIR}/logs"
 
@@ -45,6 +46,7 @@ cat <<EOF | tee "${WM_P2_OUT_DIR}/logs/config.txt"
 [wm-p2] min_candidates:  ${WM_P2_MIN_CANDIDATES}
 [wm-p2] max_candidates:  ${WM_P2_MAX_CANDIDATES}
 [wm-p2] device:          ${WM_P2_DEVICE}
+[wm-p2] eval_split:      ${WM_P2_EVAL_SPLIT}
 EOF
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -57,6 +59,24 @@ if [[ ! -s "${RECORDS}" || ! -s "${CACHE}" || ! -s "${CHECKPOINT}" ]]; then
   exit 1
 fi
 
+"${PYTHON_BIN}" - "${CHECKPOINT}" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+from slime.world_model.checkpoint import trained_value_head_status
+
+checkpoint_path = Path(sys.argv[1])
+checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+trained, reason = trained_value_head_status(checkpoint.get("metadata"))
+if not trained:
+    raise SystemExit(
+        "[wm-p2] checkpoint is not eligible for value ranking: "
+        f"{reason}. Re-run Stage-A with WM_VALUE_COEF>0 and valid reward labels."
+    )
+PY
+
 "${PYTHON_BIN}" -m slime.world_model.candidate_set_eval \
   --checkpoint "${CHECKPOINT}" \
   --cache "${CACHE}" \
@@ -68,6 +88,7 @@ fi
   --max-candidates "${WM_P2_MAX_CANDIDATES}" \
   --device "${WM_P2_DEVICE}" \
   --uncertainty-coef "${WM_P2_UNCERTAINTY_COEF}" \
+  --split "${WM_P2_EVAL_SPLIT}" \
   2>&1 | tee "${WM_P2_OUT_DIR}/logs/candidate_set_eval.log"
 
 echo "[wm-p2] done. Outputs: ${WM_P2_OUT_DIR}"

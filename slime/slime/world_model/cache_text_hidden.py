@@ -4,11 +4,20 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 import torch.nn.functional as F
+
+from .metadata import canonicalize_context_identity
+
+
+_ENCODER_BEHAVIOR_PROBES = [
+    "OpenClaw encoder identity probe: inspect terminal state.",
+    'OpenClaw encoder identity probe: {"tool":"bash","command":"pwd"}',
+]
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -27,6 +36,106 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _json_sha256(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _hidden_tensors_sha256(tensors: dict[str, torch.Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(tensors):
+        tensor = tensors[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(memoryview(tensor.numpy()).cast("B"))
+    return digest.hexdigest()
+
+
+def _encoder_behavior_sha256(hidden: torch.Tensor) -> str:
+    # Quantization avoids false mismatches from insignificant cross-device rounding.
+    quantized = torch.round(hidden.detach().cpu().float() * 10_000.0).to(torch.int32)
+    return _hidden_tensors_sha256({"encoder_behavior_probe": quantized})
+
+
+def _reward_label_contract(records: list[dict[str, Any]]) -> dict[str, Any]:
+    fields = [
+        "reward_label_scope",
+        "reward_label_source",
+        "reward_label_semantics",
+        "reward_label_is_execution_outcome",
+    ]
+    contracts: dict[str, dict[str, Any]] = {}
+    for record in records:
+        contract = {field: record.get(field) for field in fields}
+        key = json.dumps(contract, ensure_ascii=False, sort_keys=True, default=str)
+        contracts[key] = contract
+    consistent = len(contracts) == 1
+    contract = next(iter(contracts.values())) if consistent else {field: None for field in fields}
+    return {
+        **contract,
+        "consistent": consistent,
+        "contract_count": len(contracts),
+        "verified_execution_outcome": consistent
+        and contract.get("reward_label_is_execution_outcome") is True,
+    }
+
+
+def validate_hidden_cache_integrity(payload: dict[str, Any]) -> dict[str, Any]:
+    """Recompute current-schema tensor/cache digests when they are present."""
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    expected_tensor_digest = metadata.get("hidden_tensors_sha256")
+    if not expected_tensor_digest:
+        return {"verified": False, "reason": "hidden_tensors_sha256_missing"}
+
+    tensor_keys = metadata.get("fingerprint_tensor_keys") or [
+        "action_hidden",
+        "state_hidden",
+        "target_hidden",
+    ]
+    if not isinstance(tensor_keys, list) or not tensor_keys:
+        raise ValueError("cache fingerprint_tensor_keys is invalid")
+    missing = [key for key in tensor_keys if not isinstance(payload.get(key), torch.Tensor)]
+    if missing:
+        raise ValueError(f"cache fingerprint tensors are missing: {missing}")
+    actual_tensor_digest = _hidden_tensors_sha256({key: payload[key] for key in tensor_keys})
+    if actual_tensor_digest != expected_tensor_digest:
+        raise ValueError("hidden cache tensor digest mismatch")
+
+    encoder_config = metadata.get("encoder_config")
+    if not isinstance(encoder_config, dict):
+        raise ValueError("hidden cache encoder_config is missing or invalid")
+    actual_encoder_fingerprint = _json_sha256(encoder_config)
+    if actual_encoder_fingerprint != metadata.get("encoder_fingerprint_sha256"):
+        raise ValueError("hidden cache encoder fingerprint mismatch")
+    behavior_fingerprint = encoder_config.get("behavior_probe_sha256")
+    if behavior_fingerprint and behavior_fingerprint != metadata.get("encoder_behavior_probe_sha256"):
+        raise ValueError("hidden cache encoder behavior fingerprint mismatch")
+
+    expected_cache_fingerprint = metadata.get("cache_fingerprint_sha256")
+    if not expected_cache_fingerprint:
+        raise ValueError("cache_fingerprint_sha256 is missing")
+    actual_cache_fingerprint = _json_sha256(
+        {
+            "encoder_fingerprint_sha256": actual_encoder_fingerprint,
+            "hidden_tensors_sha256": actual_tensor_digest,
+            "input_records_sha256": metadata.get("input_records_sha256"),
+        }
+    )
+    if actual_cache_fingerprint != expected_cache_fingerprint:
+        raise ValueError("hidden cache metadata fingerprint mismatch")
+    return {"verified": True, "reason": None}
+
+
+def _finite_reward(value: Any) -> float | None:
+    try:
+        reward = float(value)
+    except (TypeError, ValueError):
+        return None
+    return reward if math.isfinite(reward) else None
 
 
 def _record_state_text(record: dict) -> str:
@@ -70,12 +179,20 @@ def _light_record_metadata(record: dict[str, Any]) -> dict[str, Any]:
         "turn_idx",
         "num_turns",
         "status",
+        "trajectory_status",
         "done",
         "has_tool_result",
         "reward_score",
         "reward_base_score",
         "reward_raw_score",
+        "reward_label_scope",
+        "reward_label_source",
+        "reward_label_semantics",
+        "reward_label_is_execution_outcome",
+        "reward_label_terminal",
         "context_hash",
+        "context_hash_schema",
+        "source_context_hash",
         "action_hash",
         "next_observation_hash",
         "context_token_len",
@@ -111,17 +228,18 @@ def _hf_encode(
     device: str,
     pooling: str,
     local_files_only: bool,
+    trust_remote_code: bool,
 ) -> torch.Tensor:
     from transformers import AutoModel, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
         local_files_only=local_files_only,
     )
     model = AutoModel.from_pretrained(
         model_name_or_path,
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
         local_files_only=local_files_only,
     ).to(device)
     model.eval()
@@ -167,6 +285,7 @@ def _encode_texts(args: argparse.Namespace, texts: list[str]) -> torch.Tensor:
         device=device,
         pooling=args.pooling,
         local_files_only=args.hf_local_files_only,
+        trust_remote_code=args.hf_trust_remote_code,
     )
 
 
@@ -175,18 +294,20 @@ def _encode_record_texts(
     state_texts: list[str],
     action_texts: list[str],
     target_texts: list[str],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if args.encoder == "hash":
-        return (
-            _hash_encode(state_texts, args.hidden_dim),
-            _hash_encode(action_texts, args.hidden_dim),
-            _hash_encode(target_texts, args.hidden_dim),
-        )
-
-    all_texts = state_texts + action_texts + target_texts
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
+    all_texts = state_texts + action_texts + target_texts + _ENCODER_BEHAVIOR_PROBES
     all_hidden = _encode_texts(args, all_texts)
     count = len(state_texts)
-    return all_hidden[:count], all_hidden[count : count * 2], all_hidden[count * 2 :]
+    expected_count = count * 3 + len(_ENCODER_BEHAVIOR_PROBES)
+    if int(all_hidden.shape[0]) != expected_count:
+        raise ValueError(f"encoder returned {int(all_hidden.shape[0])} rows; expected {expected_count}")
+    probe_hidden = all_hidden[count * 3 :]
+    return (
+        all_hidden[:count],
+        all_hidden[count : count * 2],
+        all_hidden[count * 2 : count * 3],
+        _encoder_behavior_sha256(probe_hidden),
+    )
 
 
 def main() -> None:
@@ -200,7 +321,24 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--pooling", choices=["mean", "last", "cls"], default="mean")
-    parser.add_argument("--hf-local-files-only", action="store_true", help="Do not download HF model/tokenizer files.")
+    parser.set_defaults(hf_local_files_only=True)
+    parser.add_argument(
+        "--hf-local-files-only",
+        action="store_true",
+        dest="hf_local_files_only",
+        help="Use only local HF files (default).",
+    )
+    parser.add_argument(
+        "--hf-allow-downloads",
+        action="store_false",
+        dest="hf_local_files_only",
+        help="Explicitly allow HF model/tokenizer downloads.",
+    )
+    parser.add_argument(
+        "--hf-trust-remote-code",
+        action="store_true",
+        help="Allow custom Python code from the HF model repository. Disabled by default.",
+    )
     args = parser.parse_args()
 
     if args.encoder == "hf" and not args.hf_model:
@@ -210,14 +348,47 @@ def main() -> None:
     records = _read_jsonl(input_path)
     if not records:
         raise ValueError(f"No world-model records found in {input_path}. Check filters or input path.")
+    records = [canonicalize_context_identity(record) for record in records]
     state_texts = [_record_state_text(record) for record in records]
     action_texts = [_record_action_text(record) for record in records]
     target_texts = [_record_target_text(record) for record in records]
 
-    state_hidden, action_hidden, target_hidden = _encode_record_texts(args, state_texts, action_texts, target_texts)
-    rewards = [record.get("reward_score") for record in records]
+    state_hidden, action_hidden, target_hidden, encoder_behavior_sha256 = _encode_record_texts(
+        args,
+        state_texts,
+        action_texts,
+        target_texts,
+    )
+    rewards = [_finite_reward(record.get("reward_score")) for record in records]
     reward_mask = [value is not None for value in rewards]
     has_reward = any(value is not None for value in rewards)
+
+    input_records_sha256 = _file_sha256(input_path)
+    encoder_config = {
+        "schema_version": "openclaw_text_jepa_encoder_config_v1",
+        "encoder": args.encoder,
+        "hidden_dim": args.hidden_dim if args.encoder == "hash" else int(state_hidden.shape[-1]),
+        "hf_model": args.hf_model if args.encoder == "hf" else None,
+        "pooling": args.pooling if args.encoder == "hf" else None,
+        "max_length": args.max_length if args.encoder == "hf" else None,
+        "behavior_probe_schema": "openclaw_text_encoder_behavior_probe_v1",
+        "behavior_probe_sha256": encoder_behavior_sha256,
+    }
+    encoder_fingerprint_sha256 = _json_sha256(encoder_config)
+    hidden_tensors_sha256 = _hidden_tensors_sha256(
+        {
+            "action_hidden": action_hidden,
+            "state_hidden": state_hidden,
+            "target_hidden": target_hidden,
+        }
+    )
+    cache_fingerprint_sha256 = _json_sha256(
+        {
+            "encoder_fingerprint_sha256": encoder_fingerprint_sha256,
+            "hidden_tensors_sha256": hidden_tensors_sha256,
+            "input_records_sha256": input_records_sha256,
+        }
+    )
 
     payload = {
         "state_hidden": state_hidden,
@@ -228,16 +399,24 @@ def main() -> None:
         "input": str(input_path),
         "record_metadata": [_light_record_metadata(record) for record in records],
         "metadata": {
-            "schema_version": "openclaw_text_jepa_hidden_cache_v1",
+            "schema_version": "openclaw_text_jepa_hidden_cache_v3",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "input": str(input_path),
-            "input_records_sha256": _file_sha256(input_path),
+            "input_records_sha256": input_records_sha256,
+            "encoder_config": encoder_config,
+            "encoder_fingerprint_sha256": encoder_fingerprint_sha256,
+            "encoder_behavior_probe_sha256": encoder_behavior_sha256,
+            "hidden_tensors_sha256": hidden_tensors_sha256,
+            "fingerprint_tensor_keys": ["action_hidden", "state_hidden", "target_hidden"],
+            "cache_fingerprint_sha256": cache_fingerprint_sha256,
             "record_count": len(records),
+            "reward_label_contract": _reward_label_contract(records),
             "encoder": args.encoder,
             "hidden_dim": args.hidden_dim if args.encoder == "hash" else int(state_hidden.shape[-1]),
             "hf_model": args.hf_model if args.encoder == "hf" else None,
             "pooling": args.pooling if args.encoder == "hf" else None,
             "hf_local_files_only": bool(args.hf_local_files_only) if args.encoder == "hf" else None,
+            "hf_trust_remote_code": bool(args.hf_trust_remote_code) if args.encoder == "hf" else None,
             "max_length": args.max_length if args.encoder == "hf" else None,
             "batch_size": args.batch_size,
             "state_hidden_shape": tuple(state_hidden.shape),

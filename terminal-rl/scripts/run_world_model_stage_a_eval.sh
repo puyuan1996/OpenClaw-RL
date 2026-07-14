@@ -21,12 +21,13 @@ WM_BAD_EVAL_REASONS="${WM_BAD_EVAL_REASONS:-eval_timeout,eval_parse_failed}"
 WM_MAX_RECORDS="${WM_MAX_RECORDS:-0}"
 WM_MIN_RECORDS="${WM_MIN_RECORDS:-1}"
 WM_REUSE_CACHE="${WM_REUSE_CACHE:-1}"
-WM_RUN_RANK="${WM_RUN_RANK:-1}"
+WM_RUN_RANK="${WM_RUN_RANK:-0}"
 
 WM_ENCODER="${WM_ENCODER:-hash}"
 WM_ALLOW_HF="${WM_ALLOW_HF:-0}"
 WM_HF_MODEL="${WM_HF_MODEL:-}"
 WM_HF_LOCAL_FILES_ONLY="${WM_HF_LOCAL_FILES_ONLY:-1}"
+WM_HF_TRUST_REMOTE_CODE="${WM_HF_TRUST_REMOTE_CODE:-0}"
 WM_HASH_HIDDEN_DIM="${WM_HASH_HIDDEN_DIM:-256}"
 WM_CONTEXT_MAX_CHARS="${WM_CONTEXT_MAX_CHARS:-4096}"
 WM_CONTEXT_SOURCE="${WM_CONTEXT_SOURCE:-world_model}"
@@ -37,6 +38,8 @@ WM_CACHE_BATCH_SIZE="${WM_CACHE_BATCH_SIZE:-2}"
 WM_TRAIN_BATCH_SIZE="${WM_TRAIN_BATCH_SIZE:-8}"
 WM_SEED="${WM_SEED:-42}"
 WM_BOOTSTRAP_SAMPLES="${WM_BOOTSTRAP_SAMPLES:-500}"
+WM_SPLIT_GROUP_KEY="${WM_SPLIT_GROUP_KEY:-context_hash}"
+WM_EVAL_SPLIT="${WM_EVAL_SPLIT:-auto}"
 
 if [[ "${WM_ENCODER}" == "hf" ]]; then
   WM_LATENT_DIM="${WM_LATENT_DIM:-1024}"
@@ -50,6 +53,7 @@ WM_LR="${WM_LR:-1e-4}"
 WM_SIGREG_COEF="${WM_SIGREG_COEF:-0.1}"
 WM_ACTION_CONTRAST_COEF="${WM_ACTION_CONTRAST_COEF:-0.1}"
 WM_VALUE_COEF="${WM_VALUE_COEF:-0.0}"
+WM_RANK_SCORE_MODE="${WM_RANK_SCORE_MODE:-pred_error}"
 
 mkdir -p "${WM_OUT_DIR}/logs" "${WM_OUT_DIR}/shards"
 
@@ -116,10 +120,11 @@ def match(name, row):
     reason = _eval_reason(row)
     reason = None if reason is None else str(reason).lower()
     status = str(row.get("status", "")).lower()
+    trajectory_status = str(row.get("trajectory_status", status)).lower()
     if name == "full":
         return True
     if name == "clean":
-        return status == "completed" and reason not in bad_reasons
+        return trajectory_status == "completed" and reason not in bad_reasons
     if name == "tool_only":
         return bool(row.get("has_tool_result"))
     if name == "completed":
@@ -192,6 +197,10 @@ if [[ "${WM_ENCODER}" == "hf" ]]; then
     echo "[wm-stage-a] HF encoder is fail-closed. Set WM_ALLOW_HF=1 and WM_HF_MODEL=/local/path explicitly." >&2
     exit 1
   fi
+  if [[ -z "${WM_HF_MODEL}" ]]; then
+    echo "[wm-stage-a] WM_HF_MODEL is required for the HF encoder." >&2
+    exit 1
+  fi
   if [[ "${WM_HF_LOCAL_FILES_ONLY}" == "1" && ! -d "${WM_HF_MODEL}" ]]; then
     echo "[wm-stage-a] missing local WM_HF_MODEL: ${WM_HF_MODEL}" >&2
     exit 1
@@ -212,6 +221,8 @@ run_bucket() {
   local log_file="${bucket_dir}/logs/stage_a.log"
   local config_file="${bucket_dir}/stage_a_config.json"
   local next_config="${bucket_dir}/stage_a_config.next.json"
+  local artifact_config_file="${bucket_dir}/stage_a_artifact_config.json"
+  local next_artifact_config="${bucket_dir}/stage_a_artifact_config.next.json"
   mkdir -p "${bucket_dir}/logs"
 
   if (( count < WM_MIN_RECORDS )); then
@@ -225,7 +236,7 @@ run_bucket() {
 
   echo "[wm-stage-a:${bucket}] gpu=${gpu_id} records=${count} encoder=${WM_ENCODER} out=${bucket_dir}" | tee "${log_file}"
 
-  "${PYTHON_BIN}" - "${records}" "${next_config}" <<PY
+  "${PYTHON_BIN}" - "${records}" "${next_config}" "${next_artifact_config}" <<PY
 import hashlib
 import json
 import sys
@@ -233,8 +244,18 @@ from pathlib import Path
 
 records_path = Path(sys.argv[1])
 digest = hashlib.sha256(records_path.read_bytes()).hexdigest()
+artifact_code_digest = hashlib.sha256()
+for relative_path in [
+    "slime/slime/world_model/cache_text_hidden.py",
+    "slime/slime/world_model/modules.py",
+    "slime/slime/world_model/train_probe.py",
+]:
+    source_path = Path(relative_path)
+    artifact_code_digest.update(relative_path.encode("utf-8"))
+    artifact_code_digest.update(source_path.read_bytes())
 config = {
-    "script_version": "run_world_model_stage_a_eval_v1",
+    "script_version": "run_world_model_stage_a_eval_v3",
+    "artifact_code_sha256": artifact_code_digest.hexdigest(),
     "bucket": ${bucket@Q},
     "records_path": str(records_path),
     "records_sha256": digest,
@@ -243,6 +264,7 @@ config = {
     "allow_hf": ${WM_ALLOW_HF@Q},
     "hf_model": ${WM_HF_MODEL@Q} if ${WM_ENCODER@Q} == "hf" else None,
     "hf_local_files_only": ${WM_HF_LOCAL_FILES_ONLY@Q},
+    "hf_trust_remote_code": ${WM_HF_TRUST_REMOTE_CODE@Q},
     "hash_hidden_dim": int(${WM_HASH_HIDDEN_DIM@Q}),
     "hf_max_length": int(${WM_HF_MAX_LENGTH@Q}),
     "hf_pooling": ${WM_HF_POOLING@Q},
@@ -256,16 +278,31 @@ config = {
     "sigreg_coef": float(${WM_SIGREG_COEF@Q}),
     "action_contrast_coef": float(${WM_ACTION_CONTRAST_COEF@Q}),
     "value_coef": float(${WM_VALUE_COEF@Q}),
+    "rank_score_mode": ${WM_RANK_SCORE_MODE@Q},
+    "split_group_key": ${WM_SPLIT_GROUP_KEY@Q},
+    "eval_split": ${WM_EVAL_SPLIT@Q},
     "val_ratio": float(${WM_VAL_RATIO@Q}),
     "seed": int(${WM_SEED@Q}),
     "bootstrap_samples": int(${WM_BOOTSTRAP_SAMPLES@Q}),
 }
 Path(sys.argv[2]).write_text(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+artifact_keys = {
+    "script_version", "artifact_code_sha256", "bucket", "records_sha256", "record_count", "encoder", "allow_hf",
+    "hf_model", "hf_local_files_only", "hf_trust_remote_code", "hash_hidden_dim", "hf_max_length",
+    "hf_pooling", "context_source", "context_truncation", "cache_batch_size", "latent_dim",
+    "train_batch_size", "epochs", "lr", "sigreg_coef", "action_contrast_coef", "value_coef",
+    "split_group_key", "val_ratio", "seed",
+}
+artifact_config = {key: value for key, value in config.items() if key in artifact_keys}
+Path(sys.argv[3]).write_text(
+    json.dumps(artifact_config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
 PY
 
   local reuse_artifacts=0
   if [[ "${WM_REUSE_CACHE}" == "1" && -s "${bucket_dir}/cached_hidden.pt" && -s "${bucket_dir}/probe.pt" ]] \
-    && cmp -s "${next_config}" "${config_file}"; then
+    && cmp -s "${next_artifact_config}" "${artifact_config_file}"; then
     reuse_artifacts=1
   fi
 
@@ -289,6 +326,11 @@ PY
       )
       if [[ "${WM_HF_LOCAL_FILES_ONLY}" == "1" ]]; then
         cache_cmd+=(--hf-local-files-only)
+      else
+        cache_cmd+=(--hf-allow-downloads)
+      fi
+      if [[ "${WM_HF_TRUST_REMOTE_CODE}" == "1" ]]; then
+        cache_cmd+=(--hf-trust-remote-code)
       fi
     fi
     CUDA_VISIBLE_DEVICES="${gpu_id}" "${cache_cmd[@]}" >> "${log_file}" 2>&1
@@ -310,7 +352,8 @@ PY
       --action-contrast-coef "${WM_ACTION_CONTRAST_COEF}" \
       --value-coef "${WM_VALUE_COEF}" \
       --val-ratio "${WM_VAL_RATIO}" \
-      --seed "${WM_SEED}" >> "${log_file}" 2>&1
+      --seed "${WM_SEED}" \
+      --split-group-key "${WM_SPLIT_GROUP_KEY}" >> "${log_file}" 2>&1
     mv "${probe_tmp}" "${bucket_dir}/probe.pt"
   else
     echo "[wm-stage-a:${bucket}] reuse probe ${bucket_dir}/probe.pt" >> "${log_file}"
@@ -323,39 +366,53 @@ PY
     --output "${eval_tmp}" \
     --device auto \
     --seed "${WM_SEED}" \
-    --bootstrap-samples "${WM_BOOTSTRAP_SAMPLES}" >> "${log_file}" 2>&1
+    --bootstrap-samples "${WM_BOOTSTRAP_SAMPLES}" \
+    --split "${WM_EVAL_SPLIT}" >> "${log_file}" 2>&1
   mv "${eval_tmp}" "${bucket_dir}/eval_summary.json"
 
   if [[ "${WM_RUN_RANK}" == "1" ]]; then
-    local rankings_tmp="${bucket_dir}/rankings.jsonl.tmp.$$"
+    local rankings_name="rankings.jsonl"
+    if [[ "${WM_RANK_SCORE_MODE}" == "pred_error" ]]; then
+      rankings_name="oracle_pred_error_diagnostic.jsonl"
+    fi
+    local rankings_tmp="${bucket_dir}/${rankings_name}.tmp.$$"
     CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" -m slime.world_model.rank_candidates \
       --checkpoint "${bucket_dir}/probe.pt" \
       --input "${bucket_dir}/cached_hidden.pt" \
-      --output "${rankings_tmp}" >> "${log_file}" 2>&1
-    mv "${rankings_tmp}" "${bucket_dir}/rankings.jsonl"
+      --output "${rankings_tmp}" \
+      --score-mode "${WM_RANK_SCORE_MODE}" >> "${log_file}" 2>&1
+    mv "${rankings_tmp}" "${bucket_dir}/${rankings_name}"
   fi
   mv "${next_config}" "${config_file}"
+  mv "${next_artifact_config}" "${artifact_config_file}"
 }
 
 FAILED=0
 ACTIVE_PIDS=()
+ACTIVE_GPUS=()
+FREE_GPU_IDS=("${GPU_IDS[@]}")
 
 wait_oldest() {
   local pid="${ACTIVE_PIDS[0]}"
+  local gpu_id="${ACTIVE_GPUS[0]}"
   if ! wait "${pid}"; then
     FAILED=1
   fi
   ACTIVE_PIDS=("${ACTIVE_PIDS[@]:1}")
+  ACTIVE_GPUS=("${ACTIVE_GPUS[@]:1}")
+  FREE_GPU_IDS+=("${gpu_id}")
 }
 
 while IFS=$'\t' read -r bucket count records; do
   [[ -z "${bucket}" ]] && continue
-  while (( ${#ACTIVE_PIDS[@]} >= ${#GPU_IDS[@]} )); do
+  while (( ${#FREE_GPU_IDS[@]} == 0 )); do
     wait_oldest
   done
-  gpu_id="${GPU_IDS[${#ACTIVE_PIDS[@]}]}"
+  gpu_id="${FREE_GPU_IDS[0]}"
+  FREE_GPU_IDS=("${FREE_GPU_IDS[@]:1}")
   run_bucket "${bucket}" "${count}" "${records}" "${gpu_id}" > "${WM_OUT_DIR}/logs/${bucket}.driver.log" 2>&1 &
   ACTIVE_PIDS+=("$!")
+  ACTIVE_GPUS+=("${gpu_id}")
 done < "${COUNTS_TSV}"
 
 while (( ${#ACTIVE_PIDS[@]} > 0 )); do
@@ -397,12 +454,13 @@ for item in counts:
         row["shuffle_gap_mse_shuffled_minus_real"] = metrics.get("shuffle_gap_mse_shuffled_minus_real")
         row["action_delta"] = metrics.get("action_delta")
         row["value_reward_spearman"] = (metrics.get("value_reward") or {}).get("spearman")
+        row["evaluation_split"] = payload.get("evaluation_split")
     if record_summary_path.exists():
         row["records_summary"] = str(record_summary_path)
     rows.append(row)
 
 summary = {
-    "schema_version": "openclaw_text_jepa_stage_a_eval_summary_v1",
+    "schema_version": "openclaw_text_jepa_stage_a_eval_summary_v2",
     "out_dir": str(out_dir),
     "buckets": rows,
 }
