@@ -140,7 +140,10 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
         or evaluation_scope == "group_heldout",
         "record_count_ok": record_count >= min_records,
         "context_unique_ok": context_unique >= min(int(args.min_context_unique), max(2, record_count)),
-        "context_not_fully_truncated": context_truncated_ratio is None or context_truncated_ratio < float(args.max_context_truncated_ratio),
+        "context_not_fully_truncated": (
+            context_truncated_ratio is not None
+            and 0.0 <= context_truncated_ratio < float(args.max_context_truncated_ratio)
+        ),
         "state_hidden_ok": state_hidden_finite and state_hidden_pairwise is not None and state_hidden_pairwise > float(args.min_state_hidden_pairwise_l2),
         "state_latent_rank_ok": state_latent_rank is not None and state_latent_rank >= float(args.min_state_latent_rank),
         "state_latent_var_ok": state_latent_var is not None and state_latent_var > float(args.min_state_latent_var),

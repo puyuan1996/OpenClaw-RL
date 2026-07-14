@@ -88,6 +88,19 @@ def test_stage_gate_rejects_in_sample_scope_by_default(tmp_path):
     assert "group_heldout_ok" in row["failed_checks"]
 
 
+def test_stage_gate_rejects_missing_context_truncation_stat(tmp_path):
+    _make_stage_bucket(tmp_path, evaluation_scope="group_heldout")
+    summary_path = tmp_path / "clean" / "records_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary.pop("context_truncated_ratio")
+    _write_json(summary_path, summary)
+
+    row = _summarize_bucket(tmp_path, "clean", _args())
+
+    assert row["checks"]["context_not_fully_truncated"] is False
+    assert row["passed"] is False
+
+
 def test_stage_gate_rejects_tampered_cache(tmp_path):
     _make_stage_bucket(tmp_path, evaluation_scope="group_heldout")
     cache_path = tmp_path / "clean" / "cached_hidden.pt"

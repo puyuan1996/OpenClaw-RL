@@ -4,6 +4,7 @@ from slime.world_model.metadata import (
     attach_terminal_world_model_metadata,
     is_world_model_enabled,
     redact_sensitive_text,
+    truncate_head_tail_text,
 )
 
 
@@ -29,6 +30,38 @@ def test_attach_terminal_world_model_metadata_default_off():
     )
     assert "world_model" not in sample.metadata
     assert sample.train_metadata is None
+
+
+def test_multi_interaction_turn_fails_closed_without_harness_adapter():
+    samples = [_sample(), _sample()]
+    samples[1].metadata["turn_idx"] = 1
+
+    attach_terminal_world_model_metadata(
+        args=SimpleNamespace(world_model_enable=True),
+        samples=samples,
+        turn_records=[
+            {
+                "turn_idx": 1,
+                "sdk_model_turns": [
+                    {"turn_idx": 0, "assistant_output": "first"},
+                    {"turn_idx": 1, "assistant_output": "second"},
+                ],
+                "tool_calls": [],
+            }
+        ],
+        task_meta={},
+        run_ctx=SimpleNamespace(),
+        status=SimpleNamespace(value="completed"),
+    )
+
+    for sample in samples:
+        assert "world_model" not in sample.metadata
+        assert sample.metadata["world_model_skipped"]["reason"] == (
+            "multi_interaction_turn_requires_harness_adapter"
+        )
+        assert sample.train_metadata["world_model_skipped"]["reason"] == (
+            "multi_interaction_turn_requires_harness_adapter"
+        )
 
 
 def test_world_model_enable_ignores_env_side_channel(monkeypatch):
@@ -236,3 +269,23 @@ def test_metadata_redacts_common_credentials_before_storage():
 
 def test_redact_sensitive_text_handles_url_credentials():
     assert redact_sensitive_text("https://user:secret@example.com/repo") == "https://user:[REDACTED]@example.com/repo"
+
+
+def test_redact_sensitive_text_removes_authorization_scheme_payloads():
+    cases = [
+        ("Authorization: Basic dXNlcjpwYXNz", "Authorization: [REDACTED]"),
+        ("authorization=Token abcdefghijklmnop", "authorization=[REDACTED]"),
+    ]
+
+    for value, expected in cases:
+        assert redact_sensitive_text(value) == expected
+
+
+def test_truncate_head_tail_text_preserves_result_tail():
+    value = "HEAD:" + ("x" * 100) + ":TAIL"
+    truncated = truncate_head_tail_text(value, 56)
+
+    assert len(truncated) == 56
+    assert truncated.startswith("HEAD:")
+    assert truncated.endswith(":TAIL")
+    assert "[openclaw_truncated_middle]" in truncated

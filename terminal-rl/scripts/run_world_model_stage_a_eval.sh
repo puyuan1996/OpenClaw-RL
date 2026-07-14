@@ -245,12 +245,10 @@ from pathlib import Path
 records_path = Path(sys.argv[1])
 digest = hashlib.sha256(records_path.read_bytes()).hexdigest()
 artifact_code_digest = hashlib.sha256()
-for relative_path in [
-    "slime/slime/world_model/cache_text_hidden.py",
-    "slime/slime/world_model/modules.py",
-    "slime/slime/world_model/train_probe.py",
-]:
-    source_path = Path(relative_path)
+source_paths = sorted(Path("slime/slime/world_model").glob("*.py"))
+source_paths.append(Path("terminal-rl/scripts/run_world_model_stage_a_eval.sh"))
+for source_path in source_paths:
+    relative_path = source_path.as_posix()
     artifact_code_digest.update(relative_path.encode("utf-8"))
     artifact_code_digest.update(source_path.read_bytes())
 config = {

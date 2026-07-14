@@ -11,6 +11,7 @@ from slime.world_model.checkpoint import (
     value_head_training_status,
 )
 from slime.world_model.candidate_set_eval import (
+    _evaluation_gate_eligible,
     _group_records,
     _require_candidate_groups,
     _reward_label_contract,
@@ -46,9 +47,9 @@ def _cache_metadata(*, records="digest", cache="cache", encoder="encoder"):
 
 def test_group_records_drops_missing_reward_candidates():
     records = [
-        {"context_hash": "ctx", "reward_score": 1.0},
-        {"context_hash": "ctx", "reward_score": None},
-        {"context_hash": "ctx", "reward_score": -1.0},
+        {"context_hash": "ctx", "action_hash": "a", "reward_score": 1.0},
+        {"context_hash": "ctx", "action_hash": "b", "reward_score": None},
+        {"context_hash": "ctx", "action_hash": "c", "reward_score": -1.0},
     ]
 
     groups = _group_records(
@@ -60,6 +61,23 @@ def test_group_records_drops_missing_reward_candidates():
     )
 
     assert groups == [[0, 2]]
+
+
+def test_group_records_rejects_duplicate_actions_as_distinct_candidates():
+    records = [
+        {"context_hash": "ctx", "action_hash": "stale-a", "action_text": "same", "reward_score": 1.0},
+        {"context_hash": "ctx", "action_hash": "stale-b", "action_text": "same", "reward_score": -1.0},
+    ]
+
+    groups = _group_records(
+        records,
+        group_key="context_hash",
+        min_candidates=2,
+        max_candidates=8,
+        require_reward_variation=True,
+    )
+
+    assert groups == []
 
 
 def test_candidate_eval_rejects_empty_candidate_groups():
@@ -79,6 +97,21 @@ def test_candidate_eval_accepts_matching_heldout_group_key():
     _validate_candidate_group_scope(
         "context_hash",
         {"scope": "group_heldout", "split_group_key": "context_hash"},
+    )
+
+
+def test_candidate_eval_gate_requires_group_heldout_execution_labels():
+    assert _evaluation_gate_eligible(
+        execution_outcome_eligible=True,
+        evaluation_split={"scope": "group_heldout"},
+    )
+    assert not _evaluation_gate_eligible(
+        execution_outcome_eligible=True,
+        evaluation_split={"scope": "in_sample_all"},
+    )
+    assert not _evaluation_gate_eligible(
+        execution_outcome_eligible=False,
+        evaluation_split={"scope": "group_heldout"},
     )
 
 
@@ -257,6 +290,36 @@ def test_select_evaluation_indices_auto_rejects_non_group_validation():
     )
 
     with pytest.raises(ValueError, match="non-empty group_holdout"):
+        select_evaluation_indices(metadata, _cache_metadata(), count=3, requested_split="auto")
+
+
+def test_select_evaluation_indices_rejects_overlapping_group_holdout_partition():
+    metadata = _trained_metadata(
+        cache_metadata=_cache_metadata(),
+        split={
+            "strategy": "group_holdout",
+            "group_key": "context_hash",
+            "train_indices": [0, 1],
+            "val_indices": [1, 2],
+        },
+    )
+
+    with pytest.raises(ValueError, match="train and val indices overlap"):
+        select_evaluation_indices(metadata, _cache_metadata(), count=3, requested_split="auto")
+
+
+def test_select_evaluation_indices_rejects_incomplete_group_holdout_partition():
+    metadata = _trained_metadata(
+        cache_metadata=_cache_metadata(),
+        split={
+            "strategy": "group_holdout",
+            "group_key": "context_hash",
+            "train_indices": [0],
+            "val_indices": [2],
+        },
+    )
+
+    with pytest.raises(ValueError, match="must partition the cache"):
         select_evaluation_indices(metadata, _cache_metadata(), count=3, requested_split="auto")
 
 

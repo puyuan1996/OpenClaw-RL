@@ -110,6 +110,22 @@ def _group_records(
             valid_indices = valid_indices[:max_candidates]
         if len(valid_indices) < min_candidates:
             continue
+        action_identities = []
+        for idx in valid_indices:
+            action_hash = records[idx].get("action_hash")
+            action_text = records[idx].get("action_text")
+            if action_text is not None:
+                action_identities.append(
+                    "text:" + hashlib.sha256(str(action_text).encode("utf-8")).hexdigest()
+                )
+            elif action_hash:
+                action_identities.append(f"hash:{action_hash}")
+            else:
+                action_identities.append(None)
+        if any(identity is None for identity in action_identities):
+            continue
+        if len(set(action_identities)) != len(action_identities):
+            continue
         if require_reward_variation:
             rewards = {
                 _float(records[idx].get("reward_score"))
@@ -126,7 +142,7 @@ def _require_candidate_groups(groups: list[list[int]]) -> None:
     if not groups:
         raise ValueError(
             "no eligible candidate groups remain after split/group/reward filters; "
-            "check group_key, min_candidates, and reward variation"
+            "check group_key, min_candidates, distinct actions, and reward variation"
         )
 
 
@@ -139,6 +155,14 @@ def _validate_candidate_group_scope(group_key: str, evaluation_split: dict[str, 
             "group-heldout candidate evaluation requires group_key to match the checkpoint split_group_key: "
             f"group_key={group_key!r} split_group_key={split_group_key!r}"
         )
+
+
+def _evaluation_gate_eligible(
+    *,
+    execution_outcome_eligible: bool,
+    evaluation_split: dict[str, Any],
+) -> bool:
+    return bool(execution_outcome_eligible and evaluation_split.get("scope") == "group_heldout")
 
 
 def _reward_label_contract(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -220,6 +244,10 @@ def evaluate_candidate_sets(
     execution_outcome_eligible = _validate_reward_label_contract(
         reward_label_contract,
         allow_unverified=allow_unverified_reward_labels,
+    )
+    gate_eligible = _evaluation_gate_eligible(
+        execution_outcome_eligible=execution_outcome_eligible,
+        evaluation_split=evaluation_split,
     )
 
     groups = _group_records(
@@ -331,6 +359,7 @@ def evaluate_candidate_sets(
         "group_key": group_key,
         "min_candidates": int(min_candidates),
         "max_candidates": int(max_candidates),
+        "distinct_actions_required": True,
         "require_reward_variation": bool(require_reward_variation),
         "uncertainty_coef": float(uncertainty_coef),
         "uncertainty": {
@@ -340,7 +369,8 @@ def evaluate_candidate_sets(
         "evaluation_split": evaluation_split,
         "reward_label_contract": reward_label_contract,
         "execution_outcome_eligible": execution_outcome_eligible,
-        "diagnostic_only": not execution_outcome_eligible,
+        "gate_eligible": gate_eligible,
+        "diagnostic_only": not gate_eligible,
         "record_count": len(records),
         "candidate_group_count": len(groups),
         "candidate_record_count": sum(len(group) for group in groups),
@@ -366,6 +396,7 @@ def evaluate_candidate_sets(
             "This is an offline candidate-set evaluation over already executed candidates.",
             "Ranking uses only state/action features via the value head; target_hidden is not passed to the model.",
             "reward_score is a replay training-reward label unless reward_label_contract explicitly verifies an execution outcome.",
+            "A gate-eligible result also requires a group-heldout split and distinct actions within every candidate group.",
             "Production U2 must generate candidates before execution and evaluate them against real labels.",
         ],
     }

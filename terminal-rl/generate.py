@@ -19,7 +19,10 @@ import asyncio
 
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.types import Sample
-from slime.world_model.metadata import attach_terminal_world_model_metadata
+from slime.world_model.metadata import (
+    attach_terminal_world_model_metadata,
+    truncate_head_tail_text,
+)
 
 from agent.prm_agent import TerminalPRMAgent
 from clawsentry_client import ClawSentryClient
@@ -3363,7 +3366,7 @@ async def generate(
                         "tool_call_id": getattr(tool_call_request, "tool_call_id", None),
                         "tool_name": tool_call_request.tool_name,
                         "args": tool_call_request.args,
-                        "result": raw_result[:4096] if isinstance(raw_result, str) else str(raw_result)[:4096],
+                        "result": truncate_head_tail_text(raw_result, 4096),
                         "clawsentry": cs_dec_dict,
                     })
                 should_continue_loop = True

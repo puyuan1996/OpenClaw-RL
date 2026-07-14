@@ -15,6 +15,9 @@ _SECRET_NAME = (
 _QUOTED_SECRET_RE = re.compile(rf"([\"']{_SECRET_NAME}[\"']\s*:\s*[\"'])(.*?)([\"'])", re.IGNORECASE)
 _QUOTED_ASSIGNMENT_RE = re.compile(rf"(\b{_SECRET_NAME}\b\s*=\s*[\"'])(.*?)([\"'])", re.IGNORECASE)
 _BARE_SECRET_RE = re.compile(rf"(\b{_SECRET_NAME}\b\s*[:=]\s*)([^\s,;}}\"']+)", re.IGNORECASE)
+_AUTHORIZATION_SCHEME_RE = re.compile(
+    r"(?i)(\bauthorization\b\s*[:=]\s*)(?:basic|bearer|token)\s+[a-z0-9._~+/:=-]{4,}"
+)
 _BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[a-z0-9._~+/=-]{8,}")
 _URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://[^:/\s]+:)[^@\s]+@")
 _TOKEN_LITERAL_RE = re.compile(
@@ -45,7 +48,7 @@ def stable_hash(value: Any, *, digest_size: int = 16) -> str:
 
 
 def canonicalize_context_identity(record: dict[str, Any]) -> dict[str, Any]:
-    """Derive split identity from the exact context text consumed by the encoder."""
+    """Derive split identity from the canonical text passed to the encoder tokenizer."""
     normalized = dict(record)
     context_text = normalized.get("context_text")
     if context_text is not None and not isinstance(context_text, str):
@@ -68,6 +71,7 @@ def canonicalize_context_identity(record: dict[str, Any]) -> dict[str, Any]:
 
 def redact_sensitive_text(value: Any) -> str:
     text = "" if value is None else str(value)
+    text = _AUTHORIZATION_SCHEME_RE.sub(r"\1[REDACTED]", text)
     text = _BEARER_RE.sub(r"\1[REDACTED]", text)
     text = _URL_CREDENTIAL_RE.sub(r"\1[REDACTED]@", text)
     text = _QUOTED_SECRET_RE.sub(r"\1[REDACTED]\3", text)
@@ -101,6 +105,11 @@ def _truncate(text: Any, max_chars: int, *, strategy: str = "head") -> str:
         tail_chars = keep - head_chars
         return text[:head_chars] + marker + text[-tail_chars:]
     return text[:max_chars]
+
+
+def truncate_head_tail_text(value: Any, max_chars: int) -> str:
+    """Bound stored text while retaining evidence from both ends."""
+    return _truncate(value, max_chars, strategy="head_tail")
 
 
 def _tool_action_text(call: dict[str, Any], max_chars: int) -> str:
@@ -267,6 +276,22 @@ def attach_terminal_world_model_metadata(
     eval_error: str | None = None,
 ) -> None:
     if not is_world_model_enabled(args) or not samples:
+        return
+    if any(
+        isinstance(turn, dict) and len(turn.get("sdk_model_turns") or []) > 1
+        for turn in (turn_records or [])
+    ):
+        for sample in samples:
+            skip = {
+                "schema": "openclaw_text_jepa_world_model_skip_v1",
+                "reason": "multi_interaction_turn_requires_harness_adapter",
+            }
+            metadata = sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}
+            sample.metadata = metadata
+            sample.metadata["world_model_skipped"] = skip
+            train_metadata = dict(sample.train_metadata or {})
+            train_metadata["world_model_skipped"] = skip
+            sample.train_metadata = train_metadata
         return
     max_chars = int(getattr(args, "world_model_metadata_max_chars", 4096) or 4096)
     turn_by_idx = {int(turn.get("turn_idx", i)): turn for i, turn in enumerate(turn_records or [])}

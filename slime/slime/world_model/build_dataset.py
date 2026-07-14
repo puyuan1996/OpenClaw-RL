@@ -11,7 +11,7 @@ import torch
 
 from slime.utils.types import Sample
 
-from .metadata import canonicalize_context_identity
+from .metadata import canonicalize_context_identity, redact_sensitive_text, stable_hash
 
 
 def _iter_sample_dicts(path: Path) -> Iterable[dict[str, Any]]:
@@ -76,10 +76,13 @@ def _looks_prefix_truncated(record: dict[str, Any], *, context_max_chars: int) -
     text = str(record.get("context_text") or "")
     if not text:
         return True
-    if context_max_chars > 0 and len(text) >= context_max_chars:
-        return True
-    source = str(record.get("context_text_source") or "")
-    return source == "sample.prompt" and "[openclaw_truncated_middle]" not in text and len(text) >= context_max_chars
+    if (
+        record.get("schema") == "openclaw_text_jepa_world_model_v2"
+        or record.get("context_text_truncation") == "head_tail"
+        or "[openclaw_truncated_middle]" in text
+    ):
+        return False
+    return context_max_chars > 0 and len(text) >= context_max_chars
 
 
 def _enrich_legacy_record(
@@ -108,10 +111,42 @@ def _enrich_legacy_record(
     if prompt is None:
         return record
     enriched = dict(record)
-    enriched["context_text"] = _truncate_text(prompt, context_max_chars, strategy=context_truncation)
+    if isinstance(prompt, str):
+        prompt_text = prompt
+    else:
+        prompt_text = json.dumps(prompt, ensure_ascii=False, sort_keys=True, default=str)
+    enriched["context_text"] = _truncate_text(
+        redact_sensitive_text(prompt_text),
+        context_max_chars,
+        strategy=context_truncation,
+    )
     enriched["context_text_source"] = "sample.prompt"
     enriched["context_text_truncation"] = context_truncation
     return enriched
+
+
+def _redact_record_text_fields(record: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(record)
+    fields = {
+        "context_text": None,
+        "action_text": "action_hash",
+        "next_observation_text": "next_observation_hash",
+    }
+    for text_key, hash_key in fields.items():
+        if text_key not in redacted or redacted[text_key] is None:
+            continue
+        value = redacted[text_key]
+        text = value if isinstance(value, str) else json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        text = redact_sensitive_text(text)
+        redacted[text_key] = text
+        if hash_key is not None:
+            redacted[hash_key] = stable_hash(text)
+    return redacted
 
 
 def _eval_reason(record: dict[str, Any]) -> str | None:
@@ -201,12 +236,14 @@ def extract_world_model_records(
             wm = metadata.get("world_model")
         if isinstance(wm, dict):
             record = canonicalize_context_identity(
-                _enrich_legacy_record(
-                    wm,
-                    item,
-                    context_max_chars=context_max_chars,
-                    context_source=context_source,
-                    context_truncation=context_truncation,
+                _redact_record_text_fields(
+                    _enrich_legacy_record(
+                        wm,
+                        item,
+                        context_max_chars=context_max_chars,
+                        context_source=context_source,
+                        context_truncation=context_truncation,
+                    )
                 )
             )
             if _record_matches(

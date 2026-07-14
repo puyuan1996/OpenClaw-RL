@@ -78,6 +78,70 @@ def test_extract_world_model_records_can_repair_prefix_truncated_context(tmp_pat
     assert records[0]["context_text_source"] == "sample.prompt"
 
 
+def test_auto_context_repair_preserves_v2_head_tail_context(tmp_path):
+    context_text = ("head" * 20) + "[openclaw_truncated_middle]" + ("tail" * 20)
+    payload = {
+        "samples": [
+            {
+                "status": "completed",
+                "prompt": [{"role": "user", "content": "initial prompt"}],
+                "metadata": {
+                    "world_model": {
+                        "schema": "openclaw_text_jepa_world_model_v2",
+                        "context_text": context_text,
+                        "context_text_source": "context_messages.head_tail",
+                        "context_text_truncation": "head_tail",
+                        "action_text": "act",
+                        "next_observation_text": "obs",
+                    }
+                },
+            }
+        ]
+    }
+    path = tmp_path / "rollout.pt"
+    torch.save(payload, path)
+
+    records = extract_world_model_records(
+        path,
+        context_max_chars=128,
+        context_source="auto",
+    )
+
+    assert records[0]["context_text"] == context_text
+    assert records[0]["context_text_source"] == "context_messages.head_tail"
+
+
+def test_extract_world_model_records_redacts_repaired_legacy_prompt(tmp_path):
+    secret = "sk-abcdefghijklmnop"
+    payload = {
+        "samples": [
+            {
+                "status": "completed",
+                "prompt": [{"role": "user", "content": f"OPENAI_API_KEY={secret}"}],
+                "metadata": {},
+                "train_metadata": {
+                    "world_model": {
+                        "schema": "openclaw_text_jepa_world_model_v1",
+                        "context_hash": "legacy",
+                        "action_text": "Authorization: Basic dXNlcjpwYXNz",
+                        "next_observation_text": "password=hunter2",
+                    }
+                },
+            }
+        ]
+    }
+    path = tmp_path / "rollout.pt"
+    torch.save(payload, path)
+
+    records = extract_world_model_records(path, context_source="sample_prompt")
+
+    assert len(records) == 1
+    assert secret not in records[0]["context_text"]
+    assert "dXNlcjpwYXNz" not in records[0]["action_text"]
+    assert "hunter2" not in records[0]["next_observation_text"]
+    assert "[REDACTED]" in records[0]["context_text"]
+
+
 def test_extract_world_model_records_unifies_legacy_and_v2_context_hashes(tmp_path):
     context_text = '[{"content":"same state","role":"user"}]'
     payload = {

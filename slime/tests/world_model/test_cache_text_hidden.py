@@ -7,6 +7,7 @@ import torch
 from slime.world_model.cache_text_hidden import (
     _finite_reward,
     _hash_encode,
+    _pool_last_token,
     _record_action_text,
     _record_state_text,
     _record_target_text,
@@ -21,6 +22,23 @@ def test_hash_encode_is_deterministic():
     assert first.shape == (2, 8)
     assert torch.allclose(first, second)
     assert torch.allclose(first.norm(dim=-1), torch.ones(2))
+
+
+def test_last_token_pooling_supports_left_and_right_padding():
+    hidden = torch.arange(2 * 4 * 2, dtype=torch.float32).reshape(2, 4, 2)
+    attention_mask = torch.tensor([[1, 1, 0, 0], [0, 0, 1, 1]])
+
+    pooled = _pool_last_token(hidden, attention_mask)
+
+    assert torch.equal(pooled[0], hidden[0, 1])
+    assert torch.equal(pooled[1], hidden[1, 3])
+
+
+def test_last_token_pooling_rejects_empty_rows():
+    hidden = torch.zeros(1, 2, 3)
+
+    with pytest.raises(ValueError, match="at least one unmasked token"):
+        _pool_last_token(hidden, torch.zeros(1, 2, dtype=torch.long))
 
 
 def test_finite_reward_rejects_nan_and_infinity():

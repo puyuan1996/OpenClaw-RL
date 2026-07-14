@@ -333,6 +333,18 @@ def _hash_encode(texts: Iterable[str], hidden_dim: int) -> torch.Tensor:
     return torch.stack(rows, dim=0)
 
 
+def _pool_last_token(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    if hidden.ndim != 3 or tuple(attention_mask.shape) != tuple(hidden.shape[:2]):
+        raise ValueError("hidden and attention_mask shapes are incompatible for last-token pooling")
+    mask = attention_mask.to(device=hidden.device, dtype=torch.bool)
+    positions = torch.arange(hidden.size(1), device=hidden.device).unsqueeze(0).expand_as(mask)
+    last_indices = positions.masked_fill(~mask, -1).max(dim=1).values
+    if bool((last_indices < 0).any()):
+        raise ValueError("last-token pooling requires at least one unmasked token per row")
+    batch_indices = torch.arange(hidden.size(0), device=hidden.device)
+    return hidden[batch_indices, last_indices]
+
+
 def _hf_encode(
     texts: list[str],
     *,
@@ -372,8 +384,7 @@ def _hf_encode(
             hidden = model(**enc).last_hidden_state
         mask = enc["attention_mask"].to(hidden.dtype)
         if pooling == "last":
-            lengths = enc["attention_mask"].sum(dim=1).clamp_min(1) - 1
-            pooled = hidden[torch.arange(hidden.size(0), device=hidden.device), lengths]
+            pooled = _pool_last_token(hidden, enc["attention_mask"])
         elif pooling == "cls":
             pooled = hidden[:, 0]
         else:

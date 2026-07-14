@@ -39,6 +39,22 @@ def _validated_indices(raw_indices: Any, *, count: int, name: str) -> list[int]:
     return indices
 
 
+def _validated_group_holdout_partition(
+    split_metadata: Mapping[str, Any],
+    *,
+    count: int,
+) -> tuple[list[int], list[int]]:
+    train_indices = _validated_indices(split_metadata.get("train_indices"), count=count, name="train")
+    val_indices = _validated_indices(split_metadata.get("val_indices"), count=count, name="val")
+    if not train_indices or not val_indices:
+        raise ValueError("checkpoint group_holdout split must contain non-empty train and val indices")
+    if set(train_indices) & set(val_indices):
+        raise ValueError("checkpoint group_holdout train and val indices overlap")
+    if set(train_indices) | set(val_indices) != set(range(count)):
+        raise ValueError("checkpoint group_holdout train and val indices must partition the cache")
+    return train_indices, val_indices
+
+
 def validate_cache_encoder(
     metadata: Mapping[str, Any] | None,
     cache_metadata: Mapping[str, Any] | None,
@@ -111,7 +127,11 @@ def select_evaluation_indices(
     if split in {"train", "val"}:
         if not same_cache:
             raise ValueError(f"checkpoint {split} split cannot be applied to a different or unverifiable cache")
-        indices = _validated_indices(split_metadata.get(f"{split}_indices"), count=count, name=split)
+        if split_strategy == "group_holdout":
+            train_indices, val_indices = _validated_group_holdout_partition(split_metadata, count=count)
+            indices = train_indices if split == "train" else val_indices
+        else:
+            indices = _validated_indices(split_metadata.get(f"{split}_indices"), count=count, name=split)
         if not indices:
             raise ValueError(f"checkpoint {split} split is empty")
         if split == "val":
