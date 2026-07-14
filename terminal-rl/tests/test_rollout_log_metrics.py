@@ -307,3 +307,80 @@ def test_metric_record_exposes_core_reward_fusion_fields(monkeypatch):
     assert math.isclose(record["agent57/trust_mean"], 0.575)
     assert record["agent57/trust_completed_mean"] == 1.0
     assert record["agent57/trust_truncated_mean"] == 0.15
+
+
+def test_step_context_uses_raw_rollout_axis_and_train_axis():
+    args = SimpleNamespace(
+        num_steps_per_rollout=None,
+        rollout_batch_size=64,
+        n_samples_per_prompt=8,
+        global_batch_size=128,
+    )
+
+    context = rollout_log._step_context(args, 3, rollout_step=12)
+
+    assert context == {
+        "rollout_id": 3,
+        "rollout_step": 3,
+        "train_step": 12,
+        "steps_per_rollout": 4,
+        "legacy_rollout_step": 12,
+    }
+
+
+def test_reward_fusion_axis_metrics_expose_canonical_fields(monkeypatch):
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS", "1")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_ENABLED", "1")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_MODE", "dual_stream")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_LAMBDA", "0.2")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE", "none")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_CLIP", "0")
+    monkeypatch.setenv("EXPLORE_TRUNCATION_PENALTY", "-0.03")
+    args = SimpleNamespace(
+        reward_key="score",
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        dynamic_history=False,
+    )
+    samples = [
+        DummySample(group_index=0, index=0, score=0.0, intrinsic=0.0, beta=0.01),
+        DummySample(
+            group_index=0,
+            index=1,
+            score=1.0,
+            intrinsic=1.0,
+            beta=0.02,
+            status="truncated",
+        ),
+    ]
+    samples[0].reward["explore_post_norm_base_reward"] = -0.5
+    samples[1].reward["explore_post_norm_base_reward"] = 0.5
+    samples[0].reward["explore_post_norm_bonus"] = -0.1
+    samples[1].reward["explore_post_norm_bonus"] = 0.1
+    samples[0].reward["explore_truncation_penalty"] = 0.0
+    samples[1].reward["explore_truncation_penalty"] = -0.03
+    samples[0].reward["explore_post_norm_adjusted_reward"] = -0.6
+    samples[1].reward["explore_post_norm_adjusted_reward"] = 0.57
+
+    metrics = rollout_log._reward_fusion_axis_metrics(args, samples)
+    record = rollout_log._metric_record_from_samples(
+        args=args,
+        phase="train",
+        dataset_name="seta",
+        source_datasets=["seta"],
+        rollout_id=3,
+        step=12,
+        samples=samples,
+    )
+
+    assert metrics["reward/task"] == 0.5
+    assert metrics["intrinsic/intra"] == 0.25
+    assert math.isclose(metrics["intrinsic/inter"], 0.005)
+    assert metrics["intrinsic/fused"] == 0.5
+    assert metrics["adv/task"] == 0.0
+    assert metrics["adv/intrinsic"] == 0.0
+    assert metrics["adv/final_penalty"] == -0.015
+    assert math.isclose(metrics["adv/with_penalty"], -0.015)
+    assert record["intrinsic/fused"] == metrics["intrinsic/fused"]
+    assert record["adv/with_penalty"] == metrics["adv/with_penalty"]

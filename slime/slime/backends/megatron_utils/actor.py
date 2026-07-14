@@ -31,6 +31,7 @@ from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
+from .lora import merged_megatron_lora
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
@@ -151,7 +152,7 @@ class MegatronTrainRayActor(TrainRayActor):
             single_tag=None if args.enable_weights_backuper else "actor",
         )
         self._active_model_tag: str | None = "actor"
-        self.weights_backuper.backup("actor")
+        self._backup_model_weights("actor")
 
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
@@ -161,7 +162,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.load_other_checkpoint("old_actor", args.load)
             # Create rollout_actor as a copy of current actor
             if args.update_weights_interval == 1:
-                self.weights_backuper.backup("rollout_actor")
+                self._backup_model_weights("rollout_actor")
 
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
@@ -566,7 +567,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
-        self.weights_backuper.backup("actor")
+        self._backup_model_weights("actor")
 
         # Update ref model if needed
         if (
@@ -577,7 +578,7 @@ class MegatronTrainRayActor(TrainRayActor):
             with timer("ref_model_update"):
                 if is_megatron_main_rank():
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
-                self.weights_backuper.backup("ref")
+                self._backup_model_weights("ref")
 
         log_perf_data(rollout_id, self.args)
 
@@ -631,7 +632,9 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+        offload_context = torch_memory_saver.disable() if self.args.offload_train else nullcontext()
+        lora_context = merged_megatron_lora(self.model) if getattr(self.args, "use_megatron_lora", False) else nullcontext()
+        with offload_context, lora_context:
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
@@ -651,9 +654,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     # First copy rollout_actor to old_actor
                     self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
                     # Then copy current actor to rollout_actor
-                    self.weights_backuper.backup("rollout_actor")
+                    self._backup_model_weights("rollout_actor")
                 else:
-                    self.weights_backuper.backup("old_actor")
+                    self._backup_model_weights("old_actor")
 
         if self.args.offload_train:
             destroy_process_groups()
@@ -681,8 +684,15 @@ class MegatronTrainRayActor(TrainRayActor):
         if model_tag == "ref" and self.args.ref_ckpt_step is not None:
             self.args.ckpt_step = old_ckpt_step
 
-        self.weights_backuper.backup(model_tag)
-        self._active_model_tag = model_tag
+        self._backup_model_weights(model_tag)
+
+    def _backup_model_weights(self, tag: str) -> None:
+        if getattr(self.args, "use_megatron_lora", False):
+            with merged_megatron_lora(self.model):
+                self.weights_backuper.backup(tag)
+        else:
+            self.weights_backuper.backup(tag)
+        self._active_model_tag = tag
 
     def connect_actor_critic(
         self,

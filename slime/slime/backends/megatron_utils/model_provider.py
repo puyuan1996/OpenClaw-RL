@@ -17,6 +17,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from slime.backends.megatron_utils.lora import apply_megatron_lora
 from slime.utils.misc import load_function
 
 
@@ -217,6 +218,8 @@ def wrap_model_provider_with_freeze(original_provider, args):
             model = original_provider(pre_process=pre_process, post_process=post_process)
 
         freeze_model_params(model, args)
+        if getattr(args, "use_megatron_lora", False):
+            apply_megatron_lora(model, args)
 
         return model
 

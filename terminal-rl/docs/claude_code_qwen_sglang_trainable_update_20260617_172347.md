@@ -57,4 +57,3 @@ MAX_CKPT_KEEP=0 DRY_RUN=1 bash terminal-rl/terminal-rl_qwen3-8b_seta_dapo_nodyna
 ```
 
 结果：相关 pytest `13 passed`；dry-run 通过；带假 `ANTHROPIC_API_KEY=supersecret` 的 dry-run 日志未检出密钥串。
-

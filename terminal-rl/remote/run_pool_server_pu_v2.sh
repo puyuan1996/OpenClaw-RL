@@ -48,6 +48,38 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 
 log() { echo "[$(date +'%F %T')] $*"; }
 
+detect_docker_data_root() {
+    local detected=""
+    if [[ -n "${DOCKER_DATA_ROOT:-}" ]]; then
+        printf '%s\n' "${DOCKER_DATA_ROOT}"
+        return 0
+    fi
+    if [[ -n "${DOCKER_ROOT:-}" ]]; then
+        printf '%s\n' "${DOCKER_ROOT}"
+        return 0
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        detected="$(timeout 10 docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+        if [[ -n "${detected}" ]]; then
+            printf '%s\n' "${detected}"
+            return 0
+        fi
+    fi
+    if [[ -f /etc/docker/daemon.json ]] && command -v python3 >/dev/null 2>&1; then
+        detected="$(python3 - <<'PY' 2>/dev/null || true
+import json
+with open("/etc/docker/daemon.json") as f:
+    print(json.load(f).get("data-root", ""))
+PY
+)"
+        if [[ -n "${detected}" ]]; then
+            printf '%s\n' "${detected}"
+            return 0
+        fi
+    fi
+    printf '%s\n' "/var/lib/docker"
+}
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 # 坑1: capacity must balance rollout demand and Docker isolation limits.
 # Most tasks can run in parallel; known compose-unsafe tasks are serialized
@@ -72,7 +104,8 @@ PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
 SKIP_PROXY_ENV="${SKIP_PROXY_ENV:-0}"
 CLAWSENTRY_NEEDED="${CLAWSENTRY_NEEDED:-0}"
 CS_GATEWAY_PORT="${CS_GATEWAY_PORT:-8090}"
-DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
+DOCKER_DATA_ROOT="$(detect_docker_data_root)"
+DOCKER_ROOT="${DOCKER_DATA_ROOT}"
 WORKER_DISK_GUARD_ENABLED="${WORKER_DISK_GUARD_ENABLED:-1}"
 WORKER_MIN_DOCKER_FREE_GB="${WORKER_MIN_DOCKER_FREE_GB:-50}"
 WORKER_MAX_DOCKER_USED_PCT="${WORKER_MAX_DOCKER_USED_PCT:-95}"
@@ -665,20 +698,51 @@ export WORKER_TASK_IMAGE_RETRY_AFTER
 export CONTAINER_PIDS_LIMIT
 export CONTAINER_MEMORY_LIMIT
 
-if [ -d "${REPO_ROOT}/.venv" ]; then
-    source .venv/bin/activate
+pool_server_env_ok() {
+    local env_dir="$1"
+    [[ -x "${env_dir}/bin/python" ]] || return 1
+    "${env_dir}/bin/python" - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+
+if sys.version_info < (3, 12):
+    raise SystemExit(1)
+missing = [
+    name for name in ("terminal_bench", "fastapi", "uvicorn", "camel")
+    if importlib.util.find_spec(name) is None
+]
+raise SystemExit(1 if missing else 0)
+PY
+}
+
+SHARED_CONDA_POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV:-$(cd "${REPO_ROOT}/.." && pwd)/conda_envs/openclaw-worker-py312}"
+if [[ -z "${POOL_SERVER_VENV:-}" ]] && pool_server_env_ok "${SHARED_CONDA_POOL_SERVER_VENV}"; then
+    POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV}"
+else
+    if [[ -z "${POOL_SERVER_VENV:-}" && -x "${SHARED_CONDA_POOL_SERVER_VENV}/bin/python" ]]; then
+        log "  shared conda env is present but missing pool_server deps: ${SHARED_CONDA_POOL_SERVER_VENV}"
+    fi
+    POOL_SERVER_VENV="${POOL_SERVER_VENV:-${REPO_ROOT}/.venv}"
+fi
+
+if [ -f "${POOL_SERVER_VENV}/bin/activate" ]; then
+    # shellcheck disable=SC1090
+    source "${POOL_SERVER_VENV}/bin/activate"
+else
+    export PATH="${POOL_SERVER_VENV}/bin:${PATH}"
 fi
 
 POOL_SERVER_PYTHON="${POOL_SERVER_PYTHON:-}"
 if [[ -z "${POOL_SERVER_PYTHON}" ]]; then
-    if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
-        POOL_SERVER_PYTHON="${REPO_ROOT}/.venv/bin/python"
+    if [[ -x "${POOL_SERVER_VENV}/bin/python" ]]; then
+        POOL_SERVER_PYTHON="${POOL_SERVER_VENV}/bin/python"
     else
         POOL_SERVER_PYTHON="$(command -v python3 || command -v python)"
     fi
 fi
 
 log "  pool_server python: ${POOL_SERVER_PYTHON}"
+log "  pool_server env: ${POOL_SERVER_VENV}"
 "${POOL_SERVER_PYTHON}" - <<'PY'
 import sys
 print("  pool_server python version:", sys.version.replace("\n", " "))

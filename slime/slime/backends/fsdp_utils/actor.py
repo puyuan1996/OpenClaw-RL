@@ -116,6 +116,14 @@ class FSDPTrainRayActor(TrainRayActor):
 
         model.train()
 
+        # Apply LoRA adapters before FSDP wrapping
+        self._is_lora = getattr(self.args, "use_lora", False)
+        if self._is_lora:
+            from .lora_utils import apply_lora, propagate_no_split_modules
+
+            model = apply_lora(model, self.args)
+            model = propagate_no_split_modules(model)
+
         full_state = model.state_dict()
 
         model = apply_fsdp2(model, mesh=self.dp_mesh, cpu_offload=self.fsdp_cpu_offload, args=self.args)
@@ -127,11 +135,21 @@ class FSDPTrainRayActor(TrainRayActor):
         self.model = model
 
         if args.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
+            # LoRA freezes base params, so reentrant checkpointing fails
+            # (inputs don't have requires_grad=True). Use non-reentrant mode.
+            gc_kwargs = {"use_reentrant": False} if self._is_lora else {}
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
+
+        # For LoRA, only pass trainable parameters to the optimizer
+        optim_params = (
+            [p for p in self.model.parameters() if p.requires_grad]
+            if self._is_lora
+            else self.model.parameters()
+        )
 
         if args.optimizer == "adam":
             self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
+                optim_params,
                 lr=args.lr,
                 betas=(args.adam_beta1, args.adam_beta2),
                 eps=args.adam_eps,
@@ -158,6 +176,23 @@ class FSDPTrainRayActor(TrainRayActor):
             if self.args.colocate
             else UpdateWeightFromDistributed(self.args, self.model)
         )
+
+        # When LoRA is enabled, PEFT wraps parameter names with prefixes that
+        # SGLang doesn't understand.  Strip them and skip adapter-only params.
+        if self._is_lora:
+
+            def _lora_name_transform(name: str) -> str | None:
+                # Skip LoRA adapter parameters — SGLang only needs merged base weights
+                if "lora_A" in name or "lora_B" in name or "lora_embedding" in name:
+                    return None
+                # Strip PEFT outer prefix: base_model.model.xxx → xxx
+                if name.startswith("base_model.model."):
+                    name = name[len("base_model.model."):]
+                # Strip .base_layer. inserted by PEFT for LoRA-targeted modules
+                name = name.replace(".base_layer.", ".")
+                return name
+
+            self.weight_updater._name_transform = _lora_name_transform
 
         checkpoint.finalize_load(self, checkpoint_payload)
 
@@ -572,7 +607,12 @@ class FSDPTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 logger.info(f"Updating ref model at rollout_id {rollout_id}")
             # Copy actor model state to ref model
-            actor_state = self.model.state_dict()
+            if self._is_lora:
+                from .lora_utils import get_merged_state_dict
+
+                actor_state = get_merged_state_dict(self.model)
+            else:
+                actor_state = self.model.state_dict()
             self.ref_model.load_state_dict(actor_state)
             self.ref_model.cpu()
 
@@ -710,10 +750,16 @@ class FSDPTrainRayActor(TrainRayActor):
             reported_accum.setdefault(k, []).append(v)
 
         if (mbs_id + 1) in grad_accum:
-            # TODO: check if the grad norm is global grad norm.
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
-            # the grad norm used to be of DTensor
-            grad_norm = float(grad_norm)
+            clip_grad = getattr(self.args, "clip_grad", 1.0)
+            if clip_grad is not None and clip_grad > 0:
+                # TODO: check if the grad norm is global grad norm.
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_grad)
+                # the grad norm used to be of DTensor
+                grad_norm = float(grad_norm)
+            else:
+                # LoRA/FSDP smoke runs can set --clip-grad 0 to skip grad norm
+                # clipping while keeping the training/logging path intact.
+                grad_norm = 0.0
 
             self.optimizer.step()
             # Update learning rate
@@ -733,6 +779,8 @@ class FSDPTrainRayActor(TrainRayActor):
                     f"train/{k}": (val.item() if torch.is_tensor(val) else val) for k, val in aggregated.items()
                 }
                 log_dict["train/grad_norm"] = grad_norm
+                if clip_grad is None or clip_grad <= 0:
+                    log_dict["train/clip_grad_enabled"] = 0.0
 
                 # Log learning rate per parameter group; use scheduler's last computed LRs
                 lr_values = self.lr_scheduler.get_last_lr()
@@ -743,9 +791,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 if self.args.use_kl_loss and "kl_loss" in aggregated:
                     kl_info = f", kl_loss: {aggregated['kl_loss']:.4f}, kl_penalty: {aggregated['kl_loss'] * self.args.kl_loss_coef:.4f}"
                     logger.info(kl_info)
-                logger.info(f"step {self.global_step}: {log_dict}")
-
                 log_dict["train/step"] = self.global_step
+                logger.info(f"train-step {self.global_step}: {log_dict}")
                 logging_utils.log(self.args, log_dict, step_key="train/step")
             self.global_step += 1
 
@@ -768,7 +815,15 @@ class FSDPTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
-        self.weight_updater.update_weights()
+        # Merge LoRA into base weights before syncing to SGLang rollout engines.
+        # SGLang doesn't understand LoRA adapters, so it needs the merged model.
+        if self._is_lora:
+            self.model.merge_adapter()
+        try:
+            self.weight_updater.update_weights()
+        finally:
+            if self._is_lora:
+                self.model.unmerge_adapter()
 
         if self.args.ci_test and len(rollout_engines) > 0:
             engine = random.choice(rollout_engines)
@@ -969,8 +1024,12 @@ def apply_fsdp2(model, mesh=None, cpu_offload=False, args=None):
 
     offload_policy = CPUOffloadPolicy() if cpu_offload else None
 
-    layer_cls_to_wrap = model._no_split_modules
-    assert len(layer_cls_to_wrap) > 0 and layer_cls_to_wrap[0] is not None
+    layer_cls_to_wrap = getattr(model, "_no_split_modules", None)
+    # When PEFT wraps the model, _no_split_modules may live on the inner model
+    if not layer_cls_to_wrap and hasattr(model, "base_model"):
+        inner = getattr(model.base_model, "model", model.base_model)
+        layer_cls_to_wrap = getattr(inner, "_no_split_modules", None)
+    assert layer_cls_to_wrap and len(layer_cls_to_wrap) > 0 and layer_cls_to_wrap[0] is not None
 
     modules = [
         module

@@ -110,6 +110,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_train_arguments(parser):
+            def add_arg_if_missing(*names, **kwargs):
+                if any(name in parser._option_string_actions for name in names):
+                    return
+                parser.add_argument(*names, **kwargs)
+
             parser.add_argument(
                 "--train-backend",
                 type=str,
@@ -212,6 +217,45 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                         3. Freeze specific projection layers (e.g., all Gate/Up projections):
                             --freeze-params-name-list linear_fc1
                         """,
+            )
+            parser.add_argument(
+                "--use-megatron-lora",
+                action="store_true",
+                default=False,
+                help="Enable lightweight LoRA adapters for the Megatron backend.",
+            )
+            parser.add_argument(
+                "--megatron-lora-save-adapter-only",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Save only Megatron LoRA adapter weights for adapter warm start. "
+                    "This does not save optimizer, scheduler, RNG, or full training resume state."
+                ),
+            )
+            parser.add_argument(
+                "--megatron-lora-adapter-load",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a saved Megatron LoRA adapter warm-start checkpoint to load after base weights. "
+                    "Use --load for the base/full Megatron checkpoint."
+                ),
+            )
+            parser.add_argument(
+                "--megatron-lora-include-experts",
+                action="store_true",
+                default=False,
+                help="Allow Megatron LoRA target matching to patch MoE expert modules.",
+            )
+            add_arg_if_missing("--lora-rank", type=int, default=8, help="LoRA adapter rank.")
+            add_arg_if_missing("--lora-alpha", type=int, default=16, help="LoRA adapter alpha.")
+            add_arg_if_missing("--lora-dropout", type=float, default=0.0, help="LoRA adapter dropout.")
+            add_arg_if_missing(
+                "--lora-target-modules",
+                type=str,
+                default=None,
+                help="Comma-separated LoRA target module names.",
             )
 
             return parser
@@ -2042,6 +2086,14 @@ def slime_validate_args(args):
 
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if getattr(args, "use_lora", False):
+        assert args.train_backend == "fsdp", "LoRA is only supported with --train-backend fsdp"
+    if getattr(args, "use_megatron_lora", False):
+        assert args.train_backend == "megatron", "--use-megatron-lora requires --train-backend megatron"
+        assert args.megatron_to_hf_mode == "bridge", "--use-megatron-lora requires --megatron-to-hf-mode bridge"
+        if getattr(args, "lora_target_modules", None) is None:
+            raise ValueError("--use-megatron-lora requires --lora-target-modules")
 
 
 def hf_validate_args(args, hf_config):

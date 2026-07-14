@@ -234,4 +234,3 @@ HARNESS_OPTION=camel-agent bash terminal-rl/terminal-rl_qwen3-8b_seta_dapo_nodyn
 - 删除 `terminal-rl/terminal-rl_qwen3-8b_seta_dapo_nodynamic_claude_code_pu.sh`。
 - 删除 `terminal-rl/tests/test_claude_code_agent.py`。
 - 回退 `terminal-rl/agent_runner.py`、`terminal-rl/generate.py`、两个 base/exploration shell 脚本和相关测试中的 `claude-code` 分支。
-

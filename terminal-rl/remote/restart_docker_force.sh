@@ -27,6 +27,7 @@ FORCE_RESTART_CONTAINERD="${FORCE_RESTART_CONTAINERD:-1}"
 DOCKER_RUNTIME_RETRY="${DOCKER_RUNTIME_RETRY:-1}"
 USE_SYSTEMD_START="${USE_SYSTEMD_START:-1}"
 LOG_FILE=""
+CONTAINERD_LOG_FILE=""
 
 log "Force restarting docker on $(hostname)"
 log "  DOCKER_DATA_ROOT=${DATA_ROOT}"
@@ -35,6 +36,12 @@ log "  DOCKER_START_WAIT=${DOCKER_START_WAIT_SECONDS}s"
 log "  RESTART_CONTAINERD=${FORCE_RESTART_CONTAINERD}"
 log "  RUNTIME_RETRY=${DOCKER_RUNTIME_RETRY}"
 log "  USE_SYSTEMD_START=${USE_SYSTEMD_START}"
+
+systemd_available() {
+    command -v systemctl >/dev/null 2>&1 &&
+        [ -d /run/systemd/system ] &&
+        timeout 5 systemctl list-units --no-pager >/dev/null 2>&1
+}
 
 dump_docker_start_diagnostics() {
     local log_file="${1:-}"
@@ -50,6 +57,10 @@ dump_docker_start_diagnostics() {
     journalctl -u docker -n 80 --no-pager 2>/dev/null | sed 's/^/    /' || true
     log "  journal containerd tail:"
     journalctl -u containerd -n 80 --no-pager 2>/dev/null | sed 's/^/    /' || true
+    if [ -n "${CONTAINERD_LOG_FILE:-}" ] && [ -f "${CONTAINERD_LOG_FILE}" ]; then
+        log "  containerd log tail (${CONTAINERD_LOG_FILE}):"
+        tail -80 "${CONTAINERD_LOG_FILE}" 2>/dev/null | sed 's/^/    /' || true
+    fi
 }
 
 cleanup_docker_runtime_state() {
@@ -60,28 +71,72 @@ cleanup_docker_runtime_state() {
     rm -rf /run/containerd/io.containerd.grpc.v1.introspection 2>/dev/null || true
 }
 
+wait_for_containerd_api() {
+    local label="$1"
+    local max_attempts="${2:-12}"
+    local i
+    for i in $(seq 1 "${max_attempts}"); do
+        if command -v ctr >/dev/null 2>&1 && timeout 5 ctr version >/dev/null 2>&1; then
+            log "  [OK] containerd API ready after ~$((i*2))s (${label})"
+            return 0
+        fi
+        if ! pgrep -x containerd >/dev/null 2>&1; then
+            log "  [ERROR] containerd process is not running (${label})"
+            return 1
+        fi
+        sleep 2
+    done
+    log "  WARN: containerd API not ready after ~$((max_attempts*2))s (${label})"
+    return 1
+}
+
+start_containerd_direct() {
+    command -v containerd >/dev/null 2>&1 || die "containerd binary not found"
+    mkdir -p /run/containerd
+    rm -f /run/containerd/containerd.sock /run/containerd/containerd.sock.ttrpc 2>/dev/null || true
+    CONTAINERD_LOG_FILE="/tmp/containerd_start_$(date +%H%M%S).log"
+    nohup containerd > "${CONTAINERD_LOG_FILE}" 2>&1 &
+    CONTAINERD_PID=$!
+    disown 2>/dev/null || true
+    log "  nohup started containerd PID=${CONTAINERD_PID}, log: ${CONTAINERD_LOG_FILE}"
+    wait_for_containerd_api "direct start" 30
+}
+
 restart_containerd_clean() {
     if [ "${FORCE_RESTART_CONTAINERD}" != "1" ]; then
-        if ! pgrep -x containerd >/dev/null 2>&1; then
-            log "  containerd not running, starting via systemd..."
-            timeout 10 systemctl start containerd 2>/dev/null || log "  WARN: systemctl start containerd timed out"
-            sleep 3
-        else
+        if pgrep -x containerd >/dev/null 2>&1 && wait_for_containerd_api "existing process" 3; then
             log "  containerd already running: $(pgrep -x containerd | xargs)"
+        elif systemd_available; then
+            log "  containerd not ready, starting via systemd..."
+            timeout 10 systemctl start containerd 2>/dev/null || log "  WARN: systemctl start containerd timed out"
+            wait_for_containerd_api "systemd start" 15 || true
+        else
+            log "  containerd not ready and systemd is unavailable; starting directly"
+            pkill -9 -x containerd 2>/dev/null || true
+            start_containerd_direct || true
         fi
         return 0
     fi
 
     log "  restarting containerd cleanly after shim cleanup"
-    timeout 10 systemctl stop containerd 2>/dev/null || log "  WARN: systemctl stop containerd timed out"
+    if systemd_available; then
+        timeout 10 systemctl stop containerd 2>/dev/null || log "  WARN: systemctl stop containerd timed out"
+    fi
     pkill -9 -x containerd 2>/dev/null || true
     cleanup_docker_runtime_state
-    timeout 20 systemctl start containerd 2>/dev/null || log "  WARN: systemctl start containerd timed out"
-    sleep 3
-    if pgrep -x containerd >/dev/null 2>&1; then
-        log "  [OK] containerd running: $(pgrep -x containerd | xargs)"
+    rm -f /run/containerd/containerd.sock /run/containerd/containerd.sock.ttrpc 2>/dev/null || true
+    if systemd_available; then
+        timeout 20 systemctl start containerd 2>/dev/null || log "  WARN: systemctl start containerd timed out"
+        sleep 3
+        if pgrep -x containerd >/dev/null 2>&1 && wait_for_containerd_api "systemd restart" 10; then
+            log "  [OK] containerd running: $(pgrep -x containerd | xargs)"
+        else
+            log "  WARN: containerd still not ready after systemd restart; trying direct start"
+            pkill -9 -x containerd 2>/dev/null || true
+            start_containerd_direct || true
+        fi
     else
-        log "  WARN: containerd still not visible after restart"
+        start_containerd_direct || true
     fi
 }
 
