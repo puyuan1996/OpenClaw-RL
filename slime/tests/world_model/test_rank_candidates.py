@@ -130,6 +130,7 @@ def test_verified_target_free_ranking_is_execution_eligible(tmp_path):
                 "oracle_only": False,
                 "requires_target": False,
                 "reward_label_verified_execution_outcome": True,
+                "evaluation_split_scope": "group_heldout",
             }
         )
         + "\n",
@@ -140,6 +141,28 @@ def test_verified_target_free_ranking_is_execution_eligible(tmp_path):
 
     assert count == 1
     assert eligible is True
+
+
+def test_in_sample_target_free_ranking_is_not_execution_eligible(tmp_path):
+    path = tmp_path / "rankings.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "score_source": "value",
+                "oracle_only": False,
+                "requires_target": False,
+                "reward_label_verified_execution_outcome": True,
+                "evaluation_split_scope": "in_sample_all",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    count, eligible = _ranking_artifact_status(path)
+
+    assert count == 1
+    assert eligible is False
 
 
 def test_reward_label_status_requires_verified_checkpoint_contract():

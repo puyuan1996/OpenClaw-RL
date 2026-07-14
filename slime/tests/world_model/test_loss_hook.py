@@ -42,7 +42,7 @@ def test_apply_world_model_loss_zero_coefficient_does_not_load_hook():
 def test_apply_world_model_loss_with_precomputed_latents():
     logits = torch.zeros(1)
     base_loss = logits.sum()
-    pred = [torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0])]
+    pred = [torch.tensor([1.0, 0.0], requires_grad=True), torch.tensor([0.0, 1.0], requires_grad=True)]
     target = [torch.tensor([0.0, 0.0]), torch.tensor([0.0, 0.0])]
     out_loss, log = apply_world_model_loss(
         args=SimpleNamespace(world_model_enable=True, world_model_loss_coef=0.5, world_model_loss_hook_path=None),
@@ -61,6 +61,36 @@ def test_apply_world_model_loss_with_precomputed_latents():
     assert torch.isclose(log["wm/loss_coef"], torch.tensor(1.0))
     assert torch.isclose(log["wm/metadata_count"], torch.tensor(2.0))
     assert torch.isclose(log["wm/latent_available"], torch.tensor(2.0))
+    out_loss.backward()
+    assert all(row.grad is not None for row in pred)
+
+
+def test_apply_world_model_loss_rejects_missing_latents_at_positive_coefficient():
+    logits = torch.zeros(1, requires_grad=True)
+    with pytest.raises(ValueError, match="graph-connected"):
+        apply_world_model_loss(
+            args=SimpleNamespace(world_model_enable=True, world_model_loss_coef=0.1),
+            batch={},
+            logits=logits,
+            loss=logits.sum(),
+            reported_loss={"loss": logits.sum().detach()},
+        )
+
+
+def test_apply_world_model_loss_rejects_detached_latents():
+    logits = torch.zeros(1, requires_grad=True)
+    with pytest.raises(ValueError, match="detached"):
+        apply_world_model_loss(
+            args=SimpleNamespace(world_model_enable=True, world_model_loss_coef=0.1),
+            batch={
+                "wm_pred_latents": torch.ones(1, 4),
+                "wm_target_latents": torch.zeros(1, 4),
+                "response_lengths": [1],
+            },
+            logits=logits,
+            loss=logits.sum(),
+            reported_loss={"loss": logits.sum().detach()},
+        )
 
 
 @pytest.mark.parametrize("coefficient", [-1.0, float("nan"), float("inf")])
@@ -110,10 +140,11 @@ def test_apply_world_model_loss_rejects_context_parallel_replication():
 
 def test_apply_world_model_loss_treats_unbatched_latent_as_one_sample():
     logits = torch.zeros(1)
+    pred = torch.tensor([1.0, 0.0, 0.0, 0.0], requires_grad=True)
     out_loss, log = apply_world_model_loss(
         args=SimpleNamespace(world_model_enable=True, world_model_loss_coef=1.0),
         batch={
-            "wm_pred_latents": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            "wm_pred_latents": pred,
             "wm_target_latents": torch.zeros(4),
             "wm_metadata": [{}],
             "response_lengths": [1],
@@ -125,6 +156,8 @@ def test_apply_world_model_loss_treats_unbatched_latent_as_one_sample():
 
     assert torch.isclose(out_loss, torch.tensor(0.25))
     assert torch.isclose(log["wm/loss"], torch.tensor(0.25))
+    out_loss.backward()
+    assert pred.grad is not None
 
 
 def test_apply_world_model_loss_rejects_latent_batch_count_mismatch():

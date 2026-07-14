@@ -28,11 +28,10 @@ def _load_checkpoint(path: Path, device: torch.device) -> tuple[TextLatentWorldM
     return model, ckpt.get("metadata", {})
 
 
-def _load_cache(path: Path) -> dict[str, Any]:
+def _load_cache(path: Path, *, require_verified: bool = False) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise TypeError(f"Expected dict payload in {path}, got {type(payload).__name__}")
-    validate_hidden_cache_integrity(payload)
     required = ["state_hidden", "action_hidden", "target_hidden"]
     missing = [key for key in required if key not in payload]
     if missing:
@@ -45,6 +44,7 @@ def _load_cache(path: Path) -> dict[str, Any]:
             raise ValueError(
                 f"Inconsistent cache length for {key}: expected {count}, got {int(payload[key].shape[0])}"
             )
+    validate_hidden_cache_integrity(payload, require_verified=require_verified)
     return payload
 
 
@@ -236,7 +236,7 @@ def evaluate_probe(
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
     model, checkpoint_metadata = _load_checkpoint(checkpoint, device)
-    payload = _load_cache(cache)
+    payload = _load_cache(cache, require_verified=split != "all")
     indices, evaluation_split = select_evaluation_indices(
         checkpoint_metadata,
         payload.get("metadata"),

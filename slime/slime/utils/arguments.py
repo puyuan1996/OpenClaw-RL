@@ -949,8 +949,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0.0,
                 help=(
-                    "Auxiliary world-model loss coefficient. A value of 0 keeps the "
-                    "world-model hook as metadata/shadow logging only."
+                    "Auxiliary world-model loss coefficient. Positive values require "
+                    "--world-model-enable, --world-model-mode auxiliary, and the Megatron backend."
                 ),
             )
             parser.add_argument(
@@ -958,7 +958,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 choices=["offline", "shadow", "auxiliary"],
                 default="offline",
-                help="World-model integration mode. The v1 implementation keeps online behavior shadow/offline unless loss coef is set.",
+                help=(
+                    "World-model integration mode. offline/shadow require zero loss coefficient; "
+                    "auxiliary requires an explicitly positive coefficient."
+                ),
             )
             parser.add_argument(
                 "--world-model-hidden-source",
@@ -1813,6 +1816,9 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    from slime.world_model.checkpoint import validate_world_model_configuration
+
+    validate_world_model_configuration(args)
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.kl_coef != 0 or args.use_kl_loss:

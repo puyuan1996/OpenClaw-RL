@@ -1,7 +1,7 @@
 # OpenClaw Latent World Model w/ Value Head
 
 > 项目：OpenClaw-RL `jepa_wm`
-> 文档定位：组会讲解、阶段性研究结论与 PR #19 实现说明
+> 文档定位：组会讲解、方法说明、实现边界与 PR #19 复现入口
 > 更新日期：2026-07-14
 > 代码快照：`MING-ZCH:jepa_wm`，以 [PR #19](https://github.com/puyuan1996/OpenClaw-RL/pull/19) 当前 head 为准
 > 参考框架：Qwen-AgentWorld 的 Motivation -> Method -> Training/Eval -> Findings 讲解结构
@@ -17,8 +17,8 @@
 | 研究问题 | 当前结论 | 证据等级 |
 | --- | --- | --- |
 | LLM hidden 能否对齐为统一 belief latent？ | 工程链路和离线训练已闭环 | 已实现 |
-| predictor 是否使用 action？ | 历史 clean snapshot 的 shuffled/zero-action 对照为正，严格 group-heldout 待重跑 | 探索性信号 |
-| value score 能否排序同 context 候选？ | 历史 same-context 与小规模 context-heldout snapshot 为正，需用新 protocol 复验 | 探索性信号 |
+| predictor 是否使用 action？ | shuffled/zero-action、bootstrap CI 与 group-heldout eval 已实现；PR 未提交 benchmark artifact | 待实验验证 |
+| value score 能否排序同 context 候选？ | target-free ranking 与 candidate-set eval 已实现；PR 未提交 benchmark artifact | 待实验验证 |
 | latent 能否预测结构化 execution result？ | 当前 PR 未提交结构化 result head/eval | 未验证 |
 | latent 能否预测 tool 选择？ | 当前 PR 未提交 tool-choice head/eval | 未验证 |
 | uncertainty 能否作为可靠风险估计？ | head 未接受 dedicated loss，相关性不稳定 | 未验证 |
@@ -26,7 +26,7 @@
 
 一句话结论：
 
-> 历史离线结果显示“LLM hidden + 受控 projector”可能包含 action-conditioned transition 与 ranking 信号；严格 group-heldout/provenance 修复已经落地，但真实数据必须重跑后才能升级证据等级，更未证明 online policy 收益。
+> 当前 PR 交付的是可复现、fail-closed 的离线研究框架，不是正向 benchmark 结论；action sensitivity、candidate ranking、tool/result prediction 与 online policy 收益都必须在 PR 外重新生成的数据上验证。
 
 ---
 
@@ -219,7 +219,7 @@ flowchart TB
 3. **calibration measured, not assumed**：prediction loss 低不等于可以控制 policy，必须报告 heldout ranking、risk-coverage 和 real-execution utility。
 4. **verifier-preserving**：learned WM 只筛选、排序或辅助信用分配，不替代 unit test / real environment truth。
 
-当前 PR 和实验只覆盖前三个限定中的离线部分。P2b real-execution shadow gate 尚未完成，因此本阶段应称为 **offline feasibility and ranking evidence**，不能称为已验证的 online model-based agentic-RL。
+当前 PR 只交付前三个限定所需的离线实现与评测协议。P2b real-execution shadow gate 尚未完成，因此本阶段应称为 **offline research infrastructure**，不能称为已有 ranking evidence 或已验证的 online model-based agentic-RL。
 
 ### 2.6 为什么 v1 不做 Multi-step Imagination
 
@@ -277,7 +277,7 @@ flowchart TB
 
 LLM hidden 的原始目标是 next-token prediction。它混合了 token identity、position、syntax、style 和语义信息，不天然等于 Markov state 或 belief state。
 
-当前实现使用 frozen HF `AutoModel(...).last_hidden_state`，支持 `mean/last/cls` pooling。正式代表性实验使用 Qwen3-8B final hidden 的 mean pooling：
+当前实现使用 frozen HF `AutoModel(...).last_hidden_state`，支持 `mean/last/cls` pooling。建议语义实验以 Qwen3-8B final hidden 的 mean pooling 作为首个 baseline；PR 不提交模型权重、hidden cache 或对应 benchmark：
 
 $$
 h_t^s=H(s_t), \quad h_t^a=H(a_t), \quad h_{t+1}^o=H(o_{t+1})
@@ -370,7 +370,7 @@ $$
 
 需要明确两个实现事实：
 
-1. 通用脚本默认 `value_coef=0.0`，只有显式打开后 value head 才接受 reward supervision。代表性 `stability_mean_seed7` 实验使用 `value_coef=0.05`。
+1. 通用脚本默认 `value_coef=0.0`，只有显式设置正系数后 value head 才接受 reward supervision。
 2. `uncertainty_head` 当前只有 `softplus(linear(...))` forward interface，`compute_loss()` 没有 dedicated uncertainty loss。因此它不是已校准 epistemic/aleatoric uncertainty。
 
 总 loss 为：
@@ -396,7 +396,7 @@ $$
 - 默认 `auto/value/uncertainty` mode 不向模型传入 `target_hidden`。
 - 只有显式 `--score-mode pred_error` 才读取 target，用于 oracle diagnostic。
 - `candidate_set_eval.py` 会过滤缺失、NaN 或 infinite `reward_score`。
-- cache 的 records digest、encoder contract fingerprint、hidden tensor digest 必须与 checkpoint/records 一致，防止同长度、不同 encoder 或不同 hidden 的错位。
+- cache 的 records digest、encoder contract fingerprint、hidden tensor digest，以及逐样本 reward/mask/group metadata digest 必须与 checkpoint/records 一致，防止同长度但 encoder、hidden、监督标签或 heldout 分组错位。
 - `auto` eval 只接受精确训练 cache 中持久化的非空 group-heldout validation indices；record fallback、空 validation 和 provenance 不完整都会 fail closed。
 - 排序前拒绝 NaN/Inf score，JSON 输出禁止非标准 `NaN`。
 
@@ -419,9 +419,9 @@ $$
 
 | 能力 | 当前 v1 | 完整设计/后续方向 |
 | --- | --- | --- |
-| 数据源 | 本地 replay-buffer `.pt` records | online policy hidden capture + 持续 replay |
+| 数据源 | debug rollout `.pt` snapshots 与静态 offline records | online policy hidden capture + 持久 replay service |
 | encoder | frozen HF Qwen hidden cache | policy-coupled Megatron hidden，需处理 PP/CP/SP |
-| pooling | `mean/last/cls`，代表实验为 mean | learned-query pooling、multi-vector action |
+| pooling | `mean/last/cls`，建议首个 baseline 为 mean | learned-query pooling、multi-vector action |
 | transition | single-step MLP predictor | turn-level AR predictor、短 horizon imagination |
 | target branch | learnable projector，可选 stop-grad | frozen/EMA target encoder + periodic re-anchor |
 | anti-collapse | SIGReg + effective-rank diagnostics | 同时监控 anti-drift、CKA/OOD |
@@ -444,10 +444,10 @@ $$
 | Head branch | `MING-ZCH:jepa_wm` |
 | Core package | `slime/slime/world_model/` |
 | Focused tests | 9 test files under `slime/tests/world_model/` |
-| Reusable scripts | 5 generic `terminal-rl/scripts/*world_model*.sh` |
+| Reusable scripts | 5 个通用入口，完整文件名见 [4.4](#44-reusable-scripts) |
 | Committed docs | 本讲解稿与 package README |
 
-PR-ready tree 只保留通用脚本，不包含一次性 GPU 拓扑、overnight、topup、recovery、dated wrapper 或本地实验产物。
+PR-ready tree 只保留实现模块、focused tests、通用入口和本讲解文档，不包含生成的 rollout、cache、checkpoint 或运行日志。
 
 ### 4.2 Core Modules
 
@@ -482,7 +482,7 @@ flowchart TD
 
 - `world_model_enable=False` 时不记录 world-model metadata。
 - `world_model_loss_coef=0.0` 时 auxiliary hook 是 no-op。
-- 当前 hook 仅支持 sample-normalized、`context_parallel_size=1`；per-token loss 或 CP>1 会 fail closed，尚未完成 PP/CP/SP online distributed adaptation。
+- 当前 hook 仅支持 sample-normalized、`context_parallel_size=1`；正系数下缺 latent 或 auxiliary 已 detach、per-token loss、CP>1 都会 fail closed，尚未完成 PP/CP/SP online distributed adaptation。
 - policy/value loss、reward、environment、Docker worker 和 SETA 数据逻辑不被替换。
 - 大 hidden tensor 不进入 `Sample.metadata`，只保存轻量文本和 hash。
 - context/action/result 在落盘前清理常见 token、password、Authorization 和 URL credentials。
@@ -531,43 +531,41 @@ flowchart LR
     S3 --> S4[P2b real-execution shadow]
     S4 --> S5[Small-coef online auxiliary]
 
-    S0 -. completed .-> C0[Done]
-    S1 -. strict rerun .-> C1[Historical snapshot only]
-    S2 -. strict rerun .-> C2[Historical snapshot only]
-    S3 -. strict rerun .-> C3[Historical small-group snapshot]
+    S0 -. code and tests .-> C0[Implemented]
+    S1 -. protocol available .-> C1[No committed benchmark]
+    S2 -. protocol available .-> C2[No committed benchmark]
+    S3 -. protocol available .-> C3[No committed benchmark]
     S4 -. next .-> C4[Not done]
     S5 -. gated .-> C5[Not started]
 ```
 
 ### 5.2 Data Buckets
 
-| Bucket | Records | 含义 |
-| --- | ---: | --- |
-| `full` | 2878 | 所有可用 records |
-| `clean` | 472 | 过滤 timeout/bad eval 等低质量结果 |
-| `tool_only` | 2591 | 具有 tool result 的 records |
+| Bucket | 选择规则 | 用途 |
+| --- | --- | --- |
+| `full` | 保留全部可解析 records | 覆盖率基线 |
+| `clean` | trajectory completed，且排除配置的 bad eval reasons | 高质量反馈子集 |
+| `tool_only` | `has_tool_result=true`，空字符串 result 也保留 | tool-feedback 子集 |
 
-clean 只占 full 的 `16.4%`，是当前泛化和统计稳定性的主要瓶颈。
+bucket 数量由输入 rollout 决定，PR 不提交固定 dataset manifest，因此不在此记录本地样本数。
 
-### 5.3 Representative Probe Configuration
-
-代表性实验 `stability_mean_seed7`：
+### 5.3 Generic Stage-A Defaults
 
 | 配置 | 值 |
 | --- | --- |
-| Frozen encoder | Qwen3-8B HF `last_hidden_state` |
-| Hidden dimension | 4096 |
-| Pooling | mean |
+| Encoder | `hash` 默认仅用于 smoke；HF 必须显式 opt-in |
+| HF hidden | `AutoModel.last_hidden_state`，维度由所选本地模型决定 |
+| Pooling | `mean` |
 | Max text length | 2048 |
 | Latent dimension | 1024 |
-| Epochs | 8 |
-| Batch size | 16 |
+| Epochs | HF 5；hash 3 |
+| Batch size | 8 |
 | Learning rate | `1e-4` |
 | `sigreg_coef` | 0.1 |
 | `action_contrast_coef` | 0.1 |
-| `value_coef` | 0.05 |
+| `value_coef` | 0.0；P2 value 实验必须显式设为正数 |
 | Validation ratio | 0.25 |
-| Train seed | 7 |
+| Train seed | 42 |
 
 ### 5.4 Stage-A Metrics
 
@@ -596,107 +594,42 @@ clean 只占 full 的 `16.4%`，是当前泛化和统计稳定性的主要瓶颈
 
 ---
 
-## 6. Results
+## 6. Current Validation Status
 
-> **证据口径说明**：以下数值来自严格 group-heldout、终局标签和 provenance guards 合入前的历史实验快照。它们可用于提出假设和选择下一轮配置，但不能作为当前代码的最终 heldout 结果；必须使用新 schema/protocol 重跑。
+本 PR 不提交 rollout、hidden cache、checkpoint、dataset manifest 或 benchmark summary，因此**没有可随代码审计的实验数值**。当前可以报告的是实现与回归验证，而不是模型效果：
 
-### 6.1 历史 Stage-A：Clean Data 的 Action Signal 最强
+| 能力 | PR 内状态 | 允许的结论 |
+| --- | --- | --- |
+| Causal turn record 与 credential redaction | 已实现并有单元测试 | 数据接口可用 |
+| HF/hash hidden cache 与完整 provenance | cache schema v4；hidden、reward/mask、group metadata 均参与 fingerprint | 严格消费者可发现错配或篡改 |
+| JEPA-style probe training | 已实现 | 训练链路可执行，不代表语义预测有效 |
+| Group-heldout Stage-A | eval 与 gate 已实现 | 可生成 action/collapse diagnostics，尚无 committed benchmark |
+| Target-free candidate ranking | value 训练证据和 reward-label contract 均 fail closed | 可运行离线 ranking protocol，尚无 committed ranking 结果 |
+| Uncertainty | 只有 interface，无 dedicated objective | unavailable，禁止用于风险决策 |
+| Tool choice / structured execution result | 无 classifier/head/eval | 未实现、未验证 |
+| Online RL improvement | 只有默认关闭的 hook boundary | 未验证 |
 
-| Bucket | Real MSE | Shuffled - real | Gap ratio | Gap 95% CI | Action delta | Value-reward Spearman |
-| --- | ---: | ---: | ---: | --- | ---: | ---: |
-| `full` | 0.0002934 | 0.0000100 | 3.41% | `[8.77e-6, 1.12e-5]` | 0.00204 | 0.6017 |
-| `clean` | 0.0002741 | 0.0001130 | 41.23% | `[9.04e-5, 1.37e-4]` | 0.00818 | 0.6542 |
-| `tool_only` | 0.0002940 | 0.0000057 | 1.92% | `[4.58e-6, 6.87e-6]` | 0.00170 | 0.6103 |
-
-解释：
-
-- 三个 bucket 的 shuffled gap 均为正，bootstrap CI 不跨 0。
-- clean split 的 gap ratio 和 `action_delta` 明显更大；这一历史探索性相关信号提示低质量 feedback 可能削弱 action-conditioned signal。
-- tool-only 数量最大，但 action signal 最弱，提示“有 tool result”不等于“有信息量的 state transition”。
-
-### 6.2 Latent Rank：没有完全塌缩，但 Predictor 存在强压缩
-
-| Bucket | State rank | Pred rank | Target rank |
-| --- | ---: | ---: | ---: |
-| `full` | 49.38 | 27.49 | 341.73 |
-| `clean` | 25.84 | 12.83 | 98.15 |
-| `tool_only` | 47.45 | 34.37 | 346.35 |
-
-`pred_latent` effective rank 大于 1，因此不是完全 collapse；但它显著低于 target rank，说明 predictor 可能只保留与平均 reward/status 相关的低维因素。这既可能是有效压缩，也可能是欠拟合，需要 hard-negative 和 richer outcome labels 区分。
-
-### 6.3 P2 Same-Context Ranking
-
-阶段报告记录的最好离线结果：
-
-| 指标 | 最好结果 |
-| --- | ---: |
-| `WM - random` | +0.3058 |
-| `Spearman(score, reward)` | 0.6538 |
-| `hit_oracle` | 0.8333 |
-
-这是值得复验的 candidate-ordering 信号；原 same-context candidate-set 混有 training rows，不是 heldout 或 online selector 证据。
-
-### 6.4 Context-Heldout 结果
-
-历史独立 heldout 运行如下。由于 raw artifacts 与一次性 split wrapper 未纳入 PR，且 causal schema 已更新，这些结果仍需由当前通用 protocol 重跑：
-
-| Experiment | Bucket | Groups | WM-random | Spearman | hit_oracle | Regret |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `pooling_last_seed42` 6h champion | clean | 10 | 0.4952 | 0.7498 | 0.8000 | 0.0799 |
-| `stability_mean_seed7` 12h challenger | clean | 17 | 0.3737 | 0.6743 | 0.8235 | 0.2209 |
-
-Repeated-heldout recovery 的 `stability_mean_seed7` family：
-
-| Split seed | Groups | WM-random | Spearman | hit_oracle | Regret |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 11 | 19 | 0.2990 | 0.5333 | 0.7368 | 0.1365 |
-| 13 | 12 | 0.2908 | 0.9185 | 0.8333 | 0.1428 |
-| 17 | 10 | 0.2826 | 0.1250 | 0.6000 | 0.1927 |
-| **Family mean/min** | 3 jobs | **0.2908 / 0.2826** | **0.5256 mean** | **0.7234 mean** | **0.1573 mean** |
-
-结论：
-
-- 3 个历史 split seed 的 `WM-random` 都为正，形成重复性线索，但不能替代新 protocol 下的复验。
-- Spearman 从 `0.1250` 到 `0.9185` 波动很大，说明排序相关性尚不稳定。
-- 每个 split 只有 10 到 19 个 eligible groups，置信度仍有限。
-
-### 6.5 Uncertainty 尚不可用
-
-`uncertainty_head` 没有 dedicated loss，旧实验中的 penalty sweep 也未改变 top1 结果。当前 eval 因此将 uncertainty 标记为 unavailable，candidate-set eval 强制 `beta=0`；在加入专门 objective 与 calibration eval 前，不再输出或使用随机初始化 head 的相关性。
-
-### 6.6 Execution Result 与 Tool Selection 的证据边界
-
-当前 PR 的 committed eval 覆盖 next-latent prediction、action ablation、collapse diagnostic、value-reward correlation 和 same-context candidate ranking。它没有提交结构化 `tool_name/status/error_type/exit_code` 标签，也没有提交对应 classifier/head，因此本阶段不能报告 tool-choice accuracy 或 execution-result classification accuracy。
-
-历史 P2 value ranking 为正，只构成已有候选组内相对 outcome ordering 的假设；它不等价于跨 context 的绝对分类 calibration，也不等价于已经选对 tool。下一阶段必须用 pre-action state-candidate pairs 和真实执行结果建立独立 heldout eval。
+`pred_error` 依赖真实 target，只能作为 oracle pipeline diagnostic；`auto/value` 才是 target-free score。默认 replay `sample.reward.score` 的语义为 `training_reward_unspecified`，除非 adapter 明确证明 label 是 execution outcome，否则 ranking 不得标记为 execution-eligible。
 
 ---
 
 ## 7. Findings and Claims Boundary
 
-### Finding 1：Hidden-to-latent 工程链路可训练，但 projector 是必要组件
+### Finding 1：受控 projector 是方法假设，不是已证明结论
 
-Qwen hidden 可以提供语义表征，但当前证据支持的是“frozen hidden + projector + predictor”的整体，而不是 raw hidden 天然等价于 world state。
+LLM hidden 只作为语义原材料；当前代码用 source-specific projector、normalization、predictor 与 anti-collapse objective 定义 belief latent。其环境充分性仍需 heldout outcome eval 证明。
 
-### Finding 2：Clean feedback 比单纯扩量更重要
+### Finding 2：Causality 与 provenance 是进入科学评测的前置条件
 
-clean split 只有 472 条，却表现出最强 shuffled/zero-action gap。下一阶段应优先提升高信息量 clean transitions，并补做结构化 execution-result eval，而不是只增加 tool-only 数量。
+中间 turn 不读取未来 terminal summary；`context_hash` 从最终 encoder 输入重算；strict eval 绑定 records、encoder、hidden、reward/mask 与 group metadata fingerprint。缺任一条件都不应产生 heldout claim。
 
-### Finding 3：Action-conditioned latent 存在历史探索性信号
+### Finding 3：Value head 当前是 supervised state-action utility probe
 
-旧 protocol 下 shuffled/zero-action gap 为正且 clean CI 不跨 0，提示模型可能不是纯 state-only mean predictor。但 effective rank 偏低，且旧 Stage-A 混有 training rows，必须在新 group-heldout split 上重跑。
+它回归 replay training reward，不是经典 state-only value，也不是默认的 execution-success classifier。只有显式 reward-label adapter 才能改变这个语义。
 
-### Finding 4：Value ranking 值得复验，absolute calibration 尚未建立
+### Finding 4：Tool/result、uncertainty 与 online policy gain 都未进入当前证据集
 
-历史 same-context 与 context-heldout snapshots 都优于 random expectation，但 raw artifacts 未提交、eligible groups 少且 schema 已更新。下一步只能用于 shadow rerun，不能直接改写 policy action。
-
-### Finding 5：Tool-use / structured result prediction 尚未进入 committed eval
-
-当前 schema 聚合 turn 内的 tool calls/results，缺少 command-level 结构化标签。后续应改成 state-candidate pair scoring，并以真实执行 outcome 标注候选优劣，而不是把 behavior policy 实际选择当作“最优 tool”真值。
-
-### Finding 6：Uncertainty 目前只是 interface
-
-没有 dedicated training loss，error correlation 不稳定，penalty sweep 也没有改变 heldout ranking。任何“风险校准已完成”的表述都不成立。
+这些目标已有清晰接口或下一步 protocol，但 PR 内没有可审计 benchmark artifact，不能从实现存在推导模型有效。
 
 ### 当前不能宣称的结论
 
@@ -712,10 +645,10 @@ clean split 只有 472 条，却表现出最强 shuffled/zero-action gap。下�
 
 | 风险 | 当前影响 | 建议控制 |
 | --- | --- | --- |
-| Eligible candidate groups 少 | heldout 方差大 | 扩展到固定大规模 P2b groups |
+| 无 committed benchmark dataset/artifact | 当前只能审计代码，不能审计模型效果 | 固定 manifest、seed、checkpoint 与 summary 后单独发布实验报告 |
 | Reward/task imbalance | accuracy 容易被 majority 主导 | balanced accuracy、macro F1、task-stratified split |
 | Same-context replay bias | 可能记忆 context/reward prior | context/task heldout 与 real-execution shadow |
-| 历史 Stage-A/P2 protocol | 混有 training rows，且旧 schema 向中间 turn 广播 terminal outcome | 使用当前 causal schema + group-heldout 全量重跑 |
+| Group 数量与 reward variation 未知 | ranking 方差与统计功效未知 | 预注册最小 group 数、bootstrap CI 与 task-stratified split |
 | Reward shortcut | latent 可能不理解完整 transition | status/error/tool-result 多任务 heads |
 | 缺少 command-level 标签 | 无法严谨评估 tool 与 execution status | 原生结构化 tool metadata |
 | Offline frozen HF hidden | 与 online policy hidden 有 domain gap | 后续小流量 hidden capture 对照 |
@@ -772,7 +705,7 @@ clean split 只有 472 条，却表现出最强 shuffled/zero-action gap。下�
 4. Pred latent effective rank 较低是有用压缩还是 reward shortcut？
 5. Target branch 是否应升级为 EMA encoder，还是保持共同可学习 projector？
 6. P2b 中应该以 task success、step reward、error avoidance 还是综合 utility 作为主指标？
-7. 在 10 到 20 个 heldout groups 上的正结果，达到多少 groups 后才足以进入 online shadow？
+7. 最小 heldout group 数和统计功效应如何预注册，达到什么门槛后才进入 online shadow？
 
 ---
 
@@ -821,8 +754,11 @@ WM_VAL_RATIO=0.25 \
 bash terminal-rl/scripts/run_world_model_stage_a_eval.sh
 
 WM_P2_BASE_EXP="$P2_ROOT" \
+WM_P2_ALLOW_UNVERIFIED_REWARD_LABELS=1 \
 bash terminal-rl/scripts/run_world_model_p2_candidate_set_eval.sh
 ```
+
+上面的 override 只用于验证 CLI 与 metric schema；默认 collector 的 reward contract 未证明 execution outcome，输出会标记 `diagnostic_only=true`。正式 P2/U2 结果必须先由结构化 label adapter 写入 `reward_label_is_execution_outcome=true`，然后去掉 override。
 
 ### 11.2 PR Validation
 
@@ -831,13 +767,20 @@ bash terminal-rl/scripts/run_world_model_p2_candidate_set_eval.sh
 ```bash
 PYTHONPATH=slime python -m pytest slime/tests/world_model -q
 python -m py_compile slime/slime/world_model/*.py slime/tests/world_model/*.py
-bash -n terminal-rl/scripts/run_world_model_*.sh
+for script in \
+  terminal-rl/scripts/run_world_model_seta_smoke.sh \
+  terminal-rl/scripts/run_world_model_offline_probe_smoke.sh \
+  terminal-rl/scripts/run_world_model_batch_probe.sh \
+  terminal-rl/scripts/run_world_model_stage_a_eval.sh \
+  terminal-rl/scripts/run_world_model_p2_candidate_set_eval.sh; do
+  bash -n "$script"
+done
 git diff --check origin/dev-agenticrl-safety-exploration-harness...HEAD
 ```
 
-2026-07-14 PR 同步前验证：focused world-model tests `70 passed`；fresh 6-record CLI smoke 验证 cache integrity、严格 group-heldout Stage-A/P2、target-free value ranking 与 reward-label contract，回归测试覆盖 canonical context identity、encoder/cache provenance mismatch、空 candidate group、latent batch normalization 和 NaN/Inf fail-closed；Python compile、5 个 shell 入口语法和 8 个 Mermaid blocks parser check 均通过。
+2026-07-14 PR 同步前验证：focused world-model tests `78 passed`；回归覆盖 causal context identity、encoder/cache provenance mismatch、reward/group cache 篡改、Stage-A tampered-cache/heldout-ranking gate、未验证 execution label、online 配置矩阵、空 candidate group、空字符串 tool result、detached auxiliary、latent batch normalization 和 NaN/Inf fail-closed；Python compile、5 个 shell 入口语法与 `git diff --check` 通过。
 
-文档中的数值是阶段性离线实验快照。为控制 PR 体积，raw rollout、hidden cache、checkpoint 和运行日志均不提交；复现实验时应通过上述通用脚本重新生成，并记录 model revision、dataset manifest、seed 与配置。
+PR 不提交生成产物或数值 benchmark。正式实验应通过上述通用脚本生成，并把 model revision、dataset manifest、seed、配置、checkpoint digest 与 machine-readable summary 作为同一实验包归档。
 
 ---
 
@@ -851,10 +794,9 @@ git diff --check origin/dev-agenticrl-safety-exploration-harness...HEAD
 6. 展示 method selection 表：为何选择 single-step、direct target、action contrast 和 value-only ranking。
 7. 讲 schema、projector、predictor、value head 和 loss，并标出当前 v1/完整设计边界。
 8. 展示默认 no-op 的 PR integration boundary。
-9. 展示 Stage-A action sensitivity，重点讲 clean vs tool-only。
-10. 展示 P2 same-context、heldout 和 repeated-seed ranking。
-11. 明确 execution-result/tool-choice 尚未进入 committed eval，uncertainty 也因无 dedicated loss 而禁用。
-12. 以 P2b real-execution shadow、ECHO baseline 和待讨论问题收尾。
+9. 展示 Stage-A 与 P2 的指标定义，同时明确 PR 不携带 benchmark 结果。
+10. 明确 execution-result/tool-choice 尚未进入 committed eval，uncertainty 也因无 dedicated loss 而禁用。
+11. 以 P2b real-execution shadow、ECHO baseline 和待讨论问题收尾。
 
 ---
 
@@ -864,7 +806,7 @@ git diff --check origin/dev-agenticrl-safety-exploration-harness...HEAD
 
 | 内容 | 仓库路径 |
 | --- | --- |
-| 完整项目讲解与阶段结论 | `rl_doc/openclaw_latent_world_model_value_head_talk_20260714.md` |
+| 方法讲解、实现边界与复现入口 | `rl_doc/openclaw_latent_world_model_value_head_talk_20260714.md` |
 | 模型实现 | `slime/slime/world_model/modules.py` |
 | 数据构造 | `slime/slime/world_model/build_dataset.py` |
 | Hidden cache | `slime/slime/world_model/cache_text_hidden.py` |
@@ -899,7 +841,7 @@ git diff --check origin/dev-agenticrl-safety-exploration-harness...HEAD
 | 标记 | 含义 |
 | --- | --- |
 | **当前实现** | PR #19 当前 head 中已有代码路径 |
-| **已有证据** | 当前离线实验已经产生对应结果 |
+| **验证状态** | PR 内可由测试或通用入口复现的能力边界 |
 | **后续设计** | 尚未实现或尚未通过实验 gate，不能写成当前能力 |
 
 ### 14.1 `observation` 与 `action` 如何定义
@@ -955,131 +897,15 @@ reward_score:
 
 ### 14.2 `observation/action latent` 如何得到
 
-当前正式路径不是直接把 token id 当 latent，也不是直接对裸 hidden 做 MSE：
-
-```mermaid
-flowchart LR
-    C[context_text] --> E[Frozen HF AutoModel]
-    A[action_text] --> E
-    O[next_observation_text] --> E
-    E -->|last_hidden_state + pooling| HC[h_state]
-    E -->|last_hidden_state + pooling| HA[h_action]
-    E -->|last_hidden_state + pooling| HO[h_target]
-    HC --> PS[State projector]
-    HA --> PA[Action projector]
-    HO --> PO[Target projector]
-    PS --> ZS[z_state]
-    PA --> ZA[z_action]
-    PO --> ZT[z_target]
-```
-
-`cache_text_hidden.py` 使用 frozen `AutoModel(...).last_hidden_state`，在 `model.eval()` 与 `torch.no_grad()` 下编码，支持 `mean/last/cls` pooling。HF 文件默认只从本地读取，且 `trust_remote_code=False`；下载或执行模型仓库自定义代码必须显式 opt-in。历史代表性实验使用 Qwen3-8B final hidden、mean pooling：
-
-```text
-raw hidden: 4096 dimensions
-projected latent: 1024 dimensions
-```
-
-三类 raw hidden 来自同一个 frozen encoder，但分别经过 `state_projector/action_projector/target_projector`。每个 `StableProjector` 为：
-
-```text
-clip -> LayerNorm -> Linear -> GELU -> Linear -> LayerNorm -> L2 normalize
-```
-
-因此“统一 latent space”不是 LLM hidden 天然具备的属性，而是由共享训练目标、独立 source projector、normalization、SIGReg 和 action contrast 共同约束出来的。默认 `hash` encoder 只验证 pipeline wiring，不构成语义 latent 证据。
+完整定义见 [3.3 Hidden-to-Belief Latent](#33-hidden-to-belief-latent) 和 [3.4 Architecture](#34-architecture)。三类文本先经同一个 frozen HF `AutoModel.last_hidden_state` 与 `mean/last/cls` pooling 得到 raw hidden，再分别进入 `state/action/target_projector`。projector 执行 clipping、LayerNorm、MLP 与 L2 normalization；统一空间来自联合训练约束，不是 raw LLM hidden 的天然属性。`hash` encoder 只验证 wiring，不提供语义证据。
 
 ### 14.3 `observation/action latent` 如何融合：当前不是 AdaLN
 
-原始 LeWM 可采用 token/sequence-level AdaLN action conditioning；**它不是当前 OpenClaw v1 的实现**。
-
-当前融合方式是：
-
-$$
-\hat z_{t+1}=F_\theta(\operatorname{concat}(z_t^s,z_t^a))
-$$
-
-```text
-z_state  ─┐
-          ├─ concat -> LayerNorm -> MLP -> L2 normalize -> z_pred
-z_action ─┘
-
-z_state  ─┐
-          ├─ concat -> Linear -> scalar value
-z_action ─┘
-```
-
-| 对比项 | LeWM 原始思路 | 当前 OpenClaw v1 |
-| --- | --- | --- |
-| observation representation | token/patch sequence | mean/last/cls pooled single vector |
-| action conditioning | 每层 AdaLN/残差门控 | `[z_state; z_action]` concat |
-| predictor | Transformer/AR predictor | one-step MLP |
-| action 是否进入 self-attention | 作为 conditioning，不是独立 token | 当前没有 self-attention predictor |
-| 实现状态 | 可借鉴的后续 ablation | PR #19 已实现 |
-
-选择 concat + MLP 是为了先用最小模型证伪“predictor 完全忽略 action”。历史 clean snapshot 的 shuffled-action gap 提示可能存在 action signal，但当前严格 protocol 尚未重跑，且不能据此断言 AdaLN 不需要。AdaLN/AR predictor 应作为 v2 architecture ablation，与参数量、数据量和 eval protocol 等预算比较。
+当前 predictor 使用 $\hat z_{t+1}=F_\theta([z_t^s;z_t^a])$，即 pooled state/action vector concat 后进入 one-step MLP；value head 同样读取 `[z_state; z_action]`。LeWM 的 token/sequence-level AdaLN、Transformer/AR predictor 和 self-attention conditioning 均未实现。concat + MLP 是最小可证伪基线，是否应升级 AdaLN 必须由等预算 ablation 决定。
 
 ### 14.4 当前整体架构是否等于完整 online 设计
 
-不等于。完整方案包含 online hidden capture 和联合训练；当前 PR 是 frozen-cache、single-step、offline-first 的受控子集。
-
-```mermaid
-flowchart TB
-    subgraph Rollout[Terminal rollout: real environment]
-        CTX[context_messages before action]
-        ACT[assistant_output + tool calls]
-        OBS[real tool results or eval summary]
-        REW[verifier/reward score]
-    end
-
-    CTX --> REC[lightweight WM record]
-    ACT --> REC
-    OBS --> REC
-    REW --> REC
-
-    subgraph Offline[Frozen hidden cache]
-        REC --> HF[Frozen policy-family HF encoder]
-        HF --> HS[h_state]
-        HF --> HA[h_action]
-        HF --> HT[h_target]
-    end
-
-    subgraph Probe[Trainable JEPA-style probe]
-        HS --> PS[P_state]
-        HA --> PA[P_action]
-        HT --> PT[P_target]
-        PS --> ZS[z_state]
-        PA --> ZA[z_action]
-        PT --> ZT[z_target]
-        ZS --> PRED[concat + MLP predictor]
-        ZA --> PRED
-        PRED --> ZP[z_pred]
-        ZP --> LPred[prediction loss]
-        ZT --> LPred
-        ZS --> HEAD[concat]
-        ZA --> HEAD
-        HEAD --> VALUE[value head]
-        HEAD --> UNC[uncertainty interface]
-        REW --> LValue[value MSE]
-        VALUE --> LValue
-    end
-
-    subgraph Policy[Existing DAPO/GRPO path]
-        LOGITS[policy logits] --> RLLOSS[original RL loss]
-    end
-
-    Probe -. current offline path has no gradient .-> Policy
-```
-
-| 完整方案组件 | 当前状态 |
-| --- | --- |
-| `h_t` / `h_t+a_t` span 从 online policy forward 抓 hidden | 未实现；当前离线分别编码 `context_text/action_text` |
-| `h_{t+1}` next-prompt state branch | 未实现 |
-| 独立 fixed feedback encoder `T_fix` | 未实现；当前三路复用同一个 frozen HF encoder |
-| 共享 adapter `C` 对齐 state/feedback | 未实现；当前是三个独立 projector + joint losses |
-| `ARPredictor` + AdaLN | 未实现；当前是 concat MLP |
-| `feedback_head(z_pred)` | 未实现；直接让 `z_pred` 对齐 `z_target` |
-| online DAPO + auxiliary joint loss | 只保留 optional hook 边界，当前实验未接通 live hidden |
-| value/uncertainty heads | value 已有 supervised path；uncertainty 只有 forward interface |
+不等于。当前 PR 是 frozen-cache、single-step、offline-first 子集；完整边界见 [3.9](#39-当前-v1-与完整设计的边界)。online policy hidden capture、next-prompt branch、独立 feedback encoder、共享 adapter、AdaLN/AR predictor、feedback head 和联合 DAPO/GRPO training 均未实现。value 有 supervised offline path，uncertainty 只有未训练 interface。
 
 ### 14.5 新增 LWM 后，policy 主干是否受到梯度影响
 
@@ -1088,7 +914,7 @@ flowchart TB
 1. frozen HF encoder 在 `torch.no_grad()` 下生成 `cached_hidden.pt`。
 2. `train_probe.py` 只优化 projector、predictor、value/uncertainty head 等 probe 参数。
 3. `--world-model-enable` 默认关闭；关闭时不增加 metadata 与 loss wiring。
-4. `--world-model-loss-coef` 默认 `0.0`；当前 SETA smoke 显式使用 `0`。
+4. `--world-model-loss-coef` 默认 `0.0`；通用 metadata smoke 入口也显式使用 `0`。
 5. default online hook 只有收到预计算的 `wm_pred_latents/wm_target_latents` 才计算 MSE；当前没有从 Megatron live hidden 构造这些 tensor。
 
 只有未来 custom hook 使用 **graph-connected live policy hidden**，且 `world_model_loss_coef>0`、没有 detach 对应 branch 时，auxiliary loss 才会更新 policy backbone。那属于 Stage B，需要单独验证 reward/KL/entropy/throughput no-regression，不能用当前 PR 的离线结果代替。
@@ -1116,7 +942,7 @@ $$
 +\lambda_v\mathcal L_{value}
 $$
 
-`reward_mask` 的作用是避免把缺失或非有限 reward 错当作 `0.0`。`reward_score` 是监督 label，不参与 state/action/target encoding；通用脚本默认 `value_coef=0.0`，历史 `stability_mean_seed7` 实验显式使用 `0.05`。当前 schema 将其来源记录为 `sample.reward.score`、语义标为 `training_reward_unspecified`，因此不能把 composite RL reward 自动解释为 tool execution success。
+`reward_mask` 的作用是避免把缺失或非有限 reward 错当作 `0.0`。`reward_score` 是监督 label，不参与 state/action/target encoding；通用脚本默认 `value_coef=0.0`，P2 value 实验必须显式设置正系数。当前 schema 将其来源记录为 `sample.reward.score`、语义标为 `training_reward_unspecified`，因此不能把 composite RL reward 自动解释为 tool execution success。
 
 命名上需要更严谨：这个 head 直接回归 replay 中预先计算的 outcome/step score，依赖 action，当前更接近 supervised $Q(c_t,a_t)$ / action utility probe，而不是经典的 state-only $V(c_t)$。head 自身没有 bootstrap、TD($\lambda$) 或 GAE；即使上游 label 含折扣 return，也不等于已经解决 long-horizon credit assignment。P2 输出会保留 reward-label contract，只有显式结构化为 execution outcome 的新 adapter 才能升级为 execution-result 结论。
 
@@ -1124,32 +950,15 @@ $$
 
 ### 14.7 训练轨迹如何得到
 
-当前数据链路为：
-
-```mermaid
-flowchart LR
-    G[terminal-rl/generate.py] --> T[turn_records]
-    T --> E[real Docker/tool execution]
-    E --> V[verifier/eval]
-    V --> M[attach_terminal_world_model_metadata]
-    M --> S[Sample.metadata + train_metadata]
-    S --> P[debug rollout .pt]
-    P --> J[build_dataset.py -> records.jsonl]
-    J --> H[cache_text_hidden.py -> cached_hidden.pt]
-    H --> W[train_probe.py]
-```
-
-`attach_terminal_world_model_metadata()` 在 terminal run 与 eval 完成后调用，但通过 turn boundary 强制 target 因果语义：state 取 action 前的 `context_messages`；中间 turn 的 `next_observation_text` 只写真实 tool result 或 `no_tool_result`，不注入未来 terminal status/reward/eval；最终 turn 才允许 terminal summary。独立的 `reward_score` 只作为 value label。文本在进入 metadata 前先做 credential redaction。
-
-现有 builder 期望带 `metadata["world_model"]` / `train_metadata["world_model"]` 的 debug rollout `.pt` 或逐行 sample JSONL。若未来接入其他原始 trajectory JSON，必须新增显式 schema adapter，并处理 multi-tool-call boundary、terminal reward 对齐和 command-level label；当前 PR 不声称直接兼容任意 trajectory 格式。
+完整链路见 [4.4 Reusable Scripts](#44-reusable-scripts)：terminal rollout 生成 `turn_records`，真实 Docker/tool execution 与 verifier 完成后附加轻量 WM metadata，再由 debug rollout `.pt` 构造 `records.jsonl`、hidden cache 和 probe。中间 turn 只使用真实 tool result 或 `no_tool_result`，最终 turn 才允许 terminal summary；`reward_score` 只作为 masked value label。其他 trajectory 格式必须新增显式 schema adapter，当前实现不自动兼容。
 
 ### 14.8 LWM 训练的收益：哪些已验证，哪些只是目标
 
 | 预期收益 | 当前实现 | 当前证据 | 结论 |
 | --- | --- | --- | --- |
-| 离线 latent auxiliary objective | 已实现 standalone probe loss | 历史 Stage-A signal；严格 protocol 待重跑 | 可继续研究 |
+| 离线 latent auxiliary objective | 已实现 standalone probe loss | PR 内只有实现与回归测试 | 待 benchmark |
 | execution-result representation | 尚无 committed classifier/head | 无结构化 heldout 指标 | 未验证 |
-| pre-execution candidate ranking | 已实现 value interface | 历史 small-group snapshot 为正 | 需严格 heldout 重跑与 P2b real execution |
+| pre-execution candidate ranking | 已实现 value interface | 无 committed benchmark | 需严格 heldout 与 P2b real execution |
 | 直接辅助 DAPO/GRPO backbone | 仅有 hook 边界 | 未进行 live-hidden online A/B | 未验证 |
 | value 给 GRPO 提供 advantage | 未接入 | 无 online reward/variance 结果 | 未实现 |
 | 提升 sample efficiency / final reward | 未接入 | 无等预算 online baseline | 未验证 |
@@ -1167,39 +976,17 @@ value 用于 advantage 还存在一个理论边界：当前 head 是 action-depe
 | Qwen-AgentWorld | `context/action/next observation` 的 language transition schema；environment modeling 的训练目标 | schema 对齐与 next-feedback 任务定义 | 没有 autoregressive observation generator、simulator pretraining 或大规模 synthetic environment |
 | LeWM | reconstruction-free joint-embedding prediction、action-conditioned dynamics、SIGReg | 适配 SIGReg 与 predictor + anti-collapse 思路 | 没有 pixel encoder、AdaLN Transformer、AR latent rollout 或 MPC stack |
 
-当前实现是“复用归纳偏置并按 text/terminal 约束重写”，不是逐文件复制 LeWM。最重要的实验关系不是三选一：ECHO 可以作为 policy-shaping baseline，Qwen-AgentWorld 是 text simulator baseline，`jepa_wm` 是 queryable latent evaluator；后续还应测试 `ECHO + value probe`，判断收益来自 feedback supervision 还是 latent dynamics 本身。
+当前实现复用归纳偏置并按 text/terminal 约束重写，不是逐文件复制 LeWM。ECHO 是 policy-shaping baseline，Qwen-AgentWorld 是 text simulator baseline，`jepa_wm` 是 queryable latent evaluator；三者应做对照而不是互相替代。
 
 ### 14.10 核心区别与潜在优势
 
-相对最近邻方法，本项目的核心区别是：
-
-1. 使用 policy-family LLM hidden 作为语义原材料，但通过受控 projector 形成 belief latent。
-2. 显式输入 state 与 candidate action，预测真实 next-feedback latent，并用 shuffled action 检查 conditional dependence。
-3. 提供可查询的 scalar state-action score，目标是 execution 前对多个 command 排序。
-4. 保留真实 verifier 为 ground truth，learned score 只做 shadow/screening。
-5. 默认关闭且与现有 RL 主路径隔离，适合作为渐进式插拔实验。
-
-潜在优势是避免为每个候选 autoregressively 生成完整 terminal output，只需 frozen encoding + small predictor/head 即可比较候选；同时不强迫模型重建 observation 中大量无关日志。**但这仍是待验证的系统优势**：当前没有端到端 latency、GPU cost、P2b success-rate 或 online sample-efficiency 对照，不能写成已经跑赢 ECHO/Qwen-AgentWorld。
+核心区别是：以 policy-family hidden 为原材料，经受控 projector 学 action-conditioned next-feedback latent，并提供 verifier-preserving 的 state-action score。潜在优势是无需为每个候选 autoregressively 生成完整 terminal output；但 PR 没有 latency、GPU cost、P2b success-rate 或 online sample-efficiency benchmark，不能写成已经优于 ECHO 或 Qwen-AgentWorld。
 
 ### 14.11 Replay buffer 如何实现、大小是多少
 
-当前必须区分三种名称相近但语义不同的存储：
+PR #19 没有实现 production replay service，也没有固定 `buffer_size`。当前数据源只有 `--save-debug-rollout-data` 生成的 `.pt` snapshots，以及由其派生的静态 `records.jsonl/cached_hidden.pt`；容量、淘汰、在线 append、PER 和统一 sampler 均不在本 PR。
 
-| 组件 | 当前实现 | 容量/淘汰 | 是否为 WM replay buffer |
-| --- | --- | --- | --- |
-| `RolloutDataSourceWithBuffer.buffer` | Python memory 中的 sample-group list，主要回收 aborted/partial rollout | 无显式 max capacity；默认 `pop_first` FIFO 取出；不持久化 buffer 内容 | 否，是通用 rollout control buffer |
-| debug rollout snapshots | `--save-debug-rollout-data` 将当前 rollout samples 保存为 `.pt` | 按脚本/文件系统管理，无统一 eviction 或 sampler | 当前 WM 离线数据来源 |
-| WM `records.jsonl/cached_hidden.pt` | 从一个或多个 `.pt` 抽取 transition 后离线编码 | 静态实验快照，无在线 append/capacity/PER | 是 offline dataset，但不是 production replay service |
-
-因此，PR #19 **没有实现一个持久化、容量受控、可按 task/reward/status 采样的 WM replay buffer**，也没有可以回答的固定 `buffer_size`。现有代表性快照为：
-
-| bucket | records | 含义 |
-| --- | ---: | --- |
-| full | 2878 | 当前聚合的全部可用 records |
-| clean | 472 | 过滤 timeout/bad eval 后的高质量 records |
-| tool-only | 2591 | 含 tool result 的 records |
-
-这些数字是实验 dataset size，不是 buffer capacity。后续若实现 persistent replay，至少需要 `schema_version/capacity/eviction/dedup/task cap/reward-status stratification/snapshot lineage`，并且优先保存轻量文本与 provenance，hidden 按 encoder checkpoint version 离线重算，避免 policy hidden drift 混在同一几何空间。
+若后续实现 persistent replay，至少需要 `schema_version/capacity/eviction/dedup/task cap/reward-status stratification/snapshot lineage`。建议持久化轻量文本与 provenance，并按 encoder revision 离线重算 hidden，避免不同 policy/encoder 版本混入同一几何空间。
 
 ### 14.12 后续任务的执行判断与顺序
 
@@ -1238,4 +1025,4 @@ rollout data
   -> heldout ranking / action diagnostics
 ```
 
-历史数据支持继续投入严格 heldout 重跑与 P2b 设计，但不支持跳过 real-execution shadow 直接进入 online policy control。下一步重点是用当前 causal/provenance protocol 重新证明 ranking 泛化，再评估校准和真实执行收益。
+当前实现支持开展严格 heldout 与 P2b 研究，但不支持跳过 real-execution shadow 直接进入 online policy control。下一步重点是用 causal/provenance protocol 首次建立可审计的 ranking 泛化证据，再评估校准和真实执行收益。

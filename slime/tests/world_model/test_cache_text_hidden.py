@@ -96,11 +96,14 @@ def test_cache_text_hidden_writes_metadata_and_reward_mask(tmp_path, monkeypatch
     payload = torch.load(output_path, map_location="cpu", weights_only=False)
     assert payload["state_hidden"].shape == (2, 8)
     assert payload["record_count"] == 2
-    assert payload["metadata"]["schema_version"] == "openclaw_text_jepa_hidden_cache_v3"
+    assert payload["metadata"]["schema_version"] == "openclaw_text_jepa_hidden_cache_v4"
     assert payload["metadata"]["encoder_config"]["encoder"] == "hash"
     assert len(payload["metadata"]["encoder_behavior_probe_sha256"]) == 64
     assert len(payload["metadata"]["encoder_fingerprint_sha256"]) == 64
     assert len(payload["metadata"]["hidden_tensors_sha256"]) == 64
+    assert len(payload["metadata"]["record_metadata_sha256"]) == 64
+    assert len(payload["metadata"]["supervision_tensors_sha256"]) == 64
+    assert len(payload["metadata"]["sample_payload_sha256"]) == 64
     assert len(payload["metadata"]["cache_fingerprint_sha256"]) == 64
     assert payload["record_metadata"][0]["uid"] == "u1"
     assert payload["reward"].tolist() == [1.5, 0.0]
@@ -120,6 +123,24 @@ def test_cache_text_hidden_writes_metadata_and_reward_mask(tmp_path, monkeypatch
     tampered_metadata["metadata"]["encoder_config"]["behavior_probe_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="encoder fingerprint mismatch"):
         validate_hidden_cache_integrity(tampered_metadata)
+
+    tampered_reward = dict(payload)
+    tampered_reward["reward"] = payload["reward"].clone()
+    tampered_reward["reward"][0] = 99.0
+    with pytest.raises(ValueError, match="supervision_tensors_sha256 mismatch"):
+        validate_hidden_cache_integrity(tampered_reward)
+
+    tampered_groups = dict(payload)
+    tampered_groups["record_metadata"] = [dict(row) for row in payload["record_metadata"]]
+    tampered_groups["record_metadata"][0]["context_hash"] = "different-group"
+    with pytest.raises(ValueError, match="record_metadata_sha256 mismatch"):
+        validate_hidden_cache_integrity(tampered_groups)
+
+    missing_digest = dict(payload)
+    missing_digest["metadata"] = dict(payload["metadata"])
+    missing_digest["metadata"].pop("sample_payload_sha256")
+    with pytest.raises(ValueError, match="sample/reward/group fingerprints"):
+        validate_hidden_cache_integrity(missing_digest)
 
 
 def test_cache_text_hidden_rejects_empty_input(tmp_path, monkeypatch):

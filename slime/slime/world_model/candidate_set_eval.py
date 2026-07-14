@@ -76,7 +76,7 @@ def _load_cache(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise TypeError(f"Expected dict cache payload in {path}, got {type(payload).__name__}")
-    validate_hidden_cache_integrity(payload)
+    validate_hidden_cache_integrity(payload, require_verified=True)
     for key in ["state_hidden", "action_hidden"]:
         if key not in payload:
             raise KeyError(f"Missing {key} in {path}")
@@ -160,6 +160,16 @@ def _reward_label_contract(records: list[dict[str, Any]]) -> dict[str, Any]:
     return contract
 
 
+def _validate_reward_label_contract(contract: dict[str, Any], *, allow_unverified: bool) -> bool:
+    verified = contract.get("verified_execution_outcome") is True
+    if not verified and not allow_unverified:
+        raise ValueError(
+            "candidate-set execution eval requires reward labels verified as execution outcomes; "
+            "use --allow-unverified-reward-labels only for a gate-ineligible diagnostic"
+        )
+    return verified
+
+
 def evaluate_candidate_sets(
     *,
     checkpoint: Path,
@@ -174,6 +184,7 @@ def evaluate_candidate_sets(
     device_name: str = "auto",
     uncertainty_coef: float = 0.0,
     split: str = "auto",
+    allow_unverified_reward_labels: bool = False,
 ) -> dict[str, Any]:
     if device_name == "auto":
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -206,6 +217,10 @@ def evaluate_candidate_sets(
     records = [records[index] for index in source_record_indices]
     payload = _subset_payload(payload, source_record_indices)
     reward_label_contract = _reward_label_contract(records)
+    execution_outcome_eligible = _validate_reward_label_contract(
+        reward_label_contract,
+        allow_unverified=allow_unverified_reward_labels,
+    )
 
     groups = _group_records(
         records,
@@ -306,7 +321,7 @@ def evaluate_candidate_sets(
 
     candidate_count_hist = Counter(len(group) for group in groups)
     summary = {
-        "schema_version": "openclaw_text_jepa_u2_candidate_set_eval_v2",
+        "schema_version": "openclaw_text_jepa_u2_candidate_set_eval_v3",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "cache": str(cache),
@@ -324,6 +339,8 @@ def evaluate_candidate_sets(
         },
         "evaluation_split": evaluation_split,
         "reward_label_contract": reward_label_contract,
+        "execution_outcome_eligible": execution_outcome_eligible,
+        "diagnostic_only": not execution_outcome_eligible,
         "record_count": len(records),
         "candidate_group_count": len(groups),
         "candidate_record_count": sum(len(group) for group in groups),
@@ -382,6 +399,7 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--uncertainty-coef", type=float, default=0.0)
     parser.add_argument("--split", choices=["auto", "all", "train", "val"], default="auto")
+    parser.add_argument("--allow-unverified-reward-labels", action="store_true")
     args = parser.parse_args()
 
     summary = evaluate_candidate_sets(
@@ -397,6 +415,7 @@ def main() -> None:
         device_name=args.device,
         uncertainty_coef=args.uncertainty_coef,
         split=args.split,
+        allow_unverified_reward_labels=args.allow_unverified_reward_labels,
     )
     metrics = summary["metrics"]
     print(

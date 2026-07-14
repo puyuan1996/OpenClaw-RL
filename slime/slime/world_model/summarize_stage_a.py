@@ -34,11 +34,16 @@ def _nested(payload: dict[str, Any], path: list[str], default: Any = None) -> An
 def _load_tensor_stats(cache_path: Path) -> dict[str, Any]:
     try:
         import torch
+        from .cache_text_hidden import validate_hidden_cache_integrity
     except Exception as exc:  # pragma: no cover - depends on runtime env.
         return {"available": False, "reason": f"torch_import_failed:{exc}"}
 
     payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-    stats: dict[str, Any] = {"available": True}
+    try:
+        integrity = validate_hidden_cache_integrity(payload, require_verified=True)
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"available": False, "reason": f"cache_integrity_failed:{exc}"}
+    stats: dict[str, Any] = {"available": True, "integrity": integrity}
     for key in ["state_hidden", "action_hidden", "target_hidden"]:
         tensor = payload[key].float()
         row: dict[str, Any] = {
@@ -73,6 +78,7 @@ def _ranking_artifact_status(path: Path) -> tuple[int, bool]:
         and row.get("oracle_only") is False
         and row.get("requires_target") is False
         and row.get("reward_label_verified_execution_outcome") is True
+        and row.get("evaluation_split_scope") == "group_heldout"
         for row in rows
     )
     return len(rows), eligible
@@ -126,6 +132,7 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
     value_spearman = _float(_nested(metrics, ["value_reward", "spearman"]))
     uncertainty_spearman = _float(_nested(metrics, ["uncertainty_error", "spearman_uncertainty_vs_pred_mse"]))
     evaluation_scope = _nested(eval_summary, ["evaluation_split", "scope"])
+    evaluation_record_count = int(_nested(eval_summary, ["evaluation_split", "record_count"], 0) or 0)
 
     checks = {
         "artifacts_ok": not missing,
@@ -142,7 +149,7 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
         "action_delta_ok": action_delta is not None and action_delta > float(args.min_action_delta),
         "rankings_ok": (
             not args.require_execution_rankings
-            or (rankings_count == record_count and rankings_execution_eligible)
+            or (rankings_count == evaluation_record_count and rankings_execution_eligible)
         ),
     }
     failed = [name for name, ok in checks.items() if not ok]
@@ -154,6 +161,7 @@ def _summarize_bucket(root: Path, bucket: str, args: argparse.Namespace) -> dict
         "record_count": record_count,
         "min_records": min_records,
         "rankings": rankings_count,
+        "rankings_expected_count": evaluation_record_count,
         "rankings_execution_eligible": rankings_execution_eligible,
         "context_text_unique_count": context_unique,
         "context_truncated_ratio": context_truncated_ratio,

@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch.utils.data import Subset, TensorDataset
@@ -5,12 +7,14 @@ from torch.utils.data import Subset, TensorDataset
 from slime.world_model.checkpoint import (
     select_evaluation_indices,
     trained_value_head_status,
+    validate_world_model_configuration,
     value_head_training_status,
 )
 from slime.world_model.candidate_set_eval import (
     _group_records,
     _require_candidate_groups,
     _reward_label_contract,
+    _validate_reward_label_contract,
     _validate_candidate_group_scope,
 )
 from slime.world_model.train_probe import _reward_label_count, _split_dataset
@@ -86,6 +90,45 @@ def test_reward_label_contract_rejects_mixed_semantics():
 
     with pytest.raises(ValueError, match="inconsistent reward label contracts"):
         _reward_label_contract(records)
+
+
+def test_candidate_eval_requires_verified_execution_labels_by_default():
+    contract = {"verified_execution_outcome": False}
+    with pytest.raises(ValueError, match="verified as execution outcomes"):
+        _validate_reward_label_contract(contract, allow_unverified=False)
+
+    assert _validate_reward_label_contract(contract, allow_unverified=True) is False
+
+
+def test_world_model_configuration_rejects_silent_noop_combinations():
+    invalid = [
+        SimpleNamespace(world_model_enable=False, world_model_mode="offline", world_model_loss_coef=0.1),
+        SimpleNamespace(world_model_enable=True, world_model_mode="offline", world_model_loss_coef=0.1),
+        SimpleNamespace(world_model_enable=True, world_model_mode="auxiliary", world_model_loss_coef=0.0),
+        SimpleNamespace(
+            world_model_enable=True,
+            world_model_mode="auxiliary",
+            world_model_loss_coef=0.1,
+            train_backend="fsdp",
+        ),
+    ]
+    for args in invalid:
+        with pytest.raises(ValueError):
+            validate_world_model_configuration(args)
+
+
+def test_world_model_configuration_accepts_offline_and_megatron_auxiliary():
+    validate_world_model_configuration(
+        SimpleNamespace(world_model_enable=True, world_model_mode="offline", world_model_loss_coef=0.0)
+    )
+    validate_world_model_configuration(
+        SimpleNamespace(
+            world_model_enable=True,
+            world_model_mode="auxiliary",
+            world_model_loss_coef=0.1,
+            train_backend="megatron",
+        )
+    )
 
 
 def test_trained_value_head_status_requires_positive_coef_and_labels():

@@ -7,7 +7,8 @@ from pathlib import Path
 import torch
 
 from .cache_text_hidden import validate_hidden_cache_integrity
-from .checkpoint import trained_value_head_status, validate_cache_encoder
+from .checkpoint import select_evaluation_indices, trained_value_head_status, validate_cache_encoder
+from .evaluate_probe import _subset_payload
 from .metrics import require_finite_tensor
 from .modules import TextLatentWorldModel, TextLatentWorldModelConfig
 
@@ -72,6 +73,7 @@ def main() -> None:
             "target-aware oracle diagnostic and is not an execution-time score."
         ),
     )
+    parser.add_argument("--split", choices=["auto", "all", "train", "val"], default="auto")
     args = parser.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -84,8 +86,15 @@ def main() -> None:
     model.eval()
 
     payload = torch.load(args.input, map_location="cpu", weights_only=False)
-    validate_hidden_cache_integrity(payload)
+    validate_hidden_cache_integrity(payload, require_verified=True)
     validate_cache_encoder(checkpoint_metadata, payload.get("metadata"))
+    source_indices, evaluation_split = select_evaluation_indices(
+        checkpoint_metadata,
+        payload.get("metadata"),
+        count=int(payload["state_hidden"].shape[0]),
+        requested_split=args.split,
+    )
+    payload = _subset_payload(payload, source_indices)
     target_hidden = payload.get("target_hidden", None) if args.score_mode == "pred_error" else None
     with torch.no_grad():
         out = model(
@@ -103,13 +112,16 @@ def main() -> None:
         for rank, idx in enumerate(order):
             row = {
                 "rank": rank,
-                "candidate_index": int(idx),
+                "candidate_index": int(source_indices[idx]),
+                "subset_candidate_index": int(idx),
                 "score": float(scores[idx].item()),
                 "score_source": score_source,
                 "oracle_only": args.score_mode == "pred_error",
                 "requires_target": args.score_mode == "pred_error",
                 "reward_label_contract": reward_label_contract,
                 "reward_label_verified_execution_outcome": execution_outcome_verified,
+                "evaluation_split": evaluation_split,
+                "evaluation_split_scope": evaluation_split.get("scope"),
             }
             if args.score_mode == "uncertainty" and out["uncertainty"] is not None:
                 row["uncertainty"] = float(out["uncertainty"][idx].item())

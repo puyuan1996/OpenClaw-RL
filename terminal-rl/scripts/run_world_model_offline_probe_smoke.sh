@@ -20,6 +20,7 @@ WM_SIGREG_COEF="${WM_SIGREG_COEF:-0.0}"
 WM_ACTION_CONTRAST_COEF="${WM_ACTION_CONTRAST_COEF:-0.0}"
 WM_VALUE_COEF="${WM_VALUE_COEF:-0.0}"
 WM_RANK_SCORE_MODE="${WM_RANK_SCORE_MODE:-pred_error}"
+WM_RANK_SPLIT="${WM_RANK_SPLIT:-}"
 WM_SPLIT_GROUP_KEY="${WM_SPLIT_GROUP_KEY:-context_hash}"
 WM_HF_MODEL="${WM_HF_MODEL:-}"
 WM_HF_LOCAL_FILES_ONLY="${WM_HF_LOCAL_FILES_ONLY:-1}"
@@ -88,11 +89,19 @@ RANK_OUTPUT="${WM_OUT_DIR}/rankings.jsonl"
 if [[ "${WM_RANK_SCORE_MODE}" == "pred_error" ]]; then
   RANK_OUTPUT="${WM_OUT_DIR}/oracle_pred_error_diagnostic.jsonl"
 fi
+if [[ -z "${WM_RANK_SPLIT}" ]]; then
+  if [[ "${WM_RANK_SCORE_MODE}" == "pred_error" ]]; then
+    WM_RANK_SPLIT="all"
+  else
+    WM_RANK_SPLIT="auto"
+  fi
+fi
 
 PYTHONPATH="${REPO_ROOT}/slime:${REPO_ROOT}/terminal-rl" "${PYTHON_BIN}" -m slime.world_model.rank_candidates \
   --checkpoint "${WM_OUT_DIR}/probe.pt" \
   --input "${WM_OUT_DIR}/cached_hidden.pt" \
   --output "${RANK_OUTPUT}" \
-  --score-mode "${WM_RANK_SCORE_MODE}"
+  --score-mode "${WM_RANK_SCORE_MODE}" \
+  --split "${WM_RANK_SPLIT}"
 
 echo "[wm-offline-probe] done. Outputs: ${WM_OUT_DIR}"

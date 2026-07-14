@@ -380,7 +380,8 @@ PY
       --checkpoint "${bucket_dir}/probe.pt" \
       --input "${bucket_dir}/cached_hidden.pt" \
       --output "${rankings_tmp}" \
-      --score-mode "${WM_RANK_SCORE_MODE}" >> "${log_file}" 2>&1
+      --score-mode "${WM_RANK_SCORE_MODE}" \
+      --split "${WM_EVAL_SPLIT}" >> "${log_file}" 2>&1
     mv "${rankings_tmp}" "${bucket_dir}/${rankings_name}"
   fi
   mv "${next_config}" "${config_file}"

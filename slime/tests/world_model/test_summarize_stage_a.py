@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from slime.world_model.cache_text_hidden import _build_cache_integrity_metadata
 from slime.world_model.summarize_stage_a import _summarize_bucket
 
 
@@ -18,14 +19,19 @@ def _make_stage_bucket(tmp_path, *, evaluation_scope):
         bucket_dir / "records_summary.json",
         {"record_count": 2, "context_text_unique_count": 2, "context_truncated_ratio": 0.0},
     )
-    torch.save(
-        {
-            "state_hidden": torch.tensor([[0.0, 0.0], [1.0, 0.0]]),
-            "action_hidden": torch.tensor([[0.0, 1.0], [1.0, 1.0]]),
-            "target_hidden": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-        },
-        bucket_dir / "cached_hidden.pt",
+    cache_payload = {
+        "state_hidden": torch.tensor([[0.0, 0.0], [1.0, 0.0]]),
+        "action_hidden": torch.tensor([[0.0, 1.0], [1.0, 1.0]]),
+        "target_hidden": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "record_count": 2,
+        "record_metadata": [{"context_hash": "a"}, {"context_hash": "b"}],
+    }
+    cache_payload["metadata"] = _build_cache_integrity_metadata(
+        cache_payload,
+        input_records_sha256="records",
+        encoder_config={"encoder": "test", "behavior_probe_sha256": "probe"},
     )
+    torch.save(cache_payload, bucket_dir / "cached_hidden.pt")
     (bucket_dir / "probe.pt").write_bytes(b"checkpoint")
     _write_json(
         bucket_dir / "eval_summary.json",
@@ -80,3 +86,16 @@ def test_stage_gate_rejects_in_sample_scope_by_default(tmp_path):
     assert row["checks"]["group_heldout_ok"] is False
     assert row["passed"] is False
     assert "group_heldout_ok" in row["failed_checks"]
+
+
+def test_stage_gate_rejects_tampered_cache(tmp_path):
+    _make_stage_bucket(tmp_path, evaluation_scope="group_heldout")
+    cache_path = tmp_path / "clean" / "cached_hidden.pt"
+    payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    payload["state_hidden"][0, 0] = 99.0
+    torch.save(payload, cache_path)
+
+    row = _summarize_bucket(tmp_path, "clean", _args())
+
+    assert row["checks"]["state_hidden_ok"] is False
+    assert row["passed"] is False

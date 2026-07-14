@@ -69,6 +69,29 @@ def test_attach_terminal_world_model_metadata_enabled():
     assert sample.train_metadata["world_model"] == wm
 
 
+def test_empty_tool_result_remains_an_observed_tool_result():
+    sample = _sample()
+    attach_terminal_world_model_metadata(
+        args=SimpleNamespace(world_model_enable=True, world_model_metadata_max_chars=128),
+        samples=[sample],
+        turn_records=[
+            {
+                "turn_idx": 0,
+                "context_messages": [{"role": "user", "content": "run"}],
+                "assistant_output": "run tool",
+                "tool_calls": [{"tool_name": "bash", "args": {"command": "true"}, "result": ""}],
+            }
+        ],
+        task_meta={},
+        run_ctx=SimpleNamespace(),
+        status=SimpleNamespace(value="completed"),
+    )
+
+    wm = sample.metadata["world_model"]
+    assert wm["has_tool_result"] is True
+    assert wm["next_observation_text"] == '{"status": "tool_result", "result": ""}'
+
+
 def test_context_text_preserves_tail_for_long_common_prefix():
     sample = _sample()
     long_system = "common-prefix-" * 200

@@ -18,6 +18,7 @@ WM_P2_MAX_CANDIDATES="${WM_P2_MAX_CANDIDATES:-8}"
 WM_P2_DEVICE="${WM_P2_DEVICE:-auto}"
 WM_P2_UNCERTAINTY_COEF="${WM_P2_UNCERTAINTY_COEF:-0.0}"
 WM_P2_EVAL_SPLIT="${WM_P2_EVAL_SPLIT:-auto}"
+WM_P2_ALLOW_UNVERIFIED_REWARD_LABELS="${WM_P2_ALLOW_UNVERIFIED_REWARD_LABELS:-0}"
 
 mkdir -p "${WM_P2_OUT_DIR}/logs"
 
@@ -47,6 +48,7 @@ cat <<EOF | tee "${WM_P2_OUT_DIR}/logs/config.txt"
 [wm-p2] max_candidates:  ${WM_P2_MAX_CANDIDATES}
 [wm-p2] device:          ${WM_P2_DEVICE}
 [wm-p2] eval_split:      ${WM_P2_EVAL_SPLIT}
+[wm-p2] allow_unverified:${WM_P2_ALLOW_UNVERIFIED_REWARD_LABELS}
 EOF
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -77,18 +79,23 @@ if not trained:
     )
 PY
 
-"${PYTHON_BIN}" -m slime.world_model.candidate_set_eval \
-  --checkpoint "${CHECKPOINT}" \
-  --cache "${CACHE}" \
-  --records "${RECORDS}" \
-  --output "${SUMMARY}" \
-  --groups-output "${GROUPS_OUT}" \
-  --group-key "${WM_P2_GROUP_KEY}" \
-  --min-candidates "${WM_P2_MIN_CANDIDATES}" \
-  --max-candidates "${WM_P2_MAX_CANDIDATES}" \
-  --device "${WM_P2_DEVICE}" \
-  --uncertainty-coef "${WM_P2_UNCERTAINTY_COEF}" \
-  --split "${WM_P2_EVAL_SPLIT}" \
-  2>&1 | tee "${WM_P2_OUT_DIR}/logs/candidate_set_eval.log"
+P2_ARGS=(
+  -m slime.world_model.candidate_set_eval
+  --checkpoint "${CHECKPOINT}"
+  --cache "${CACHE}"
+  --records "${RECORDS}"
+  --output "${SUMMARY}"
+  --groups-output "${GROUPS_OUT}"
+  --group-key "${WM_P2_GROUP_KEY}"
+  --min-candidates "${WM_P2_MIN_CANDIDATES}"
+  --max-candidates "${WM_P2_MAX_CANDIDATES}"
+  --device "${WM_P2_DEVICE}"
+  --uncertainty-coef "${WM_P2_UNCERTAINTY_COEF}"
+  --split "${WM_P2_EVAL_SPLIT}"
+)
+if [[ "${WM_P2_ALLOW_UNVERIFIED_REWARD_LABELS}" == "1" ]]; then
+  P2_ARGS+=(--allow-unverified-reward-labels)
+fi
+"${PYTHON_BIN}" "${P2_ARGS[@]}" 2>&1 | tee "${WM_P2_OUT_DIR}/logs/candidate_set_eval.log"
 
 echo "[wm-p2] done. Outputs: ${WM_P2_OUT_DIR}"

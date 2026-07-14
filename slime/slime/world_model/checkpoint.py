@@ -5,6 +5,28 @@ from collections.abc import Mapping
 from typing import Any
 
 
+def validate_world_model_configuration(args: Any) -> None:
+    enabled = bool(getattr(args, "world_model_enable", False))
+    mode = str(getattr(args, "world_model_mode", "offline"))
+    backend = str(getattr(args, "train_backend", "megatron"))
+    try:
+        coefficient = float(getattr(args, "world_model_loss_coef", 0.0) or 0.0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("world-model loss coefficient must be finite and non-negative") from exc
+    if not math.isfinite(coefficient) or coefficient < 0.0:
+        raise ValueError("world-model loss coefficient must be finite and non-negative")
+    if mode not in {"offline", "shadow", "auxiliary"}:
+        raise ValueError(f"unknown world-model mode: {mode}")
+    if not enabled and (mode != "offline" or coefficient > 0.0):
+        raise ValueError("world-model mode/loss requires --world-model-enable")
+    if coefficient > 0.0 and mode != "auxiliary":
+        raise ValueError("a positive world-model loss coefficient requires --world-model-mode auxiliary")
+    if mode == "auxiliary" and coefficient <= 0.0:
+        raise ValueError("world-model auxiliary mode requires a positive loss coefficient")
+    if coefficient > 0.0 and backend != "megatron":
+        raise ValueError("world-model auxiliary loss is supported only by the Megatron backend")
+
+
 def _validated_indices(raw_indices: Any, *, count: int, name: str) -> list[int]:
     if not isinstance(raw_indices, list):
         raise ValueError(f"checkpoint {name} indices are missing")

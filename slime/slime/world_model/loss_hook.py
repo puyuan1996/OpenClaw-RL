@@ -39,6 +39,12 @@ def default_world_model_loss_hook(
     aux_loss = logits.sum() * 0.0
     available = 0.0
     sample_count = max(len(metadata), 1)
+    if (pred is None) != (target is None):
+        raise ValueError("world-model prediction and target latents must be provided together")
+    if pred is None:
+        raise ValueError(
+            "positive world-model loss requires graph-connected wm_pred_latents and wm_target_latents"
+        )
     if pred is not None and target is not None:
         if isinstance(pred, list):
             pred = torch.stack(pred)
@@ -114,6 +120,8 @@ def apply_world_model_loss(
     aux_loss = _as_scalar_tensor(aux_loss, device=logits.device)
     if not bool(torch.isfinite(aux_loss).all().item()):
         raise ValueError("world-model hook returned a non-finite loss")
+    if torch.is_grad_enabled() and not aux_loss.requires_grad:
+        raise ValueError("world-model hook loss is detached and cannot update trainable parameters")
     if reduction == "mean":
         if sample_count <= 0:
             raise ValueError("world-model hook sample_count must be positive for mean reduction")

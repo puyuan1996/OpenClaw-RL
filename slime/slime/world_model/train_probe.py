@@ -13,11 +13,11 @@ from .cache_text_hidden import validate_hidden_cache_integrity
 from .modules import TextLatentWorldModel, TextLatentWorldModelConfig
 
 
-def _load_cache_payload(path: Path) -> dict:
+def _load_cache_payload(path: Path, *, require_verified: bool = False) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise TypeError(f"Expected dict payload in {path}, got {type(payload).__name__}")
-    validate_hidden_cache_integrity(payload)
+    validate_hidden_cache_integrity(payload, require_verified=require_verified)
     return payload
 
 
@@ -202,7 +202,10 @@ def main() -> None:
         raise ValueError("--lr must be finite and positive")
 
     input_path = Path(args.input)
-    payload = _load_cache_payload(input_path)
+    payload = _load_cache_payload(
+        input_path,
+        require_verified=args.value_coef > 0.0 or args.val_ratio > 0.0,
+    )
     dataset = _load_tensor_dataset(payload, input_path)
     if len(dataset) == 0:
         raise ValueError(f"No cached world-model records found in {input_path}.")

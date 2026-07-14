@@ -152,7 +152,8 @@ def _extract_observation_text(
     observations: list[str] = []
     for call in turn.get("tool_calls") or []:
         if isinstance(call, dict) and call.get("result") is not None:
-            observations.append(redact_sensitive_text(call.get("result")))
+            result_text = redact_sensitive_text(call.get("result"))
+            observations.append(result_text or '{"status": "tool_result", "result": ""}')
     if not observations:
         if is_terminal:
             reason = None
@@ -248,7 +249,7 @@ def build_terminal_world_model_record(
         "reward_label_is_execution_outcome": None,
         "reward_label_terminal": bool(final_turn),
         "has_tool_result": any(
-            isinstance(call, dict) and bool(call.get("result"))
+            isinstance(call, dict) and call.get("result") is not None
             for call in (turn.get("tool_calls") or [])
         ),
     }

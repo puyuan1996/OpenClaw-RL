@@ -83,12 +83,95 @@ def _reward_label_contract(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def validate_hidden_cache_integrity(payload: dict[str, Any]) -> dict[str, Any]:
-    """Recompute current-schema tensor/cache digests when they are present."""
+def _sample_payload_fingerprints(payload: dict[str, Any]) -> dict[str, str]:
+    record_count = int(payload.get("record_count", -1))
+    if record_count < 0:
+        raise ValueError("cache record_count is missing or invalid")
+    record_metadata = payload.get("record_metadata")
+    if not isinstance(record_metadata, list) or len(record_metadata) != record_count:
+        raise ValueError("cache record_metadata must match record_count")
+
+    has_reward = "reward" in payload
+    has_reward_mask = "reward_mask" in payload
+    if has_reward != has_reward_mask:
+        raise ValueError("cache reward and reward_mask must either both be present or both be absent")
+    supervision_tensors: dict[str, torch.Tensor] = {}
+    if has_reward:
+        for key in ["reward", "reward_mask"]:
+            tensor = payload[key]
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0 or int(tensor.shape[0]) != record_count:
+                raise ValueError(f"cache {key} must be a tensor whose first dimension matches record_count")
+            supervision_tensors[key] = tensor
+
+    record_metadata_sha256 = _json_sha256(record_metadata)
+    supervision_tensors_sha256 = _hidden_tensors_sha256(supervision_tensors)
+    sample_payload_sha256 = _json_sha256(
+        {
+            "record_count": record_count,
+            "record_metadata_sha256": record_metadata_sha256,
+            "supervision_tensors_sha256": supervision_tensors_sha256,
+        }
+    )
+    return {
+        "record_metadata_sha256": record_metadata_sha256,
+        "supervision_tensors_sha256": supervision_tensors_sha256,
+        "sample_payload_sha256": sample_payload_sha256,
+    }
+
+
+def _build_cache_integrity_metadata(
+    payload: dict[str, Any],
+    *,
+    input_records_sha256: str,
+    encoder_config: dict[str, Any],
+) -> dict[str, Any]:
+    tensor_keys = ["action_hidden", "state_hidden", "target_hidden"]
+    missing = [key for key in tensor_keys if not isinstance(payload.get(key), torch.Tensor)]
+    if missing:
+        raise ValueError(f"cannot fingerprint cache; hidden tensors are missing: {missing}")
+    encoder_fingerprint_sha256 = _json_sha256(encoder_config)
+    hidden_tensors_sha256 = _hidden_tensors_sha256({key: payload[key] for key in tensor_keys})
+    sample_fingerprints = _sample_payload_fingerprints(payload)
+    cache_fingerprint_sha256 = _json_sha256(
+        {
+            "encoder_fingerprint_sha256": encoder_fingerprint_sha256,
+            "hidden_tensors_sha256": hidden_tensors_sha256,
+            "input_records_sha256": input_records_sha256,
+            "sample_payload_sha256": sample_fingerprints["sample_payload_sha256"],
+        }
+    )
+    return {
+        "schema_version": "openclaw_text_jepa_hidden_cache_v4",
+        "input_records_sha256": input_records_sha256,
+        "encoder_config": encoder_config,
+        "encoder_fingerprint_sha256": encoder_fingerprint_sha256,
+        "encoder_behavior_probe_sha256": encoder_config.get("behavior_probe_sha256"),
+        "hidden_tensors_sha256": hidden_tensors_sha256,
+        "fingerprint_tensor_keys": tensor_keys,
+        **sample_fingerprints,
+        "cache_fingerprint_sha256": cache_fingerprint_sha256,
+        "reward_label_contract": _reward_label_contract(payload["record_metadata"]),
+    }
+
+
+def validate_hidden_cache_integrity(
+    payload: dict[str, Any],
+    *,
+    require_verified: bool = False,
+) -> dict[str, Any]:
+    """Recompute cache digests; strict consumers reject legacy partial fingerprints."""
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
+    schema_version = metadata.get("schema_version")
     expected_tensor_digest = metadata.get("hidden_tensors_sha256")
     if not expected_tensor_digest:
+        if schema_version in {
+            "openclaw_text_jepa_hidden_cache_v3",
+            "openclaw_text_jepa_hidden_cache_v4",
+        }:
+            raise ValueError("current-schema cache is missing hidden_tensors_sha256")
+        if require_verified:
+            raise ValueError("hidden cache lacks a complete integrity fingerprint; rebuild the cache")
         return {"verified": False, "reason": "hidden_tensors_sha256_missing"}
 
     tensor_keys = metadata.get("fingerprint_tensor_keys") or [
@@ -104,6 +187,12 @@ def validate_hidden_cache_integrity(payload: dict[str, Any]) -> dict[str, Any]:
     actual_tensor_digest = _hidden_tensors_sha256({key: payload[key] for key in tensor_keys})
     if actual_tensor_digest != expected_tensor_digest:
         raise ValueError("hidden cache tensor digest mismatch")
+    hidden_count = int(payload[tensor_keys[0]].shape[0])
+    if int(payload.get("record_count", hidden_count)) != hidden_count:
+        raise ValueError("cache record_count does not match hidden tensors")
+    for key in tensor_keys[1:]:
+        if int(payload[key].shape[0]) != hidden_count:
+            raise ValueError("cache fingerprint tensor first dimensions do not match")
 
     encoder_config = metadata.get("encoder_config")
     if not isinstance(encoder_config, dict):
@@ -118,11 +207,36 @@ def validate_hidden_cache_integrity(payload: dict[str, Any]) -> dict[str, Any]:
     expected_cache_fingerprint = metadata.get("cache_fingerprint_sha256")
     if not expected_cache_fingerprint:
         raise ValueError("cache_fingerprint_sha256 is missing")
+    expected_sample_payload = metadata.get("sample_payload_sha256")
+    if not expected_sample_payload:
+        if schema_version == "openclaw_text_jepa_hidden_cache_v4":
+            raise ValueError("hidden cache lacks sample/reward/group fingerprints; rebuild the cache")
+        legacy_cache_fingerprint = _json_sha256(
+            {
+                "encoder_fingerprint_sha256": actual_encoder_fingerprint,
+                "hidden_tensors_sha256": actual_tensor_digest,
+                "input_records_sha256": metadata.get("input_records_sha256"),
+            }
+        )
+        if legacy_cache_fingerprint != expected_cache_fingerprint:
+            raise ValueError("legacy hidden cache metadata fingerprint mismatch")
+        if require_verified:
+            raise ValueError("hidden cache lacks sample/reward/group fingerprints; rebuild the cache")
+        return {"verified": False, "reason": "sample_payload_sha256_missing"}
+
+    sample_fingerprints = _sample_payload_fingerprints(payload)
+    for key, actual in sample_fingerprints.items():
+        if metadata.get(key) != actual:
+            raise ValueError(f"hidden cache {key} mismatch")
+    actual_reward_contract = _reward_label_contract(payload["record_metadata"])
+    if metadata.get("reward_label_contract") != actual_reward_contract:
+        raise ValueError("hidden cache reward label contract mismatch")
     actual_cache_fingerprint = _json_sha256(
         {
             "encoder_fingerprint_sha256": actual_encoder_fingerprint,
             "hidden_tensors_sha256": actual_tensor_digest,
             "input_records_sha256": metadata.get("input_records_sha256"),
+            "sample_payload_sha256": sample_fingerprints["sample_payload_sha256"],
         }
     )
     if actual_cache_fingerprint != expected_cache_fingerprint:
@@ -374,22 +488,7 @@ def main() -> None:
         "behavior_probe_schema": "openclaw_text_encoder_behavior_probe_v1",
         "behavior_probe_sha256": encoder_behavior_sha256,
     }
-    encoder_fingerprint_sha256 = _json_sha256(encoder_config)
-    hidden_tensors_sha256 = _hidden_tensors_sha256(
-        {
-            "action_hidden": action_hidden,
-            "state_hidden": state_hidden,
-            "target_hidden": target_hidden,
-        }
-    )
-    cache_fingerprint_sha256 = _json_sha256(
-        {
-            "encoder_fingerprint_sha256": encoder_fingerprint_sha256,
-            "hidden_tensors_sha256": hidden_tensors_sha256,
-            "input_records_sha256": input_records_sha256,
-        }
-    )
-
+    record_metadata = [_light_record_metadata(record) for record in records]
     payload = {
         "state_hidden": state_hidden,
         "action_hidden": action_hidden,
@@ -397,36 +496,33 @@ def main() -> None:
         "record_count": len(records),
         "encoder": args.encoder,
         "input": str(input_path),
-        "record_metadata": [_light_record_metadata(record) for record in records],
-        "metadata": {
-            "schema_version": "openclaw_text_jepa_hidden_cache_v3",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "input": str(input_path),
-            "input_records_sha256": input_records_sha256,
-            "encoder_config": encoder_config,
-            "encoder_fingerprint_sha256": encoder_fingerprint_sha256,
-            "encoder_behavior_probe_sha256": encoder_behavior_sha256,
-            "hidden_tensors_sha256": hidden_tensors_sha256,
-            "fingerprint_tensor_keys": ["action_hidden", "state_hidden", "target_hidden"],
-            "cache_fingerprint_sha256": cache_fingerprint_sha256,
-            "record_count": len(records),
-            "reward_label_contract": _reward_label_contract(records),
-            "encoder": args.encoder,
-            "hidden_dim": args.hidden_dim if args.encoder == "hash" else int(state_hidden.shape[-1]),
-            "hf_model": args.hf_model if args.encoder == "hf" else None,
-            "pooling": args.pooling if args.encoder == "hf" else None,
-            "hf_local_files_only": bool(args.hf_local_files_only) if args.encoder == "hf" else None,
-            "hf_trust_remote_code": bool(args.hf_trust_remote_code) if args.encoder == "hf" else None,
-            "max_length": args.max_length if args.encoder == "hf" else None,
-            "batch_size": args.batch_size,
-            "state_hidden_shape": tuple(state_hidden.shape),
-            "action_hidden_shape": tuple(action_hidden.shape),
-            "target_hidden_shape": tuple(target_hidden.shape),
-        },
+        "record_metadata": record_metadata,
     }
     if has_reward:
         payload["reward"] = torch.tensor([0.0 if value is None else float(value) for value in rewards], dtype=torch.float32)
         payload["reward_mask"] = torch.tensor(reward_mask, dtype=torch.bool)
+    integrity_metadata = _build_cache_integrity_metadata(
+        payload,
+        input_records_sha256=input_records_sha256,
+        encoder_config=encoder_config,
+    )
+    payload["metadata"] = {
+        **integrity_metadata,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "input": str(input_path),
+        "record_count": len(records),
+        "encoder": args.encoder,
+        "hidden_dim": args.hidden_dim if args.encoder == "hash" else int(state_hidden.shape[-1]),
+        "hf_model": args.hf_model if args.encoder == "hf" else None,
+        "pooling": args.pooling if args.encoder == "hf" else None,
+        "hf_local_files_only": bool(args.hf_local_files_only) if args.encoder == "hf" else None,
+        "hf_trust_remote_code": bool(args.hf_trust_remote_code) if args.encoder == "hf" else None,
+        "max_length": args.max_length if args.encoder == "hf" else None,
+        "batch_size": args.batch_size,
+        "state_hidden_shape": tuple(state_hidden.shape),
+        "action_hidden_shape": tuple(action_hidden.shape),
+        "target_hidden_shape": tuple(target_hidden.shape),
+    }
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
