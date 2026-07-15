@@ -967,6 +967,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Source of online hidden states for future adapters. The v1 training hook expects precomputed latents.",
             )
             parser.add_argument(
+                "--world-model-backprop-to-llm",
+                action="store_true",
+                default=False,
+                help=(
+                    "Allow latent world-model losses to update the LLM backbone when the selected hidden adapter "
+                    "supports end-to-end gradients. Default is false to reduce activation memory and policy drift."
+                ),
+            )
+            parser.add_argument(
+                "--world-model-use-dapo-replay-buffer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Collect DAPO terminal transitions into the world-model trajectory replay buffer. "
+                    "The policy replay path remains unchanged."
+                ),
+            )
+            parser.add_argument(
+                "--world-model-replay-buffer-size",
+                type=int,
+                default=2048,
+                help="Maximum number of turn transitions retained by the world-model replay buffer.",
+            )
+            parser.add_argument(
                 "--world-model-hidden-layer",
                 type=int,
                 default=None,

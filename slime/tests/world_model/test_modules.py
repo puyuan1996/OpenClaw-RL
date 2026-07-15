@@ -25,7 +25,30 @@ def test_text_latent_world_model_loss_backward():
     assert "wm/action_delta" in metrics
     loss.backward()
     assert any(param.grad is not None for param in model.parameters())
-    assert any(param.grad is not None for param in model.target_projector.parameters())
+    assert any(param.grad is not None for param in model.target_adapter.parameters())
+
+
+def test_adaln_predictor_keeps_action_out_of_attention_tokens():
+    torch.manual_seed(0)
+    config = TextLatentWorldModelConfig(
+        state_hidden_dim=4,
+        action_hidden_dim=4,
+        target_hidden_dim=4,
+        latent_dim=4,
+        predictor_type="adaln",
+        predictor_num_heads=2,
+        sigreg_num_proj=4,
+    )
+    model = TextLatentWorldModel(config)
+    state = torch.randn(2, 3, 4)
+    action = torch.randn(2, 3, 4)
+
+    first = model.predictor(state, action)
+    second = model.predictor(state, torch.roll(action, shifts=1, dims=0))
+
+    assert first.shape == state.shape
+    assert not torch.allclose(first, second)
+    assert model.predictor.blocks[0].attn.embed_dim == config.latent_dim
 
 
 def test_text_latent_world_model_value_loss_honors_reward_mask():

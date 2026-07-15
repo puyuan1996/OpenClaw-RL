@@ -51,7 +51,7 @@ def test_attach_terminal_world_model_metadata_enabled():
         status=SimpleNamespace(value="completed"),
     )
     wm = sample.metadata["world_model"]
-    assert wm["schema"] == "openclaw_text_jepa_world_model_v1"
+    assert wm["schema"] == "openclaw_terminal_latent_world_model_v2"
     assert wm["action_text"]
     assert wm["next_observation_text"] == "/tmp"
     assert wm["done"] is False

@@ -126,6 +126,7 @@ def build_terminal_world_model_record(
     eval_details: dict[str, Any] | None,
     eval_error: str | None,
     max_chars: int,
+    next_turn: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reward = sample.reward if isinstance(getattr(sample, "reward", None), dict) else {}
     context_text = _extract_context_text(turn, task_meta=task_meta, max_chars=max_chars)
@@ -147,9 +148,12 @@ def build_terminal_world_model_record(
     status_value = getattr(status, "value", str(status))
     abnormal_done = status_value in {"truncated", "aborted", "failed"}
     final_turn = num_turns is not None and turn_idx >= int(num_turns) - 1
+    next_context_text = None
+    if next_turn is not None:
+        next_context_text = _extract_context_text(next_turn, task_meta=task_meta, max_chars=max_chars)
     return {
-        "schema": "openclaw_text_jepa_world_model_v1",
-        "hidden_source": "cached_or_frozen_encoder",
+        "schema": "openclaw_terminal_latent_world_model_v2",
+        "hidden_source": "policy_prompt_action_spans",
         "task_name": task_meta.get("task_name"),
         "task_path": task_meta.get("task_path"),
         "data_source": task_meta.get("data_source"),
@@ -161,7 +165,7 @@ def build_terminal_world_model_record(
         "turn_idx": turn_idx,
         "num_turns": num_turns,
         "status": status_value,
-        "done": bool(final_turn or abnormal_done),
+        "done": bool(final_turn or (num_turns is None and abnormal_done)),
         "context_hash": stable_hash(context_messages),
         "action_hash": stable_hash(action_text),
         "next_observation_hash": stable_hash(next_observation_text),
@@ -170,6 +174,8 @@ def build_terminal_world_model_record(
         "context_text": context_text,
         "context_text_source": "context_messages.head_tail",
         "context_text_truncation": "head_tail",
+        "next_context_text": next_context_text,
+        "next_context_hash": stable_hash(next_turn.get("context_messages") or []) if next_turn else None,
         "action_text": action_text,
         "next_observation_text": next_observation_text,
         "reward_score": reward.get("score"),
@@ -213,6 +219,7 @@ def attach_terminal_world_model_metadata(
             eval_details=eval_details,
             eval_error=eval_error,
             max_chars=max_chars,
+            next_turn=turn_by_idx.get(turn_idx + 1),
         )
         sample.metadata["world_model"] = record
         train_metadata = dict(sample.train_metadata or {})
