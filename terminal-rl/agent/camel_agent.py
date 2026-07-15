@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 
 from openai import AsyncStream, Stream
@@ -30,12 +31,34 @@ from camel.utils.token_counting import BaseTokenCounter
 from inference_client import SGLangTurnClient
 
 from .prompts import get_developer_agent_prompt
+from .tool_history import (
+    build_openai_assistant_tool_message,
+    build_openai_tool_calls,
+    drop_incomplete_tool_call_groups,
+)
 
 logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+
+
+@dataclass
+class AssistantToolCallsMessage(BaseMessage):
+    """A single assistant message that can carry parallel tool calls.
+
+    CAMEL's ``FunctionCallingMessage`` represents exactly one tool call. The
+    model, however, may emit several calls in one assistant turn, so recording
+    one such message per call would change the original conversation shape.
+    """
+
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_openai_assistant_message(self) -> OpenAIMessage:
+        return build_openai_assistant_tool_message(
+            self.content or "", self.tool_calls
+        )
 
 
 class HFTokenCounter(BaseTokenCounter):
@@ -239,6 +262,11 @@ class CamelAgent(ChatAgent):
         await self._wait_if_paused()
         try:
             context_messages, num_tokens = self.memory.get_context()
+            # Token-window truncation must not leave a tool result without its
+            # assistant request (or a partially retained parallel-call group).
+            context_messages = drop_incomplete_tool_call_groups(
+                context_messages
+            )
             self._accumulated_context_tokens += num_tokens
             return context_messages, None
         except RuntimeError as exc:
@@ -267,7 +295,24 @@ class CamelAgent(ChatAgent):
             return model_response, [], False, terminated_response
 
         if model_response.tool_call_requests:
-            return model_response, list(model_response.tool_call_requests), False, None
+            tool_call_requests = list(model_response.tool_call_requests)
+            output_content = ""
+            if model_response.output_messages:
+                output_content = model_response.output_messages[0].content or ""
+
+            # Record the model's assistant turn before any tool results are
+            # appended. This preserves its full visible reasoning/content and
+            # creates the assistant(tool_calls) -> tool(result) pairing that
+            # chat templates and tool-aware APIs expect on the next turn.
+            assistant_message = AssistantToolCallsMessage(
+                role_name=self.role_name,
+                role_type=self.role_type,
+                meta_dict=None,
+                content=output_content,
+                tool_calls=build_openai_tool_calls(tool_call_requests),
+            )
+            self.update_memory(assistant_message, OpenAIBackendRole.ASSISTANT)
+            return model_response, tool_call_requests, False, None
 
         parse_error_record = await self.adetect_tool_calls_parse_error(model_response)
         if parse_error_record:
@@ -360,7 +405,10 @@ class CamelAgent(ChatAgent):
                     role_name=self.role_name,
                     role_type=self.role_type,
                     meta_dict=None,
-                    content="",
+                    # Keep the complete malformed assistant output in the
+                    # active repair loop instead of retaining only the
+                    # synthetic json_parse_error call.
+                    content=content,
                     func_name="json_parse_error",
                     args={"raw_content": match_text[:200], "error": str(e)},
                     tool_call_id=error_tool_call_id,

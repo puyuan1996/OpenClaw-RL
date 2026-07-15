@@ -19,6 +19,7 @@ import asyncio
 
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.types import Sample
+from slime.world_model.metadata import attach_terminal_world_model_metadata
 
 from agent.prm_agent import TerminalPRMAgent
 from clawsentry_client import ClawSentryClient
@@ -3930,6 +3931,16 @@ async def generate(
             if eval_error is not None:
                 s.metadata["evaluation_failed"] = True
                 s.metadata["evaluation_error"] = eval_error
+        attach_terminal_world_model_metadata(
+            args=args,
+            samples=samples,
+            turn_records=turn_records,
+            task_meta=task_meta,
+            run_ctx=run_ctx,
+            status=status,
+            eval_details=eval_details,
+            eval_error=eval_error,
+        )
         _mark_non_trainable_samples(samples)
 
         _save_rollout_artifacts(

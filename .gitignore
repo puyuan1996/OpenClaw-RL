@@ -9,6 +9,11 @@ logs
 /runs/
 .DS_Store
 docs/
+!terminal-rl/docs/
+terminal-rl/docs/*
+!terminal-rl/docs/latent_world_model_design_20260616_154623_HKT.md
+!terminal-rl/docs/latent_world_model_guide_zh.md
+!terminal-rl/docs/latent_world_model_research_notes_zh.md
 a3s-code-adapter/docs/
 
 

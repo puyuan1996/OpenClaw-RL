@@ -158,6 +158,18 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
     def __init__(self, args):
         super().__init__(args)
         self.buffer = []
+        self.world_model_replay_buffer = None
+        if getattr(args, "world_model_use_dapo_replay_buffer", False):
+            from slime.world_model.replay_buffer import TrajectoryReplayBuffer
+
+            self.world_model_replay_buffer = TrajectoryReplayBuffer(
+                buffer_size=int(getattr(args, "world_model_replay_buffer_size", 2048)),
+                seed=int(getattr(args, "rollout_seed", 42) or 42),
+            )
+            logger.info(
+                "World-model DAPO replay enabled: capacity=%d",
+                self.world_model_replay_buffer.buffer_size,
+            )
         if self.args.buffer_filter_path is None:
             self.buffer_filter = pop_first
         else:
@@ -209,6 +221,43 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
 
     def get_buffer_length(self):
         return len(self.buffer)
+
+    def add_world_model_samples(self, samples, current_step: int) -> int:
+        if self.world_model_replay_buffer is None:
+            return 0
+        from slime.world_model.replay_buffer import world_model_records_from_samples
+
+        records = world_model_records_from_samples(samples)
+        admitted_before = self.world_model_replay_buffer.total_admitted
+        self.world_model_replay_buffer.push(records, current_step=current_step)
+        return self.world_model_replay_buffer.total_admitted - admitted_before
+
+    def sample_world_model_records(self, num_samples: int, current_step: int = 0):
+        if self.world_model_replay_buffer is None:
+            return []
+        return self.world_model_replay_buffer.sample(num_samples, current_step=current_step)
+
+    def save(self, rollout_id):
+        super().save(rollout_id)
+        if self.world_model_replay_buffer is None or self.args.save is None:
+            return
+        path = Path(self.args.save) / "rollout" / f"world_model_replay_{rollout_id}.pt"
+        self.world_model_replay_buffer.save(path)
+        logger.info("Saved %d world-model replay records to %s", len(self.world_model_replay_buffer), path)
+
+    def load(self, rollout_id=None):
+        super().load(rollout_id)
+        if self.world_model_replay_buffer is None or self.args.load is None or rollout_id is None:
+            return
+        path = Path(self.args.load) / "rollout" / f"world_model_replay_{rollout_id}.pt"
+        if not path.exists():
+            logger.info("World-model replay checkpoint %s does not exist.", path)
+            return
+        from slime.world_model.replay_buffer import TrajectoryReplayBuffer
+
+        loaded = TrajectoryReplayBuffer.load(path)
+        self.world_model_replay_buffer.load_state_dict(loaded.state_dict())
+        logger.info("Loaded %d world-model replay records from %s", len(self.world_model_replay_buffer), path)
 
 
 def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) -> list[list[Sample]]:
