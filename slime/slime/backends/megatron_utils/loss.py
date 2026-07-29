@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.world_model.loss_hook import apply_world_model_loss
 
 logger = logging.getLogger(__name__)
 from slime.utils.ppo_utils import (
@@ -970,6 +971,14 @@ def loss_function(
         loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean)
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    loss, log = apply_world_model_loss(
+        args=args,
+        batch=batch,
+        logits=logits,
+        loss=loss,
+        reported_loss=log,
+    )
 
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
