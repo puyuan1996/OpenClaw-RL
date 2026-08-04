@@ -28,6 +28,7 @@ from slime.utils.metric_utils import (
     dict_add_prefix,
 )
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.rollout_skip import make_skip_train_result
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
 
@@ -38,6 +39,31 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _loss_mask_sum(mask: Any) -> float:
+    if isinstance(mask, torch.Tensor):
+        return float(mask.sum().item())
+    if isinstance(mask, np.ndarray):
+        return float(mask.sum())
+    try:
+        return float(sum(mask))
+    except TypeError:
+        try:
+            return float(mask)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+def _trainable_counts(train_data: dict[str, Any]) -> tuple[int, float]:
+    masks = train_data.get("loss_masks") or []
+    trainable_tokens = sum(max(0.0, _loss_mask_sum(mask)) for mask in masks)
+    trainable_samples = sum(1 for mask in masks if _loss_mask_sum(mask) > 0.0)
+    return trainable_samples, trainable_tokens
 
 
 @ray.remote
@@ -89,7 +115,7 @@ class RolloutManager:
             self.all_prm_engines = []
             self.num_new_prm_engines = 0
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0).remote()
         self.rollout_id = -1
 
         self._metric_checker = MetricChecker.maybe_create(args)
@@ -155,6 +181,31 @@ class RolloutManager:
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = self._convert_samples_to_train_data(data)
+        trainable_samples, trainable_tokens = _trainable_counts(data)
+        if _env_flag("SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT", "0") and trainable_tokens <= 0.0:
+            step = compute_rollout_step(self.args, rollout_id)
+            log_dict = {
+                "rollout/step": step,
+                "rollout/skip_train": 1.0,
+                "rollout/trainable_count": float(trainable_samples),
+                "rollout/trainable_tokens": float(trainable_tokens),
+            }
+            logger.warning(
+                "Skipping training for rollout_id=%s because trainable_count=%s trainable_tokens=%.1f",
+                rollout_id,
+                trainable_samples,
+                trainable_tokens,
+            )
+            logging_utils.log(self.args, log_dict, step_key="rollout/step")
+            pending = logging_utils.flush_pending_metrics()
+            marker = make_skip_train_result(
+                rollout_id=rollout_id,
+                reason="zero_trainable",
+                metrics=log_dict,
+            )
+            if pending:
+                return marker, pending
+            return marker
         rollout_data_refs = self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
         pending = logging_utils.flush_pending_metrics()
         if pending:

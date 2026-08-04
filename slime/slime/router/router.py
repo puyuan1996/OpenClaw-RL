@@ -53,6 +53,7 @@ class SlimeRouter:
         self.client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=max_connections),
             timeout=httpx.Timeout(timeout),
+            trust_env=False,
         )
 
         self._setup_routes()

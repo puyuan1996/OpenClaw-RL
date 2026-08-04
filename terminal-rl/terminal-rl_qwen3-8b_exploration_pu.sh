@@ -4,7 +4,7 @@
 #
 # All options default OFF -> baseline training semantics when all disabled.
 # Dataset and algorithm selection intentionally follow terminal-rl_qwen3-8b_pu.sh:
-#   DATASET=seta|safety|agentharm|mixed
+#   DATASET=seta|safety|agentharm|mixed|tau2
 #   ALGO=grpo|dapo
 #
 # USAGE:
@@ -20,7 +20,7 @@
 #   EXPLORE_ENTROPY_COEF=0.01 EXPLORE_INTRINSIC=1 bash ...exploration_pu.sh # combined
 #
 # BASELINE OPTIONS (same names/defaults as terminal-rl_qwen3-8b_pu.sh):
-#   DATASET                  : seta|safety|agentharm|mixed (default seta)
+#   DATASET                  : seta|safety|agentharm|mixed|tau2 (default seta)
 #   ALGO                     : grpo|dapo (default grpo)
 #   MIX_SETA_RATIO           : mixed seta ratio
 #   MIX_SAFETY_RATIO         : mixed Agent-SafetyBench ratio
@@ -82,9 +82,9 @@ USER_ALGO_SET="${ALGO+x}"
 DATASET="${DATASET:-seta}"
 ALGO="${ALGO:-grpo}"
 case "${DATASET}" in
-  seta|safety|agentharm|mixed) ;;
+  seta|safety|agentharm|mixed|tau2) ;;
   *)
-    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed" >&2
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed|tau2" >&2
     exit 1
     ;;
 esac

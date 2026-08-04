@@ -1,0 +1,5 @@
+dataset,n_trajectories,status_counts,reward_mean,reward_last,reward_min,reward_max,zero_reward_fraction,positive_reward_fraction,eval_error_count
+agent_safetybench,312,{'Status.COMPLETED': 312},-0.14817307692307663,-0.9400000000000001,-1.0,1.0,0.0,0.41346153846153844,0
+agentharm,336,"{'Status.COMPLETED': 332, 'Status.TRUNCATED': 4}",0.36906179138322015,0.93,-1.0,1.0,0.005952380952380952,0.7023809523809523,0
+seta,610,"{'Status.TRUNCATED': 47, 'Status.COMPLETED': 546, 'Status.FAILED': 17}",-0.41962834592725434,1.0,-2.0,1.0,0.05245901639344262,0.27704918032786885,3
+tau2,1416,"{'Status.COMPLETED': 1077, 'Status.TRUNCATED': 339}",0.048728813559322036,0.0,0.0,1.0,0.951271186440678,0.048728813559322036,0

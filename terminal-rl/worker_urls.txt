@@ -1,0 +1,5 @@
+# share-docker-server 需要根据开发机 ip 更新。
+# 修改本文件后，router 会按 WORKER_URLS_RELOAD_INTERVAL 热加载；当前脚本默认 120s。
+# rlinfra: 100.96.31.176  safevo: 100.96.26.133  
+# 测试连通性：在gpu端验证 curl -fsS --noproxy '*' http://100.96.31.176:18081/healthz
+export WORKER_URLS="http://100.96.31.176:18081"

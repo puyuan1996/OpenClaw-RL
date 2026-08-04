@@ -44,7 +44,9 @@ class RunPaths:
         runs_root = run_dir.parent
         ckpt_root = Path(os.getenv(
             "CKPT_ROOT",
-            "/mnt/shared-storage-user/narmodel/agenticrl/ckpt"
+
+            "/mnt/shared-storage-gpfs2/narmodel/agenticrl/ckpt"
+
         ))
         return cls(run_id, runs_root, ckpt_root)
 
@@ -142,7 +144,9 @@ if __name__ == "__main__":
 
     init_p = sub.add_parser("init")
     init_p.add_argument("--runs-root", default="./runs")
-    init_p.add_argument("--ckpt-root", default="/mnt/shared-storage-user/narmodel/agenticrl/ckpt")
+
+    init_p.add_argument("--ckpt-root", default="/mnt/shared-storage-gpfs2/narmodel/agenticrl/ckpt")
+
     init_p.add_argument("--model", default="qwen3-8b")
     init_p.add_argument("--method", default="grpo")
     init_p.add_argument("--run-id", default="")

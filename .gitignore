@@ -6,9 +6,18 @@ swe.pem
 __pycache__/
 *.pyc
 logs
+/runs/
 .DS_Store
 docs/
 a3s-code-adapter/docs/
+
+# Generated SWE-smith data and Terminal-Bench task directories.
+terminal-rl/dataset/swesmith_convert/
+terminal-rl/dataset/swesmith_env/
+terminal-rl/dataset/swesmith_smoke/
+terminal-rl/dataset/sweverified_convert/
+terminal-rl/dataset/sweverified_env/
+terminal-rl/dataset/.sweverified_artifact.lock
 
 
 # Byte-compiled / optimized / DLL files

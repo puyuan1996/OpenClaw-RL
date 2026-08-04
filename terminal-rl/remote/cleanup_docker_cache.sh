@@ -7,6 +7,7 @@ set -uo pipefail
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
 DOCKER_CMD_TIMEOUT="${DOCKER_CMD_TIMEOUT:-30}"
 DOCKER_PRUNE_TIMEOUT="${DOCKER_PRUNE_TIMEOUT:-120}"
+DOCKER_NETWORK_LIFECYCLE_LOCK="${DOCKER_NETWORK_LIFECYCLE_LOCK:-/tmp/openclaw_docker_network_lifecycle.lock}"
 RUN_HEAVY_DF="${RUN_HEAVY_DF:-0}"
 echo "[$(date '+%F %T')] Docker cleanup starting on $(hostname)"
 echo "Docker data root: ${DOCKER_DATA_ROOT}"
@@ -51,7 +52,13 @@ echo
 
 # ── 4. 未使用 network 清理 ─────────────────────────────────────────────
 echo "=== Step 4: Remove unused networks ==="
-timeout "${DOCKER_PRUNE_TIMEOUT}" docker network prune -f 2>&1 | tail -3
+if command -v flock >/dev/null 2>&1; then
+    timeout "${DOCKER_PRUNE_TIMEOUT}" flock -w "${DOCKER_PRUNE_TIMEOUT}" \
+        "${DOCKER_NETWORK_LIFECYCLE_LOCK}" \
+        docker network prune -f 2>&1 | tail -3
+else
+    echo "  WARN: flock is unavailable; skipping unsafe docker network prune"
+fi
 echo
 
 # ── 5. 最终状态 ───────────────────────────────────────────────────────

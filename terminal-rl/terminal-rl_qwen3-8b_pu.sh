@@ -41,6 +41,30 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] missing cmd: 
 # had this dir on PATH; we make that explicit here so the script is self-contained.
 LIGHTRFT_PY312_BIN="${LIGHTRFT_PY312_BIN:-/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin}"
 export PATH="${LIGHTRFT_PY312_BIN}:${PATH}"
+CUDA_RUNTIME_DIRS=(
+  "/usr/local/nvidia/lib64"
+  "/usr/local/cuda/lib64"
+  "/usr/local/cuda/targets/x86_64-linux/lib"
+  "/usr/lib/x86_64-linux-gnu"
+)
+CUDA_RUNTIME_LD_PATH=""
+for cuda_dir in "${CUDA_RUNTIME_DIRS[@]}"; do
+  if [[ -d "${cuda_dir}" ]]; then
+    if [[ -n "${CUDA_RUNTIME_LD_PATH}" ]]; then
+      CUDA_RUNTIME_LD_PATH="${CUDA_RUNTIME_LD_PATH}:"
+    fi
+    CUDA_RUNTIME_LD_PATH="${CUDA_RUNTIME_LD_PATH}${cuda_dir}"
+  fi
+done
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  if [[ -n "${CUDA_RUNTIME_LD_PATH}" ]]; then
+    export LD_LIBRARY_PATH="${CUDA_RUNTIME_LD_PATH}:${LD_LIBRARY_PATH}"
+  else
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
+  fi
+elif [[ -n "${CUDA_RUNTIME_LD_PATH}" ]]; then
+  export LD_LIBRARY_PATH="${CUDA_RUNTIME_LD_PATH}"
+fi
 DRY_RUN="${DRY_RUN:-0}"
 
 # ── Cleanup previous processes ───────────────────────────────────────
@@ -113,9 +137,9 @@ esac
 export ALGO
 DATASET="${DATASET:-seta}"
 case "${DATASET}" in
-  seta|safety|agentharm|mixed) ;;
+  seta|safety|agentharm|mixed|tau2) ;;
   *)
-    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed"
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed|tau2"
     exit 1
     ;;
 esac
@@ -182,6 +206,14 @@ sanitize_run_part() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/-\\{1,\\}/-/g; s/^-//; s/-$//'
 }
 
+default_tau2_task_split() {
+  case "${1:-telecom}" in
+    telecom) echo "train" ;;
+    mock) echo "base" ;;
+    *) echo "train" ;;
+  esac
+}
+
 build_dataset_tag() {
   case "${DATASET}" in
     seta)
@@ -192,6 +224,12 @@ build_dataset_tag() {
       ;;
     agentharm)
       echo "agentharm-$(short_mode "${AGENTHARM_REWARD}")"
+      ;;
+    tau2)
+      local tau2_domain tau2_split
+      tau2_domain="${TAU2_DOMAIN:-telecom}"
+      tau2_split="${TAU2_TASK_SPLIT:-$(default_tau2_task_split "${tau2_domain}")}"
+      echo "tau2-${tau2_domain}-${tau2_split}-${TAU2_POLICY_TYPE:-manual}"
       ;;
     mixed)
       local seta_ratio safety_ratio agentharm_ratio
@@ -372,6 +410,7 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 #   seta    = seta_env only (capability tasks, Docker-based evaluation)
 #   safety  = Agent-SafetyBench only (safety tasks, no Docker needed)
 #   agentharm = inspect_evals/agentharm only (safety tool tasks, no Docker needed)
+#   tau2    = tau2-bench solo-compatible tasks (telecom / mock, no Docker needed)
 #   mixed   = configurable mix of seta / safety / agentharm
 #
 # SETA_SAFETY: safety reward mode for seta_env data
@@ -410,6 +449,21 @@ AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyua
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
 AGENTHARM_REMOTE_ENV="${AGENTHARM_REMOTE_ENV:-0}"
 AGENTHARM_ROOT="${AGENTHARM_ROOT:-/mnt/shared-storage-user/puyuan/code/inspect_evals/src/inspect_evals/agentharm}"
+TAU2_DOMAIN="${TAU2_DOMAIN:-telecom}"
+TAU2_TASK_SPLIT="${TAU2_TASK_SPLIT:-}"
+TAU2_POLICY_TYPE="${TAU2_POLICY_TYPE:-manual}"
+TAU2_REMOTE_ENV="${TAU2_REMOTE_ENV:-0}"
+TAU2_NUM_TASKS="${TAU2_NUM_TASKS:-}"
+TAU2_USER_LLM="${TAU2_USER_LLM:-openai/Qwen3.6-27B-FP8}"
+TAU2_USER_LLM_API_BASE="${TAU2_USER_LLM_API_BASE:-http://s-20260523131729-dtntr.ailab-pj.pjh-service.org.cn/v1}"
+TAU2_USER_LLM_TIMEOUT="${TAU2_USER_LLM_TIMEOUT:-15}"
+VLLM_API_KEY="${VLLM_API_KEY:-dummy}"
+SGLANG_REQUEST_TIMEOUT="${SGLANG_REQUEST_TIMEOUT:-30}"
+TAU2_BENCH_ROOT_DEFAULT="$(cd "${REPO_ROOT}/.." && pwd)/tau2-bench"
+TAU2_BENCH_ROOT="${TAU2_BENCH_ROOT:-${TAU2_BENCH_ROOT_DEFAULT}}"
+if [[ -z "${TAU2_TASK_SPLIT}" ]]; then
+  TAU2_TASK_SPLIT="$(default_tau2_task_split "${TAU2_DOMAIN}")"
+fi
 
 SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
 SAFETY_DATA="${SCRIPT_DIR}/dataset/agent_safetybench_convert/train.jsonl"
@@ -426,9 +480,38 @@ ensure_agentharm_dataset() {
     --output-dir "${SCRIPT_DIR}/dataset/agentharm_convert"
 }
 
+ensure_tau2_dataset() {
+  case "${TAU2_DOMAIN}" in
+    telecom|mock) ;;
+    *)
+      echo "[ERROR] Unsupported TAU2_DOMAIN=${TAU2_DOMAIN}. Use: telecom|mock"
+      exit 1
+      ;;
+  esac
+  if [[ ! -d "${TAU2_BENCH_ROOT}" ]]; then
+    echo "[ERROR] TAU2_BENCH_ROOT not found: ${TAU2_BENCH_ROOT}"
+    exit 1
+  fi
+
+  TAU2_DATA_DIR="${SCRIPT_DIR}/dataset/tau2_${TAU2_DOMAIN}_${TAU2_TASK_SPLIT}_solo"
+  TAU2_DATA="${TAU2_DATA_DIR}/train.jsonl"
+  TAU2_ARGS=(
+    --tau2-root "${TAU2_BENCH_ROOT}"
+    --domain "${TAU2_DOMAIN}"
+    --task-split "${TAU2_TASK_SPLIT}"
+    --policy-type "${TAU2_POLICY_TYPE}"
+    --output-dir "${TAU2_DATA_DIR}"
+  )
+  if [[ -n "${TAU2_NUM_TASKS}" ]]; then
+    TAU2_ARGS+=(--num-tasks "${TAU2_NUM_TASKS}")
+  fi
+  python "${SCRIPT_DIR}/data_utils/convert_tau2_to_dataset.py" "${TAU2_ARGS[@]}"
+}
+
 INCLUDES_SETA="0"
 INCLUDES_SAFETY="0"
 INCLUDES_AGENTHARM="0"
+INCLUDES_TAU2="0"
 
 case "${DATASET}" in
   seta)
@@ -443,6 +526,11 @@ case "${DATASET}" in
     INCLUDES_AGENTHARM="1"
     ensure_agentharm_dataset
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${AGENTHARM_DATA}}"
+    ;;
+  tau2)
+    INCLUDES_TAU2="1"
+    ensure_tau2_dataset
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${TAU2_DATA}}"
     ;;
   mixed)
     if [[ -n "${MIX_AGENTHARM_RATIO:-}" ]]; then
@@ -513,7 +601,7 @@ case "${DATASET}" in
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${MIXED_DATA}}"
     ;;
   *)
-    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed"
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed|tau2"
     exit 1
     ;;
 esac
@@ -527,7 +615,10 @@ if [[ ! -f "${ROLLOUT_PROMPT_DATA}" ]]; then
   exit 1
 fi
 echo "[config] ALGO=${ALGO} DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD} AGENTHARM_REWARD=${AGENTHARM_REWARD}"
-echo "[config] sources seta=${INCLUDES_SETA} safety=${INCLUDES_SAFETY} agentharm=${INCLUDES_AGENTHARM}"
+echo "[config] sources seta=${INCLUDES_SETA} safety=${INCLUDES_SAFETY} agentharm=${INCLUDES_AGENTHARM} tau2=${INCLUDES_TAU2}"
+if [[ "${INCLUDES_TAU2}" == "1" ]]; then
+  echo "[config] tau2 domain=${TAU2_DOMAIN} split=${TAU2_TASK_SPLIT} policy_type=${TAU2_POLICY_TYPE} root=${TAU2_BENCH_ROOT}"
+fi
 echo "[config] data=${ROLLOUT_PROMPT_DATA}"
 
 NEEDS_ENV_ROUTER="0"
@@ -605,6 +696,16 @@ export AGENT_SAFETYBENCH_REMOTE_ENV
 export AGENTHARM_REMOTE_ENV
 export AGENTHARM_ROOT
 export AGENTHARM_REWARD
+export TAU2_REMOTE_ENV
+export TAU2_BENCH_ROOT
+export TAU2_DOMAIN
+export TAU2_TASK_SPLIT
+export TAU2_POLICY_TYPE
+export TAU2_USER_LLM
+export TAU2_USER_LLM_API_BASE
+export TAU2_USER_LLM_TIMEOUT
+export VLLM_API_KEY
+export SGLANG_REQUEST_TIMEOUT
 
 ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
 ROUTER_PORT="${ROUTER_PORT:-${ENV_SERVER_PORT}}"
@@ -665,7 +766,12 @@ if [[ -n "${WORKER_URLS}" ]]; then
   ALL_WORKER_HOSTS="$(echo "${WORKER_URLS}" | tr ',' '\n' \
     | sed -E 's#https?://([^:/]+).*#\1#' | tr '\n' ',' | sed 's/,$//')"
 fi
-export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}}"
+TAU2_USER_LLM_HOST="$(printf '%s\n' "${TAU2_USER_LLM_API_BASE}" | sed -E 's#https?://([^/:]+).*#\1#')"
+DEFAULT_NO_PROXY="localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}"
+if [[ -n "${TAU2_USER_LLM_HOST}" && "${TAU2_USER_LLM_HOST}" != "${TAU2_USER_LLM_API_BASE}" ]]; then
+  DEFAULT_NO_PROXY="${DEFAULT_NO_PROXY},${TAU2_USER_LLM_HOST}"
+fi
+export NO_PROXY="${NO_PROXY:-${DEFAULT_NO_PROXY}}"
 export no_proxy="${NO_PROXY}"
 
 # Router uses `python3` which, after the PATH export above, resolves to
@@ -870,6 +976,7 @@ fi
 TRAIN_ARGS=(
   --actor-num-nodes 1
   --actor-num-gpus-per-node "${ACTOR_GPUS}"
+  --num-gpus-per-node "${NUM_GPUS}"
   --rollout-num-gpus "${ROLLOUT_GPUS}"
   "${MODEL_ARGS[@]}"
   "${CKPT_ARGS[@]}"
@@ -999,7 +1106,9 @@ if [[ "${NVLINK_COUNT:-0}" -gt 0 ]]; then
 else
   HAS_NVLINK=0
 fi
-log "HAS_NVLINK=${HAS_NVLINK}"
+NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-${HAS_NVLINK}}"
+NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+log "HAS_NVLINK=${HAS_NVLINK} NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}"
 
 # ── Dump run config ──────────────────────────────────────────────────
 cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
@@ -1133,9 +1242,11 @@ RUNTIME_ENV_JSON="{
     \"PYTHONUNBUFFERED\": \"1\",
     \"PYTHONFAULTHANDLER\": \"1\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NCCL_NVLS_ENABLE\": \"${NCCL_NVLS_ENABLE}\",
+    \"NCCL_P2P_DISABLE\": \"${NCCL_P2P_DISABLE}\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
+    \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
     \"USE_REMOTE_ENV\": \"${USE_REMOTE_ENV}\",
     \"ENV_SERVER_URL\": \"${ENV_SERVER_URL}\",
     \"AGENT_SAFETYBENCH_REMOTE_ENV\": \"${AGENT_SAFETYBENCH_REMOTE_ENV}\",
@@ -1162,6 +1273,10 @@ RUNTIME_ENV_JSON="{
     \"TERMINAL_STRUCTURED_METRICS\": \"${TERMINAL_STRUCTURED_METRICS}\",
     \"TERMINAL_METRICS_JSONL\": \"${TERMINAL_METRICS_JSONL}\",
     \"DATASET\": \"${DATASET}\",
+    \"TAU2_USER_LLM\": \"${TAU2_USER_LLM}\",
+    \"TAU2_USER_LLM_API_BASE\": \"${TAU2_USER_LLM_API_BASE}\",
+    \"VLLM_API_KEY\": \"${VLLM_API_KEY}\",
+    \"SGLANG_REQUEST_TIMEOUT\": \"${SGLANG_REQUEST_TIMEOUT}\",
     \"ALGO\": \"${ALGO}\",
     \"DAPO_OVERLONG_BUFFER_ENABLE\": \"${DAPO_OVERLONG_BUFFER_ENABLE}\",
     \"DAPO_OVERLONG_BUFFER_LEN\": \"${DAPO_OVERLONG_BUFFER_LEN}\",

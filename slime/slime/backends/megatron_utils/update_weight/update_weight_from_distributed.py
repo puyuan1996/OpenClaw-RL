@@ -149,7 +149,8 @@ class UpdateWeightFromDistributed:
 
         param_size = param.numel() * param.element_size()
         if buffer_size + param_size > self.args.update_weight_buffer_size:
-            self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+            if converted_named_tensors:
+                self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
             buffer_size = 0
         converted_named_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
         buffer_size += param_size
@@ -223,6 +224,9 @@ class UpdateWeightFromDistributed:
         """
         Lock → broadcast → clear → unlock → pbar++. Lock prevents NCCL deadlock.
         """
+        if not converted_named_tensors:
+            return
+
         # lock the rollout engines to prevent dead lock on broadcast.
         while not ray.get(self.rollout_engine_lock.acquire.remote()):
             time.sleep(0.1)

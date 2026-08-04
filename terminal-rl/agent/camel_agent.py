@@ -418,6 +418,13 @@ class CamelAgent(ChatAgent):
         )
         self._tool_call_records.append(tool_record)
 
+    def record_user_message(self, input_message: Any) -> None:
+        if isinstance(input_message, str):
+            input_message = BaseMessage.make_user_message(
+                role_name="User", content=input_message
+            )
+        self.update_memory(input_message, OpenAIBackendRole.USER)
+
     def finalize_response(self, model_response: Any) -> ChatAgentResponse:
         if self._used_prompt_formatting and self._original_response_format:
             self._apply_prompt_based_parsing(

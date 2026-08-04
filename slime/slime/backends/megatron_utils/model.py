@@ -5,6 +5,7 @@ import math
 import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
+from .lora import load_megatron_lora_checkpoint, merged_megatron_lora, save_megatron_lora_checkpoint
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
@@ -668,7 +670,7 @@ def train(
                 if train_step_id == 0 and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
 
-            logger.info(f"{role_tag}step {train_step_id}: {log_dict}")
+            logger.info(f"{role_tag}train-step {train_step_id}: {log_dict}")
 
             if args.ci_save_grad_norm is not None:
                 ci_save_grad_norm_path = args.ci_save_grad_norm.format(
@@ -716,6 +718,14 @@ def save(
 
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    if getattr(args, "use_megatron_lora", False) and getattr(args, "megatron_lora_save_adapter_only", True):
+        save_megatron_lora_checkpoint(model, args, iteration)
+        if should_disable_forward_pre_hook(args):
+            enable_forward_pre_hook(model)
+        max_keep = getattr(args, "max_ckpt_keep", 1)
+        if save_dir and is_rank0:
+            cleanup_old_checkpoints(save_dir, max_keep=max_keep)
+        return
     save_checkpoint(
         iteration,
         model,
@@ -759,7 +769,8 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
 
         path.mkdir(parents=True, exist_ok=True)
 
-        with patch_megatron_model(model):
+        merge_context = merged_megatron_lora(model) if getattr(args, "use_megatron_lora", False) else nullcontext()
+        with merge_context, patch_megatron_model(model):
             bridge.save_hf_pretrained(
                 model,
                 path=path,
@@ -803,6 +814,8 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
+    if getattr(args, "use_megatron_lora", False):
+        load_megatron_lora_checkpoint(model, getattr(args, "megatron_lora_adapter_load", None))
     clear_memory()
 
     opt_param_scheduler.step(increment=iteration * args.global_batch_size)

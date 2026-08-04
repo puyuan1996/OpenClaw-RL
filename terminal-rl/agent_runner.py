@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict, List, Optional, Protocol
 
 from custom_types import TurnContext, TurnResult
 from inference_client import SGLangTurnClient
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class RolloutAgent(Protocol):
@@ -23,8 +28,34 @@ class RolloutAgent(Protocol):
     ) -> tuple[Optional[Any], List[Any], bool, Optional[Any]]: ...
 
     def record_tool_result(self, tool_call_request: Any, raw_result: Any) -> None: ...
+    def record_user_message(self, input_message: Any) -> None: ...
 
     def finalize_response(self, model_response: Any) -> Any: ...
+
+
+def normalize_harness_option(value: str | None) -> str:
+    """Normalize legacy and CLI spellings for terminal rollout harnesses."""
+    text = str(value or "camel-agent").strip().lower().replace("_", "-")
+    aliases = {
+        "camel": "camel-agent",
+        "camel-agent": "camel-agent",
+        "camelagent": "camel-agent",
+        "a3s": "a3s-code",
+        "a3s-code": "a3s-code",
+        "a3s-code-agent": "a3s-code",
+        "a3s-code-harness": "a3s-code",
+        "claude": "claude-code",
+        "claude-code": "claude-code",
+        "claude-code-cli": "claude-code",
+        "claude-code-harness": "claude-code",
+    }
+    try:
+        return aliases[text]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported harness option: {value!r}. "
+            "Expected one of: camel-agent, camel_agent, a3s-code, claude_code."
+        ) from exc
 
 
 class AgentRunner:
@@ -68,6 +99,9 @@ class AgentRunner:
 
     def set_max_iterations(self, max_iterations: int) -> None:
         self._max_iterations = max(1, int(max_iterations))
+        set_agent_max_iterations = getattr(self._rollout_agent, "set_max_iterations", None)
+        if callable(set_agent_max_iterations):
+            set_agent_max_iterations(self._max_iterations)
 
     def reached_iteration_limit(self) -> bool:
         return self._model_turn_count >= self._max_iterations
@@ -82,6 +116,17 @@ class AgentRunner:
     async def run_model_turn(
         self, context_messages: List[dict[str, Any]]
     ) -> TurnResult:
+        agent_turn = getattr(self._rollout_agent, "run_model_turn", None)
+        if callable(agent_turn):
+            result = self._call_agent_run_model_turn(agent_turn, context_messages)
+            if inspect.isawaitable(result):
+                result = await result
+            interactions = getattr(result, "interactions", None) or [
+                result.interaction
+            ]
+            self._model_turn_count += max(1, len(interactions))
+            return result
+
         chat_completion, interaction = await self._sglang_client.generate_turn(
             messages=context_messages,
             tools=self._tool_schemas,
@@ -98,13 +143,47 @@ class AgentRunner:
             tool_call_requests=tool_call_requests,
             parse_error_recorded=parse_error_recorded,
             terminated_response=terminated,
+            interactions=[interaction],
         )
 
     def record_tool_result(self, tool_call_request: Any, raw_result: Any) -> None:
         self._rollout_agent.record_tool_result(tool_call_request, raw_result)
 
+    def record_user_message(self, input_message: Any) -> None:
+        self._rollout_agent.record_user_message(input_message)
+
     def finalize_response(self, model_response: Any) -> Any:
         return self._rollout_agent.finalize_response(model_response)
+
+    async def close(self) -> None:
+        close_fn = getattr(self._rollout_agent, "close", None)
+        if not callable(close_fn):
+            return
+        result = close_fn()
+        if inspect.isawaitable(result):
+            await result
+
+    def _call_agent_run_model_turn(
+        self,
+        agent_turn: Any,
+        context_messages: List[dict[str, Any]],
+    ) -> Any:
+        signature = inspect.signature(agent_turn)
+        params = signature.parameters
+        accepts_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if accepts_kwargs or "context_messages" in params:
+            kwargs: dict[str, Any] = {"context_messages": context_messages}
+            if accepts_kwargs or "sglang_client" in params:
+                kwargs["sglang_client"] = self._sglang_client
+            if accepts_kwargs or "tool_schemas" in params:
+                kwargs["tool_schemas"] = self._tool_schemas
+            if accepts_kwargs or "turn_idx" in params:
+                kwargs["turn_idx"] = self._model_turn_count
+            return agent_turn(**kwargs)
+
+        return agent_turn(context_messages)
 
 
 def create_agent_runner(
@@ -115,8 +194,13 @@ def create_agent_runner(
     tool_schemas: List[Dict[str, Any]],
     non_think_mode: bool,
     max_total_tokens: int,
+    env_client: Any | None = None,
+    lease_id: str | None = None,
+    run_context: Any | None = None,
+    task_meta: Dict[str, Any] | None = None,
 ) -> AgentRunner:
-    if agent_type == "camel_agent":
+    harness = normalize_harness_option(agent_type)
+    if harness == "camel-agent":
         from agent.camel_agent import CamelAgent
 
         rollout_agent = CamelAgent(
@@ -125,10 +209,34 @@ def create_agent_runner(
             non_think_mode=non_think_mode,
             max_total_tokens=max_total_tokens,
         )
-    else:
-        raise ValueError(
-            f"Unsupported agent type: {agent_type!r}. Expected 'camel_agent'."
+    elif harness == "a3s-code":
+        from agent.a3s_code_agent import A3SCodeAgent
+
+        rollout_agent = A3SCodeAgent(
+            model_type=model_type,
+            sglang_client=sglang_client,
+            env_client=env_client,
+            lease_id=lease_id,
+            run_context=run_context,
+            task_meta=task_meta or {},
+            non_think_mode=non_think_mode,
+            max_total_tokens=max_total_tokens,
         )
+    elif harness == "claude-code":
+        from agent.claude_code_agent import ClaudeCodeAgent
+
+        rollout_agent = ClaudeCodeAgent(
+            model_type=model_type,
+            sglang_client=sglang_client,
+            env_client=env_client,
+            lease_id=lease_id,
+            run_context=run_context,
+            task_meta=task_meta or {},
+            non_think_mode=non_think_mode,
+            max_total_tokens=max_total_tokens,
+        )
+    else:
+        raise ValueError(f"Unsupported harness option: {agent_type!r}.")
 
     return AgentRunner(
         rollout_agent=rollout_agent,
