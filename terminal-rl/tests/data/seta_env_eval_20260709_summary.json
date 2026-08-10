@@ -1,0 +1,69 @@
+{
+  "dataset_total": 1356,
+  "result_count": 1354,
+  "missing_count": 2,
+  "raw_score_mean_completed_rows": 0.38827284237180804,
+  "raw_score_sum_completed_rows": 525.7214285714281,
+  "raw_score_mean_all_dataset_missing_as_zero": 0.38770016856300005,
+  "exact_pass_count": 293,
+  "exact_pass_rate_completed_rows": 0.21639586410635156,
+  "exact_pass_rate_all_dataset_missing_as_zero": 0.21607669616519173,
+  "nonzero_score_count": 772,
+  "nonzero_score_rate_completed_rows": 0.5701624815361891,
+  "nonzero_score_rate_all_dataset_missing_as_zero": 0.5693215339233039,
+  "raw_score_distribution": {
+    "0.0": 582,
+    "0.16666666666666666": 1,
+    "0.2": 5,
+    "0.25": 56,
+    "0.3333333333333333": 162,
+    "0.4": 2,
+    "0.5": 61,
+    "0.5714285714285714": 1,
+    "0.6": 2,
+    "0.6666666666666666": 137,
+    "0.75": 49,
+    "0.8": 3,
+    "1.0": 293
+  },
+  "status_counts": {
+    "TRUNCATED": 544,
+    "COMPLETED": 737,
+    "FAILED": 73,
+    "MISSING": 2
+  },
+  "run_counts": {
+    "main": 1251,
+    "supp1": 98,
+    "supp2": 5,
+    "MISSING": 2
+  },
+  "failure_event_count": 114,
+  "failure_event_counts": {
+    "HTTPStatusError": 114
+  },
+  "turns": {
+    "mean": 7.07754800590842,
+    "median": 8.0,
+    "min": 1.0,
+    "max": 10.0
+  },
+  "tool_calls": {
+    "mean": 15.748153618906942,
+    "median": 12.0,
+    "min": 0.0,
+    "max": 174.0
+  },
+  "input_tokens": {
+    "mean": 24187.313146233384,
+    "median": 23912.5,
+    "min": 2239.0,
+    "max": 76769.0
+  },
+  "output_tokens": {
+    "mean": 11715.328655834564,
+    "median": 10546.5,
+    "min": 1022.0,
+    "max": 56368.0
+  }
+}
